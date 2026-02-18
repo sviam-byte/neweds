@@ -78,6 +78,7 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
         print(
             '  {"preset":"basic","method_options":{"te_directed":{"scan_cube":0}}}'
         )
+        print("  qc_enabled=1; save_series_bundle=1")
         print("Пусто -> дефолты.\n")
         user_text = input("Config> ").strip()
 
@@ -92,7 +93,7 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
         print()
 
         # Загружаем данные с опциями предобработки из пользовательской спецификации.
-        load_kwargs = {"preprocess": bool(spec.preprocess)}
+        load_kwargs = {"preprocess": bool(spec.preprocess), "qc_enabled": bool(spec.qc_enabled)}
         opts = dict(spec.preprocess_options or {})
         for key in [
             "log_transform",
@@ -172,12 +173,13 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
     excel_path = args.output or os.path.join(out_dir, f"{name}_full.xlsx")
     html_path = args.report_html or os.path.join(out_dir, f"{name}_report.html")
 
-    # Всегда сохраняем сами ряды отдельным файлом рядом с отчётами
+    # Сохраняем сами ряды (raw+clean+QC+coords) рядом с отчётами, если не выключено.
     series_path = os.path.join(out_dir, f"{name}_series.xlsx")
-    try:
-        tool.export_series_bundle(series_path)
-    except Exception:
-        pass
+    if (spec.save_series_bundle if spec else True):
+        try:
+            tool.export_series_bundle(series_path)
+        except Exception:
+            pass
 
     if do_excel:
         tool.export_big_excel(excel_path, threshold=args.graph_threshold, p_value_alpha=args.p_alpha)
@@ -194,6 +196,16 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             harmonic_top_k=(spec.harmonic_top_k if spec else 5),
             include_series_files=True,
         )
+
+    # Явное русское пояснение того, что сделано.
+    try:
+        from src.reporting.run_summary import build_run_summary_ru
+
+        summary = build_run_summary_ru(tool, run_dir=out_dir)
+        print("\n[Что сделано]")
+        print(summary)
+    except Exception:
+        pass
 
     print(f"Processed: {filepath}")
     if do_excel:

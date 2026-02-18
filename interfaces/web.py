@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -174,6 +175,28 @@ def main() -> None:
             remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
             season_period = st.number_input("Период сезонности (0=авто)", min_value=0, max_value=1000000, value=0, step=1)
 
+            qc_enabled = st.checkbox(
+                "QC по каждому ряду/вокселю (mean/std/дрейф/спайки/AR1)",
+                value=True,
+                help="Помогает быстро увидеть 'битые' ряды и причины ложной связности.",
+            )
+            save_series_bundle = st.checkbox(
+                "Сохранять пакет рядов (raw+clean+QC+coords)",
+                value=True,
+                help="Пишет отдельный *_series.xlsx рядом с отчётами.",
+            )
+
+            st.markdown("**Partial-контроль (для *_partial)**")
+            control_strategy = st.selectbox(
+                "Что вычесть перед *_partial",
+                ["нет", "глобальный сигнал", "глобальный + тренд", "глобальный + тренд + PCA"],
+                index=2,
+                help="Partial считаем на остатках после регрессии на выбранные компоненты контроля.",
+            )
+            control_pca_k = 0
+            if "PCA" in control_strategy:
+                control_pca_k = int(st.number_input("PCA k", min_value=1, max_value=50, value=3, step=1))
+
         with colC:
             output_mode = st.selectbox("Режим вывода", ["both", "html", "excel"], index=0)
             include_diagnostics = st.checkbox("HTML: показывать диагностику", value=True)
@@ -314,6 +337,7 @@ def main() -> None:
                     remove_ar1=bool(remove_ar1),
                     remove_seasonality=bool(remove_seasonality),
                     season_period=(None if int(season_period) == 0 else int(season_period)),
+                    qc_enabled=bool(qc_enabled),
                 )
 
                 # main windows
@@ -343,6 +367,12 @@ def main() -> None:
                     max_lag=int(max_lag),
                     lag_selection=lag_selection,
                     lag=int(lag),
+                    control_strategy=(
+                        "none"
+                        if control_strategy == "нет"
+                        else ("global_mean" if control_strategy == "глобальный сигнал" else "global_mean_trend")
+                    ),
+                    control_pca_k=int(control_pca_k or 0),
                     window_sizes=window_sizes_main,
                     window_stride=run_window_stride,
                     window_policy=window_policy,
@@ -374,12 +404,13 @@ def main() -> None:
                     cube_gallery_limit=int(cube_gallery_limit),
                 )
 
-                # Всегда сохраняем ряды отдельным файлом рядом с отчётами.
+                # Сохраняем ряды отдельным файлом рядом с отчётами (если не выключено).
                 series_path = run_dir / f"{stem}_series.xlsx"
-                try:
-                    tool.export_series_bundle(str(series_path))
-                except Exception:
-                    pass
+                if bool(save_series_bundle):
+                    try:
+                        tool.export_series_bundle(str(series_path))
+                    except Exception:
+                        pass
 
                 excel_path = run_dir / f"{stem}_full.xlsx"
                 html_path = run_dir / f"{stem}_report.html"
@@ -403,6 +434,15 @@ def main() -> None:
                 st.success("Готово!")
                 st.code(str(run_dir))
 
+                # Явное русское пояснение
+                try:
+                    from src.reporting.run_summary import build_run_summary_ru
+
+                    st.subheader("Что именно сделано")
+                    st.text(build_run_summary_ru(tool, run_dir=str(run_dir)))
+                except Exception:
+                    pass
+
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     if output_mode in {"excel", "both"} and excel_path.exists():
@@ -419,25 +459,32 @@ def main() -> None:
                     try:
                         df_show = tool.data_raw if not tool.data_raw.empty else tool.data
                         st.line_chart(df_show)
-                        st.dataframe(df_show.head(200))
+                        st.dataframe(df_show.head(200), height=320)
                     except Exception:
                         pass
 
                 st.subheader("Предварительный просмотр матриц")
                 from src.visualization import plots
 
-                for method in selected_methods:
-                    mat = tool.results.get(method)
-                    if mat is None:
-                        continue
-                    chosen = None
-                    try:
-                        chosen = (tool.results_meta.get(method) or {}).get("chosen_lag")
-                    except Exception:
+                # много матриц — прячем в прокручиваемый контейнер.
+                # Для обратной совместимости со старыми Streamlit делаем fallback.
+                try:
+                    matrix_container = st.container(height=650)
+                except TypeError:
+                    matrix_container = nullcontext()
+                with matrix_container:
+                    for method in selected_methods:
+                        mat = tool.results.get(method)
+                        if mat is None:
+                            continue
                         chosen = None
-                    title = f"{method}" + (f" (chosen_lag={chosen})" if chosen is not None else "")
-                    buf = plots.plot_heatmap(mat, title)
-                    st.image(buf, caption=title)
+                        try:
+                            chosen = (tool.results_meta.get(method) or {}).get("chosen_lag")
+                        except Exception:
+                            chosen = None
+                        title = f"{method}" + (f" (chosen_lag={chosen})" if chosen is not None else "")
+                        buf = plots.plot_heatmap(mat, title)
+                        st.image(buf, caption=title)
 
             except Exception as e:
                 st.error(f"Ошибка выполнения: {e}")

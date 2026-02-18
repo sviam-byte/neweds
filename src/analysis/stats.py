@@ -194,6 +194,101 @@ def permutation_entropy(series: pd.Series, order: int = 3, delay: int = 1, norma
     return float(pe / (math.log2(math.factorial(m)) + 1e-12))
 
 
+
+def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) -> pd.DataFrame:
+    """QC по каждому вокселю/ряду.
+
+    Ожидает матрицу вида time × voxel (колонки = ряды).
+
+    Возвращает таблицу (rows = voxel) с:
+      - missing_frac
+      - mean/std
+      - drift_slope (линейный тренд)
+      - spikes_frac (доля больших скачков по производной)
+      - ar1 (corr(x[t], x[t-1]))
+
+    Если переданы coords (voxel_id,x,y,z) — подмешивает их в результат.
+    """
+    if df_time_voxel is None or getattr(df_time_voxel, "empty", True):
+        return pd.DataFrame()
+
+    out_rows = []
+    n = int(df_time_voxel.shape[0])
+    t = np.arange(n, dtype=np.float64)
+    # нормируем t для численной устойчивости
+    if n > 1:
+        t0 = (t - t.mean()) / (t.std() + 1e-12)
+    else:
+        t0 = t
+
+    for col in df_time_voxel.columns:
+        s = pd.to_numeric(df_time_voxel[col], errors="coerce")
+        missing = float(s.isna().mean())
+        x = s.to_numpy(dtype=np.float64)
+        mean = float(np.nanmean(x)) if np.isfinite(np.nanmean(x)) else np.nan
+        std = float(np.nanstd(x)) if np.isfinite(np.nanstd(x)) else np.nan
+
+        # drift: slope в линейной регрессии x ~ t
+        slope = np.nan
+        try:
+            mask = np.isfinite(x)
+            if int(mask.sum()) >= 8:
+                A = np.c_[np.ones(int(mask.sum())), t0[mask]]
+                beta, *_ = np.linalg.lstsq(A, x[mask], rcond=None)
+                slope = float(beta[1])
+        except Exception:
+            slope = np.nan
+
+        # spikes по производной (robust)
+        spikes_frac = np.nan
+        try:
+            dx = np.diff(x)
+            dx = dx[np.isfinite(dx)]
+            if dx.size >= 8:
+                med = np.median(dx)
+                mad = np.median(np.abs(dx - med)) + 1e-12
+                thr = 5.0 * mad
+                spikes_frac = float((np.abs(dx - med) > thr).mean())
+        except Exception:
+            spikes_frac = np.nan
+
+        # AR(1)
+        ar1 = np.nan
+        try:
+            x0 = x[:-1]
+            x1 = x[1:]
+            mask = np.isfinite(x0) & np.isfinite(x1)
+            if int(mask.sum()) >= 8:
+                ar1 = float(np.corrcoef(x0[mask], x1[mask])[0, 1])
+        except Exception:
+            ar1 = np.nan
+
+        out_rows.append(
+            {
+                "voxel_id": str(col),
+                "missing_frac": missing,
+                "mean": mean,
+                "std": std,
+                "drift_slope": slope,
+                "spikes_frac": spikes_frac,
+                "ar1": ar1,
+            }
+        )
+
+    qc = pd.DataFrame(out_rows)
+    if coords is not None and not getattr(coords, "empty", True):
+        try:
+            cc = coords.copy()
+            if "voxel_id" not in cc.columns:
+                # пытаемся угадать
+                if cc.columns.size >= 1:
+                    cc = cc.rename(columns={cc.columns[0]: "voxel_id"})
+            qc = qc.merge(cc, on="voxel_id", how="left")
+        except Exception:
+            pass
+    return qc
+
+
 def fft_peaks(series: pd.Series, fs: float = 1.0, top_k: int = 3, peak_height_ratio: float = 0.2) -> dict:
     """Возвращает доминирующие частоты/периоды по FFT.
 
