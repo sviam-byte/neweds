@@ -325,6 +325,69 @@ class App(tk.Tk):
         ttk.Label(r3, text="limit:").pack(side="left", padx=(10, 0))
         ttk.Entry(r3, textvariable=self.cube_gallery_limit, width=6).pack(side="left", padx=5)
 
+        # --- Методы анализа (обязательно) ---
+        # Вынесены выше JSON-опций, чтобы пользователь сначала выбрал *что*
+        # считать, а уже затем при необходимости настраивал тонкие параметры.
+        m_frame = ttk.LabelFrame(frame, text="Методы анализа (выбери, что считать)", padding=6)
+        m_frame.pack(fill="both", expand=False, pady=6)
+
+        # Кнопки быстрого выбора: помогают быстро включать/сбрасывать наборы
+        # без ручного прокликивания длинного списка.
+        m_btns = ttk.Frame(m_frame)
+        m_btns.pack(fill="x", pady=(0, 4))
+
+        def _set_all_methods(value: bool) -> None:
+            """Массово установить состояние для всех чекбоксов методов."""
+            for v in self.method_vars.values():
+                v.set(value)
+
+        def _set_default_methods() -> None:
+            """Включить быстрый дефолт из самых дешевых и часто полезных методов."""
+            default = {"correlation_full", "mutinf_full", "granger_full"}
+            for name, v in self.method_vars.items():
+                v.set(name in default)
+
+        ttk.Button(m_btns, text="Выбрать все", command=lambda: _set_all_methods(True)).pack(side="left")
+        ttk.Button(m_btns, text="Снять все", command=lambda: _set_all_methods(False)).pack(side="left", padx=6)
+        ttk.Button(m_btns, text="Дефолт (быстро)", command=_set_default_methods).pack(side="left")
+
+        # Список методов может быть длинным, поэтому используется скроллируемый
+        # контейнер на Canvas, чтобы не растягивать окно GUI по высоте.
+        canvas = tk.Canvas(m_frame, height=220)
+        vsb = ttk.Scrollbar(m_frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        methods = sorted(method_mapping.keys())
+
+        # Дефолт включения при первом открытии вкладки.
+        default_on = {"correlation_full", "mutinf_full", "granger_full"}
+
+        for i, m in enumerate(methods):
+            var = tk.BooleanVar(value=(m in default_on))
+            self.method_vars[m] = var
+
+            col = i % 3
+            row = i // 3
+
+            label = m
+            # Если pyinform недоступен, отмечаем TE-методы как потенциально
+            # более медленные/требующие зависимости.
+            if (not PYINFORM_AVAILABLE) and m.startswith("te_"):
+                label += " (медленно/зависимость pyinform)"
+            ttk.Checkbutton(inner, text=label, variable=var).grid(
+                row=row, column=col, sticky="w", padx=10, pady=2
+            )
+
         adv = ttk.LabelFrame(frame, text="Доп. опции по методам (JSON, необязательно)", padding=6)
         adv.pack(fill="both", expand=False, pady=6)
         self.method_options_text = tk.Text(adv, height=4)
@@ -333,20 +396,6 @@ class App(tk.Tk):
             "1.0",
             '{\n  "correlation_full": {"scan_cube": true},\n  "granger_full": {"scan_lag": true, "lag_min": 1, "lag_max": 10}\n}',
         )
-
-        m_frame = ttk.LabelFrame(frame, text="Методы", padding=5)
-        m_frame.pack(fill="both", expand=True, pady=10)
-
-        methods = sorted(method_mapping.keys())
-        for i, m in enumerate(methods):
-            var = tk.BooleanVar(value=(m in ["correlation_full", "granger_full"]))
-            self.method_vars[m] = var
-            col = i % 3
-            row = i // 3
-            name = m
-            if not PYINFORM_AVAILABLE and m.startswith("te_"):
-                name += " (slow)"
-            ttk.Checkbutton(m_frame, text=name, variable=var).grid(row=row, column=col, sticky="w", padx=10)
 
     def _browse_file(self) -> None:
         f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
