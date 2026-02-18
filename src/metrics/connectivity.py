@@ -18,6 +18,54 @@ from statsmodels.tsa.vector_ar.var_model import VAR
 from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 
 
+def _init_matrix(n: int, default: float, *, diag: Optional[float] = None, dtype=np.float64) -> np.ndarray:
+    out = np.full((n, n), float(default), dtype=dtype)
+    if diag is not None:
+        np.fill_diagonal(out, float(diag))
+    return out
+
+
+def _iter_pairs(n: int, pairs: Optional[list[tuple[int, int]]], *, directed: bool) -> list[tuple[int, int]]:
+    """Normalize user pairs.
+
+    For undirected metrics we return unique (min,max) pairs.
+    """
+    if pairs is None:
+        return []
+    out: list[tuple[int, int]] = []
+    seen = set()
+    for i, j in pairs:
+        try:
+            i = int(i)
+            j = int(j)
+        except Exception:
+            continue
+        if i == j or i < 0 or j < 0 or i >= n or j >= n:
+            continue
+        if not directed:
+            a, b = (i, j) if i < j else (j, i)
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
+            out.append((a, b))
+        else:
+            out.append((i, j))
+    return out
+
+
+def _corr_1d(x: np.ndarray, y: np.ndarray) -> float:
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(mask.sum()) < 3:
+        return float("nan")
+    xx = x[mask].astype(np.float64, copy=False)
+    yy = y[mask].astype(np.float64, copy=False)
+    sx = float(xx.std())
+    sy = float(yy.std())
+    if sx <= 1e-12 or sy <= 1e-12:
+        return float("nan")
+    return float(np.corrcoef(xx, yy)[0, 1])
+
+
 def _as_2d_controls(df: pd.DataFrame, control: Optional[list[str]] = None, control_matrix: Optional[np.ndarray] = None) -> tuple[np.ndarray, list[str]]:
     """Возвращает (X_ctrl, desc).
 
@@ -79,94 +127,97 @@ def _residualize_df(df: pd.DataFrame, control: Optional[list[str]] = None, contr
     return out, desc
 
 
-def correlation_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
-    """Вычисляет матрицу корреляции Пирсона для числовых колонок."""
-    return data.corr().values
+def correlation_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Корреляция Пирсона.
 
+    Если pairs задан, считаем только эти пары (упрощение для больших N).
+    """
+    if pairs is None:
+        return data.corr().values
+
+    n_cols = int(data.shape[1])
+    out = _init_matrix(n_cols, 0.0, diag=1.0)
+    X = data.to_numpy(dtype=np.float64, copy=False)
+    for i, j in _iter_pairs(n_cols, pairs, directed=False):
+        out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
+    return out
 
 def partial_correlation_matrix(
     df: pd.DataFrame,
     lag: int = 1,
     control: Optional[list[str]] = None,
     control_matrix: Optional[np.ndarray] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    """Частная корреляция.
-
-    Если передан control_matrix (или control как список регрессоров), считаем
-    корреляцию на резидуалах после линейной регрессии на control.
-
-    Иначе используем прежнюю матрицу точности (для совместимости).
-    """
+    """Частная корреляция."""
     cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     n_cols = len(cols)
     n_rows = len(df)
-
-    # Предпочтительно: резидуализация на заданных контролях (честно и прозрачно)
     if control_matrix is not None or (control is not None and len(control) > 0):
         sub = df[cols].copy()
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
-        return sub.corr().values
-
-    # Защита от проклятия размерности: при N <= P инверсия/псевдоинверсия крайне нестабильна.
+        if pairs is None:
+            return sub.corr().values
+        n = int(len(cols))
+        out = _init_matrix(n, 0.0, diag=1.0)
+        X = sub.to_numpy(dtype=np.float64, copy=False)
+        for i, j in _iter_pairs(n, pairs, directed=False):
+            out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
+        return out
     if n_rows <= n_cols + 2:
-        logging.warning(
-            "Слишком мало данных для Partial Correlation: строк %s <= колонок %s. Возвращаю NaN.",
-            n_rows,
-            n_cols,
-        )
+        logging.warning("Слишком мало данных для Partial Correlation: строк %s <= колонок %s. Возвращаю NaN.", n_rows, n_cols)
         return np.full((n_cols, n_cols), np.nan)
-
-    out = np.eye(n_cols)
-    for i in range(n_cols):
-        for j in range(i + 1, n_cols):
-            xi, xj = cols[i], cols[j]
-            ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
-            sub_cols = [xi, xj] + [c for c in ctrl_vars if c in cols and c not in (xi, xj)]
-            sub = df[sub_cols].dropna()
-            if sub.shape[0] < len(sub_cols) + 1:
+    out = _init_matrix(n_cols, 0.0, diag=1.0)
+    it = _iter_pairs(n_cols, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols)]
+    for i, j in it:
+        xi, xj = cols[i], cols[j]
+        ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
+        sub_cols = [xi, xj] + [c for c in ctrl_vars if c in cols and c not in (xi, xj)]
+        sub = df[sub_cols].dropna()
+        if sub.shape[0] < len(sub_cols) + 1:
+            pcor = np.nan
+        else:
+            try:
+                corr_matrix = sub.corr().values
+                precision = np.linalg.pinv(corr_matrix)
+                pcor = -precision[0, 1] / np.sqrt(precision[0, 0] * precision[1, 1])
+            except Exception:
                 pcor = np.nan
-            else:
-                try:
-                    corr_matrix = sub.corr().values
-                    precision = np.linalg.pinv(corr_matrix)
-                    pcor = -precision[0, 1] / np.sqrt(precision[0, 0] * precision[1, 1])
-                except Exception:
-                    pcor = np.nan
-            out[i, j] = out[j, i] = pcor
+        out[i, j] = out[j, i] = float(pcor) if np.isfinite(pcor) else 0.0
     return out
-
 
 def partial_h2_matrix(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **kwargs: dict) -> np.ndarray:
     """Вычисляет квадрат частной корреляции (приближение частного H²)."""
     return partial_correlation_matrix(df, lag=lag, control=control, **kwargs) ** 2
 
 
-def lagged_directed_correlation(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
+def lagged_directed_correlation(
+    df: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
     """Вычисляет направленную лаговую корреляцию, где M[src, tgt] = corr(src(t), tgt(t+lag))."""
     lag = int(max(1, lag))
-    cols = list(df.columns)
-    n_cols = len(cols)
-    out = np.full((n_cols, n_cols), np.nan, dtype=float)
-    np.fill_diagonal(out, 0.0)
-
-    for i, src in enumerate(cols):
-        x_series = df[src]
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
-            y_series = df[tgt].shift(-lag)
-            pair = pd.concat([x_series, y_series], axis=1).dropna()
-            if pair.shape[0] <= 3:
-                continue
-            xv = pair.iloc[:, 0].values
-            yv = pair.iloc[:, 1].values
-            if np.nanstd(xv) == 0 or np.nanstd(yv) == 0:
-                out[i, j] = np.nan
-            else:
-                out[i, j] = float(np.corrcoef(xv, yv)[0, 1])
+    n_cols = len(df.columns)
+    out = _init_matrix(n_cols, 0.0, diag=0.0)
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for i, j in it:
+        x_series = df.iloc[:, i]
+        y_series = df.iloc[:, j].shift(-lag)
+        pair = pd.concat([x_series, y_series], axis=1).dropna()
+        if pair.shape[0] <= 3:
+            continue
+        out[i, j] = _corr_1d(pair.iloc[:, 0].to_numpy(), pair.iloc[:, 1].to_numpy())
     return out
-
 
 def _knn_mutual_info(x: np.ndarray, y: np.ndarray, k: int = DEFAULT_K_MI) -> float:
     x = np.asarray(x, dtype=np.float64).ravel()
@@ -231,143 +282,133 @@ def _knn_conditional_mutual_info(x: np.ndarray, y: np.ndarray, z: np.ndarray, k:
     return float(max(0.0, cmi)) if np.isfinite(cmi) else float("nan")
 
 
-def mutual_info_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, k: int = DEFAULT_K_MI, **_: dict) -> np.ndarray:
-    """Вычисляет попарную матрицу взаимной информации оценкой KSG kNN."""
-    n_vars = len(data.columns)
-    mi_matrix = np.zeros((n_vars, n_vars), dtype=float)
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] <= k:
-                value = np.nan
-            else:
-                value = _knn_mutual_info(pair.iloc[:, 0].values, pair.iloc[:, 1].values, k=k)
-            mi_matrix[i, j] = mi_matrix[j, i] = value
+def mutual_info_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    k: int = DEFAULT_K_MI,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Взаимная информация (KSG kNN). Если pairs задан, считаем только эти пары."""
+    n_vars = int(len(data.columns))
+    mi_matrix = _init_matrix(n_vars, 0.0, diag=0.0)
+    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
+    for i, j in it:
+        pair = data.iloc[:, [i, j]].dropna()
+        if pair.shape[0] <= k:
+            value = 0.0
+        else:
+            v = _knn_mutual_info(pair.iloc[:, 0].values, pair.iloc[:, 1].values, k=k)
+            value = float(v) if np.isfinite(v) else 0.0
+        mi_matrix[i, j] = mi_matrix[j, i] = value
     return mi_matrix
 
-
-def mutual_info_matrix_partial(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, k: int = DEFAULT_K_MI, **extra: dict) -> np.ndarray:
-    """Partial MI.
-
-    По умолчанию (как раньше): условная MI I(X;Y|Z) через kNN.
-
-    Если передан control_matrix: используем линейную резидуализацию и считаем
-    MI на резидуалах (практичный компромисс для больших N).
-    """
+def mutual_info_matrix_partial(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    k: int = DEFAULT_K_MI,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
+    """Partial MI."""
     control_matrix = extra.get("control_matrix", None)
     if control_matrix is not None:
-        sub = data.copy()
-        sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
-        return mutual_info_matrix(sub, lag=lag, control=None, k=k)
-    cols = list(data.columns)
-    n_cols = len(cols)
-    pmi = np.zeros((n_cols, n_cols), dtype=float)
-    for i in range(n_cols):
-        for j in range(i + 1, n_cols):
-            xi, xj = cols[i], cols[j]
-            z_cols = control if control is not None else [c for c in cols if c not in (xi, xj)]
-            z_cols = [c for c in z_cols if c in data.columns and c not in (xi, xj)]
-            if not z_cols:
-                pair = data[[xi, xj]].dropna()
-                value = _knn_mutual_info(pair[xi].values, pair[xj].values, k=k) if pair.shape[0] > k else np.nan
-            else:
-                sub = data[[xi, xj] + z_cols].dropna()
-                value = _knn_conditional_mutual_info(sub[xi].values, sub[xj].values, sub[z_cols].values, k=k) if sub.shape[0] > k else np.nan
-            pmi[i, j] = pmi[j, i] = value
+        sub = data.copy(); sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
+        return mutual_info_matrix(sub, lag=lag, control=None, k=k, pairs=pairs)
+    cols = list(data.columns); n_cols = len(cols)
+    pmi = _init_matrix(n_cols, 0.0, diag=0.0)
+    it = _iter_pairs(n_cols, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols)]
+    for i, j in it:
+        xi, xj = cols[i], cols[j]
+        z_cols = control if control is not None else [c for c in cols if c not in (xi, xj)]
+        z_cols = [c for c in z_cols if c in data.columns and c not in (xi, xj)]
+        if not z_cols:
+            pair = data[[xi, xj]].dropna()
+            value = float(_knn_mutual_info(pair[xi].values, pair[xj].values, k=k)) if pair.shape[0] > k else 0.0
+        else:
+            sub = data[[xi, xj] + z_cols].dropna()
+            value = float(_knn_conditional_mutual_info(sub[xi].values, sub[xj].values, sub[z_cols].values, k=k)) if sub.shape[0] > k else 0.0
+        pmi[i, j] = pmi[j, i] = value if np.isfinite(value) else 0.0
     return pmi
 
-
-def coherence_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, fs: float = 1.0, **_: dict) -> np.ndarray:
-    """Вычисляет среднюю спектральную когерентность для каждой пары переменных."""
+def coherence_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    fs: float = 1.0,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
     fs = fs if np.isfinite(fs) and fs > 0 else 1.0
-    n_vars = data.shape[1]
-    coh = np.full((n_vars, n_vars), np.nan, dtype=float)
-    np.fill_diagonal(coh, 1.0)
-
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] <= 3:
-                continue
-            s1 = np.asarray(pair.iloc[:, 0].values, dtype=np.float64)
-            s2 = np.asarray(pair.iloc[:, 1].values, dtype=np.float64)
-            n = int(min(s1.size, s2.size))
-            if n <= 3:
-                continue
-            nperseg = int(max(8, min(64, n // 2)))
-            try:
-                _, cxy = signal.coherence(s1[:n], s2[:n], fs=fs, nperseg=nperseg, detrend="constant")
-                cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0)
-                cxy[~np.isfinite(cxy)] = np.nan
-                coh[i, j] = coh[j, i] = float(np.nanmean(cxy)) if np.isfinite(cxy).any() else np.nan
-            except Exception:
-                coh[i, j] = coh[j, i] = np.nan
+    n_vars = int(data.shape[1]); coh = _init_matrix(n_vars, 0.0, diag=1.0)
+    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
+    for i, j in it:
+        pair = data.iloc[:, [i, j]].dropna()
+        if pair.shape[0] <= 3: continue
+        s1 = np.asarray(pair.iloc[:, 0].values, dtype=np.float64); s2 = np.asarray(pair.iloc[:, 1].values, dtype=np.float64)
+        n = int(min(s1.size, s2.size));
+        if n <= 3: continue
+        nperseg = int(max(8, min(64, n // 2)))
+        try:
+            _, cxy = signal.coherence(s1[:n], s2[:n], fs=fs, nperseg=nperseg, detrend="constant")
+            cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0); cxy[~np.isfinite(cxy)] = np.nan
+            coh[i, j] = coh[j, i] = float(np.nanmean(cxy)) if np.isfinite(cxy).any() else 0.0
+        except Exception:
+            coh[i, j] = coh[j, i] = 0.0
     return coh
 
-
-def granger_matrix(df: pd.DataFrame, lag: int = DEFAULT_MAX_LAG, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
-    """Вычисляет матрицу p-value теста Грейнджера по попарным проверкам."""
-    n_cols = df.shape[1]
-    out = np.full((n_cols, n_cols), 1.0)
+def granger_matrix(
+    df: pd.DataFrame,
+    lag: int = DEFAULT_MAX_LAG,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    n_cols = int(df.shape[1]); out = _init_matrix(n_cols, 1.0, diag=0.0)
     columns = df.columns.tolist()
-    for src in range(n_cols):
-        for tgt in range(n_cols):
-            if src == tgt:
-                out[src, tgt] = 0.0
-                continue
-            pair = df[[columns[tgt], columns[src]]].dropna()
-            if len(pair) <= lag * 2 + 5:
-                out[src, tgt] = np.nan
-                continue
-            try:
-                tests = grangercausalitytests(pair, maxlag=lag)
-                out[src, tgt] = tests[lag][0]["ssr_ftest"][1]
-            except Exception:
-                out[src, tgt] = np.nan
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for src, tgt in it:
+        pair = df[[columns[tgt], columns[src]]].dropna()
+        if len(pair) <= lag * 2 + 5:
+            out[src, tgt] = 1.0; continue
+        try:
+            tests = grangercausalitytests(pair, maxlag=int(lag), verbose=False)
+            out[src, tgt] = float(tests[int(lag)][0]["ssr_ftest"][1])
+        except Exception:
+            out[src, tgt] = 1.0
     return out
 
-
-def granger_matrix_partial(df: pd.DataFrame, lag: int = DEFAULT_MAX_LAG, control: Optional[list[str]] = None, **extra: dict) -> np.ndarray:
-    """Вычисляет условную причинность Грейнджера (p-value) через многомерную VAR."""
+def granger_matrix_partial(
+    df: pd.DataFrame,
+    lag: int = DEFAULT_MAX_LAG,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
     control_matrix = extra.get("control_matrix", None)
     if control_matrix is not None:
-        # Резидуализация на внешних контролях и обычный Granger
-        sub = df.copy()
-        sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
-        return granger_matrix(sub, lag=lag, control=None)
-    columns = list(df.columns)
-    n_cols = len(columns)
-    out = np.full((n_cols, n_cols), np.nan, dtype=float)
-    np.fill_diagonal(out, 0.0)
-
-    # Для VAR-модели нужно достаточно наблюдений относительно числа признаков.
+        sub = df.copy(); sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
+        return granger_matrix(sub, lag=lag, control=None, pairs=pairs)
+    columns = list(df.columns); n_cols = len(columns); out = _init_matrix(n_cols, 1.0, diag=0.0)
     if len(df) <= n_cols + 2:
-        logging.warning(
-            "Слишком мало данных для Granger partial: строк %s <= колонок %s. Возвращаю NaN.",
-            len(df),
-            n_cols,
-        )
+        logging.warning("Слишком мало данных для Granger partial: строк %s <= колонок %s. Возвращаю NaN.", len(df), n_cols)
         return out
-
-    for src_i, src in enumerate(columns):
-        for tgt_j, tgt in enumerate(columns):
-            if src_i == tgt_j:
-                continue
-            control_cols = control if control is not None else [c for c in columns if c not in (src, tgt)]
-            control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
-            use_cols = [tgt, src] + control_cols
-            sub = df[use_cols].dropna()
-            p = int(max(1, lag))
-            if sub.shape[0] < max(30, 5 * p * len(use_cols)):
-                continue
-            try:
-                result = VAR(sub).fit(maxlags=p, ic=None, trend="c")
-                causality = result.test_causality(caused=tgt, causing=[src], kind="f")
-                out[src_i, tgt_j] = float(causality.pvalue) if np.isfinite(causality.pvalue) else np.nan
-            except Exception:
-                out[src_i, tgt_j] = np.nan
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for src_i, tgt_j in it:
+        src = columns[src_i]; tgt = columns[tgt_j]
+        control_cols = control if control is not None else [c for c in columns if c not in (src, tgt)]
+        control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
+        use_cols = [tgt, src] + control_cols; sub = df[use_cols].dropna(); p = int(max(1, lag))
+        if sub.shape[0] < max(30, 5 * p * len(use_cols)): continue
+        try:
+            result = VAR(sub).fit(maxlags=p, ic=None, trend="c")
+            causality = result.test_causality(caused=tgt, causing=[src], kind="f")
+            out[src_i, tgt_j] = float(causality.pvalue) if np.isfinite(causality.pvalue) else 1.0
+        except Exception:
+            out[src_i, tgt_j] = 1.0
     return out
-
 
 def _load_pyinform():
     if not PYINFORM_AVAILABLE:
@@ -455,99 +496,79 @@ def compute_te_jitter(source: np.ndarray, target: np.ndarray, lag: int = 1, bins
         return float("nan")
 
 
-def transfer_entropy_matrix(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, bins: int = DEFAULT_BINS, **_: dict) -> np.ndarray:
-    """Вычисляет направленную матрицу Transfer Entropy M[src, tgt] = TE(src -> tgt)."""
-    n_cols = df.shape[1]
-    out = np.zeros((n_cols, n_cols))
-    for src in range(n_cols):
-        for tgt in range(n_cols):
-            if src == tgt:
-                continue
-            pair = df.iloc[:, [src, tgt]].dropna()
-            if len(pair) <= lag:
-                out[src, tgt] = np.nan
-                continue
-            out[src, tgt] = compute_te_jitter(pair.iloc[:, 0].values, pair.iloc[:, 1].values, lag=lag, bins=bins)
+def transfer_entropy_matrix(
+    df: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    bins: int = DEFAULT_BINS,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    n_cols = int(df.shape[1]); out = _init_matrix(n_cols, 0.0, diag=0.0)
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for src, tgt in it:
+        pair = df.iloc[:, [src, tgt]].dropna()
+        if len(pair) <= lag:
+            out[src, tgt] = 0.0; continue
+        v = compute_te_jitter(pair.iloc[:, 0].values, pair.iloc[:, 1].values, lag=lag, bins=bins)
+        out[src, tgt] = float(v) if np.isfinite(v) else 0.0
     return out
 
-
-def transfer_entropy_matrix_partial(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, bins: int = DEFAULT_BINS, **extra: dict) -> np.ndarray:
-    """Partial TE через линейную резидуализацию.
-
-    Если передан control_matrix: используем его как общий набор регрессоров.
-    """
-    cols = list(df.columns)
-    n_cols = len(cols)
-    out = np.zeros((n_cols, n_cols))
-
+def transfer_entropy_matrix_partial(
+    df: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    bins: int = DEFAULT_BINS,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
+    cols = list(df.columns); n_cols = len(cols); out = _init_matrix(n_cols, 0.0, diag=0.0)
     control_matrix = extra.get("control_matrix", None)
-
-    def residualize(y: np.ndarray, x: np.ndarray) -> np.ndarray:
-        if x.size == 0:
-            return y
-        x_aug = np.c_[np.ones(len(x)), x]
+    def residualize(y, x_ctrl):
+        if x_ctrl is None or x_ctrl.size == 0: return y
+        x_aug = np.c_[np.ones(len(y)), x_ctrl]
         beta, *_ = np.linalg.lstsq(x_aug, y, rcond=None)
         return y - x_aug @ beta
-
-    for i, src in enumerate(cols):
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
-            # общий dropna на src/tgt/controls, иначе рассинхрон
-            if control_matrix is not None:
-                # Строим булеву маску на ПОЗИЦИОННОМ уровне (а не по index)
-                pair_vals = df[[src, tgt]].to_numpy(dtype=np.float64)
-                X_ctrl, _desc = _as_2d_controls(df, control=control, control_matrix=control_matrix)
-                valid = np.isfinite(pair_vals).all(axis=1)
-                if X_ctrl.shape[1] > 0:
-                    valid &= np.isfinite(X_ctrl).all(axis=1)
-                if int(valid.sum()) <= lag + 1:
-                    out[i, j] = np.nan
-                    continue
-                src_vals = pair_vals[valid, 0]
-                tgt_vals = pair_vals[valid, 1]
-                X_sub = X_ctrl[valid]
-                try:
-                    src_res = residualize(src_vals, X_sub)
-                    tgt_res = residualize(tgt_vals, X_sub)
-                    out[i, j] = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins)
-                except Exception:
-                    out[i, j] = np.nan
-                continue
-
-            ctrl_cols = control if control is not None else [c for c in cols if c not in (src, tgt)]
-            ctrl_cols = [c for c in ctrl_cols if c in df.columns]
-            sub = df[[src, tgt] + ctrl_cols].dropna()
-            if sub.shape[0] <= lag + 1:
-                out[i, j] = np.nan
-                continue
-            x_ctrl = sub[ctrl_cols].values if ctrl_cols else np.empty((len(sub), 0))
-            try:
-                src_res = residualize(sub[src].values, x_ctrl)
-                tgt_res = residualize(sub[tgt].values, x_ctrl)
-                out[i, j] = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins)
-            except Exception:
-                out[i, j] = np.nan
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for i, j in it:
+        src = cols[i]; tgt = cols[j]
+        if control_matrix is not None:
+            pair_vals = df[[src, tgt]].to_numpy(dtype=np.float64, copy=False)
+            X_ctrl = np.asarray(control_matrix, dtype=np.float64)
+            valid = np.isfinite(pair_vals).all(axis=1)
+            if X_ctrl.size and X_ctrl.ndim == 1: X_ctrl = X_ctrl.reshape(-1, 1)
+            if X_ctrl.shape[1] > 0: valid &= np.isfinite(X_ctrl).all(axis=1)
+            if int(valid.sum()) <= lag + 1: out[i, j] = 0.0; continue
+            src_vals = pair_vals[valid, 0]; tgt_vals = pair_vals[valid, 1]; x_ctrl = X_ctrl[valid, :] if X_ctrl.size else np.empty((int(valid.sum()), 0))
+            src_res = residualize(src_vals, x_ctrl); tgt_res = residualize(tgt_vals, x_ctrl)
+            v = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins); out[i, j] = float(v) if np.isfinite(v) else 0.0; continue
+        control_cols = control if control is not None else [c for c in cols if c not in (src, tgt)]
+        control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
+        sub = df[[src, tgt] + control_cols].dropna()
+        if sub.shape[0] <= lag + 1: out[i, j] = 0.0; continue
+        x_ctrl = sub[control_cols].values if control_cols else np.empty((len(sub), 0))
+        try:
+            src_res = residualize(sub[src].values, x_ctrl); tgt_res = residualize(sub[tgt].values, x_ctrl)
+            v = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins)
+            out[i, j] = float(v) if np.isfinite(v) else 0.0
+        except Exception:
+            out[i, j] = 0.0
     return out
 
-
-# ---------------------------------------------------------------------------
-# Coherence partial  (spec: partial coherence)
-# ---------------------------------------------------------------------------
-
-def coherence_matrix_partial(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None,
-                             fs: float = 1.0, **extra: dict) -> np.ndarray:
+def coherence_matrix_partial(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    fs: float = 1.0,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
     """Partial coherence: когерентность на резидуалах после регрессии на контроли."""
     control_matrix = extra.get("control_matrix", None)
     sub = data.copy()
     if control_matrix is not None or (control is not None and len(control) > 0):
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
-    return coherence_matrix(sub, lag=lag, control=None, fs=fs)
-
-
-# ---------------------------------------------------------------------------
-# Distance correlation  (spec metric #6)
-# ---------------------------------------------------------------------------
+    return coherence_matrix(sub, lag=lag, control=None, fs=fs, pairs=pairs)
 
 def _dcov_sq(x: np.ndarray, y: np.ndarray) -> float:
     """Квадрат дистанционной ковариации (Székely et al. 2007)."""
@@ -571,70 +592,62 @@ def _dcor(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.sqrt(max(0.0, dcov2) / np.sqrt(dvar_x * dvar_y)))
 
 
-def dcor_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
-    """Попарная матрица дистанционных корреляций (NxN, симметричная)."""
-    n_vars = data.shape[1]
-    out = np.eye(n_vars, dtype=float)
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] < 8:
-                out[i, j] = out[j, i] = np.nan
-                continue
-            v = _dcor(pair.iloc[:, 0].values, pair.iloc[:, 1].values)
-            out[i, j] = out[j, i] = v
+def dcor_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    n_vars = int(data.shape[1]); out = _init_matrix(n_vars, 0.0, diag=1.0)
+    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
+    for i, j in it:
+        pair = data.iloc[:, [i, j]].dropna()
+        if pair.shape[0] < 8:
+            out[i, j] = out[j, i] = 0.0; continue
+        v = _dcor(pair.iloc[:, 0].values, pair.iloc[:, 1].values)
+        out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
     return out
 
-
-def dcor_matrix_partial(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **extra: dict) -> np.ndarray:
-    """Partial dCor — через линейную резидуализацию."""
+def dcor_matrix_partial(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
     control_matrix = extra.get("control_matrix", None)
     if control_matrix is not None or (control is not None and len(control) > 0):
         sub, _desc = _residualize_df(data, control=control, control_matrix=control_matrix)
-        return dcor_matrix(sub, lag=lag, control=None)
-    # fallback: pairwise residualization (как MI partial)
-    cols = list(data.columns)
-    n_cols = len(cols)
-    out = np.eye(n_cols, dtype=float)
-    for i in range(n_cols):
-        for j in range(i + 1, n_cols):
-            xi, xj = cols[i], cols[j]
-            z_cols = [c for c in cols if c not in (xi, xj)]
-            sub = data[[xi, xj] + z_cols].dropna()
-            if sub.shape[0] < 8:
-                out[i, j] = out[j, i] = np.nan
-                continue
-            x_ctrl = sub[z_cols].values if z_cols else np.empty((len(sub), 0))
-            xr = _residualize_1d(sub[xi].values, x_ctrl)
-            yr = _residualize_1d(sub[xj].values, x_ctrl)
-            v = _dcor(xr, yr)
-            out[i, j] = out[j, i] = v
+        return dcor_matrix(sub, lag=lag, control=None, pairs=pairs)
+    cols = list(data.columns); n_cols = len(cols); out = _init_matrix(n_cols, 0.0, diag=1.0)
+    it = _iter_pairs(n_cols, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols)]
+    for i, j in it:
+        xi, xj = cols[i], cols[j]; z_cols = [c for c in cols if c not in (xi, xj)]
+        sub = data[[xi, xj] + z_cols].dropna()
+        if sub.shape[0] < 8:
+            out[i, j] = out[j, i] = 0.0; continue
+        x_ctrl = sub[z_cols].values if z_cols else np.empty((len(sub), 0))
+        xr = _residualize_1d(sub[xi].values, x_ctrl); yr = _residualize_1d(sub[xj].values, x_ctrl)
+        v = _dcor(xr, yr); out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
     return out
 
-
-def dcor_matrix_directed(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
-    """Лаговая dCor: M[src,tgt] = dCor(src(t), tgt(t+lag))."""
-    lag = int(max(1, lag))
-    cols = list(data.columns)
-    n_cols = len(cols)
-    out = np.full((n_cols, n_cols), np.nan, dtype=float)
-    np.fill_diagonal(out, 0.0)
-    for i, src in enumerate(cols):
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
-            x = data[src].values
-            y_shifted = data[tgt].shift(-lag).values
-            mask = np.isfinite(x) & np.isfinite(y_shifted)
-            if int(mask.sum()) < 8:
-                continue
-            out[i, j] = _dcor(x[mask], y_shifted[mask])
+def dcor_matrix_directed(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    lag = int(max(1, lag)); n_cols = len(data.columns); out = _init_matrix(n_cols, 0.0, diag=0.0)
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for i, j in it:
+        x = data.iloc[:, i].to_numpy(dtype=np.float64, copy=False)
+        y_shifted = data.iloc[:, j].shift(-lag).to_numpy(dtype=np.float64, copy=False)
+        mask = np.isfinite(x) & np.isfinite(y_shifted)
+        if int(mask.sum()) < 8: continue
+        v = _dcor(x[mask], y_shifted[mask]); out[i, j] = float(v) if np.isfinite(v) else 0.0
     return out
-
-
-# ---------------------------------------------------------------------------
-# Ordinal / Permutation-based dependence  (spec metric #7)
-# ---------------------------------------------------------------------------
 
 def _ordinal_pattern(x: np.ndarray, order: int = 3, delay: int = 1) -> np.ndarray:
     """Возвращает массив порядковых паттернов (Bandt-Pompe) как целых чисел."""
@@ -684,38 +697,42 @@ def _ordinal_mi(x: np.ndarray, y: np.ndarray, order: int = 3, delay: int = 1) ->
     return float(max(0.0, mi))
 
 
-def ordinal_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None,
-                   order: int = 3, delay: int = 1, **_: dict) -> np.ndarray:
-    """Матрица ordinal (permutation) mutual information. Симметричная."""
-    n_vars = data.shape[1]
-    out = np.zeros((n_vars, n_vars), dtype=float)
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] < 20:
-                out[i, j] = out[j, i] = np.nan
-                continue
-            v = _ordinal_mi(pair.iloc[:, 0].values, pair.iloc[:, 1].values, order=order, delay=delay)
-            out[i, j] = out[j, i] = v
+def ordinal_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    order: int = 3,
+    delay: int = 1,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    n_vars = int(data.shape[1]); out = _init_matrix(n_vars, 0.0, diag=0.0)
+    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
+    for i, j in it:
+        pair = data.iloc[:, [i, j]].dropna()
+        if pair.shape[0] < 20:
+            out[i, j] = out[j, i] = 0.0; continue
+        v = _ordinal_mi(pair.iloc[:, 0].values, pair.iloc[:, 1].values, order=order, delay=delay)
+        out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
     return out
 
-
-def ordinal_matrix_directed(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None,
-                            order: int = 3, delay: int = 1, **_: dict) -> np.ndarray:
-    """Направленная ordinal MI: M[src,tgt] = ordMI(src(t), tgt(t+lag))."""
-    lag = int(max(1, lag))
-    cols = list(data.columns)
-    n_cols = len(cols)
-    out = np.full((n_cols, n_cols), np.nan, dtype=float)
-    np.fill_diagonal(out, 0.0)
-    for i, src in enumerate(cols):
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
-            x = data[src].values
-            y_shifted = data[tgt].shift(-lag).values
-            mask = np.isfinite(x) & np.isfinite(y_shifted)
-            if int(mask.sum()) < 20:
-                continue
-            out[i, j] = _ordinal_mi(x[mask], y_shifted[mask], order=order, delay=delay)
+def ordinal_matrix_directed(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    order: int = 3,
+    delay: int = 1,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    lag = int(max(1, lag)); n_cols = len(data.columns); out = _init_matrix(n_cols, 0.0, diag=0.0)
+    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
+    for i, j in it:
+        x = data.iloc[:, i].to_numpy(dtype=np.float64, copy=False)
+        y_shifted = data.iloc[:, j].shift(-lag).to_numpy(dtype=np.float64, copy=False)
+        mask = np.isfinite(x) & np.isfinite(y_shifted)
+        if int(mask.sum()) < 20: continue
+        v = _ordinal_mi(x[mask], y_shifted[mask], order=order, delay=delay)
+        out[i, j] = float(v) if np.isfinite(v) else 0.0
     return out
+
