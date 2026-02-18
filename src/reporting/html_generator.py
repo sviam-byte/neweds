@@ -358,7 +358,7 @@ class HTMLReportGenerator:
         toc = []
 
         if run_summary:
-            toc.append(("Что сделано", "what_done"))
+            toc.append("<li><a href='#what_done'>Что сделано</a></li>")
             sections.append(
                 "<h2 id='what_done'>Что сделано</h2>" + f"<pre>{html.escape(run_summary)}</pre>"
             )

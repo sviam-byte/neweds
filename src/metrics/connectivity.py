@@ -320,7 +320,7 @@ def granger_matrix(df: pd.DataFrame, lag: int = DEFAULT_MAX_LAG, control: Option
                 out[src, tgt] = np.nan
                 continue
             try:
-                tests = grangercausalitytests(pair, maxlag=lag, verbose=False)
+                tests = grangercausalitytests(pair, maxlag=lag)
                 out[src, tgt] = tests[lag][0]["ssr_ftest"][1]
             except Exception:
                 out[src, tgt] = np.nan

@@ -389,7 +389,7 @@ def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwar
             data_pair = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             if len(data_pair) > lags * 2 + 5:
                 try:
-                    tests = grangercausalitytests(data_pair, maxlag=lags, verbose=False)
+                    tests = grangercausalitytests(data_pair, maxlag=lags)
                     G[src, tgt] = tests[lags][0]['ssr_ftest'][1]
                 except (np.linalg.LinAlgError, ValueError):
                     G[src, tgt] = np.nan
@@ -737,7 +737,7 @@ def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
                 results[f"{src}->{tgt}"] = None
                 continue
             try:
-                tests = grangercausalitytests(sub, maxlag=maxlag, verbose=False)
+                tests = grangercausalitytests(sub, maxlag=maxlag)
             except Exception as e:
                 logging.error(f"[Granger] Ошибка Granger для {src}->{tgt}: {e}")
                 results[f"{src}->{tgt}"] = None
@@ -758,7 +758,7 @@ def _compute_granger_matrix_internal(df: pd.DataFrame, lags: int = DEFAULT_MAX_L
                 continue
             sub = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
             try:
-                tests = grangercausalitytests(sub, maxlag=lags, verbose=False)
+                tests = grangercausalitytests(sub, maxlag=lags)
                 pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
                 G[src, tgt] = min(pvals)
             except Exception as e:

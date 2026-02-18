@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import EXPERIMENTAL_METHODS, SAVE_FOLDER, STABLE_METHODS
 from src.core import engine, generator
+from src.core.preprocessing import configure_warnings
+
+configure_warnings()
 
 
 def _parse_int_list_text(text: str) -> list[int] | None:
