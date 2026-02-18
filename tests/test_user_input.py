@@ -31,6 +31,19 @@ def test_build_run_spec_defaults_and_lists() -> None:
     assert spec.window_stride == 64
 
 
+def test_build_run_spec_accepts_gui_variant_tuples() -> None:
+    spec = build_run_spec(
+        {
+            "variants": [
+                ("corr_full", "Корреляция (full)"),
+                ("te_directed", "Transfer Entropy (directed)"),
+            ]
+        },
+        default_max_lag=12,
+    )
+    assert spec.variants == ["corr_full", "te_directed"]
+
+
 def test_expand_variants_preset_and_unique() -> None:
     variants, explain = expand_variants(["basic", "te_directed", "basic"])
     assert "preset 'basic'" in explain

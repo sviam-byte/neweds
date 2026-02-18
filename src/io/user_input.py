@@ -41,11 +41,29 @@ def _split_kv(text: str) -> Dict[str, str]:
 
 
 def _parse_list(v: Any) -> List[str]:
-    """Нормализует значение в список строк."""
+    """Нормализует значение в список строк.
+
+    Поддерживает частый GUI-формат, где каждый элемент может быть
+    структурой вида ``(key, label)``. В таком случае берётся только
+    первый элемент (``key``), чтобы на уровне ядра всегда работать
+    со стабильными идентификаторами вариантов.
+    """
     if v is None:
         return []
     if isinstance(v, (list, tuple)):
-        return [str(x).strip() for x in v if str(x).strip()]
+        out: List[str] = []
+        for x in v:
+            # UI (особенно GUI) может прислать элементы как кортежи
+            # вида ("corr_full", "Корреляция (full)").
+            # Нам нужен только ключ варианта.
+            if isinstance(x, (list, tuple)):
+                if len(x) == 0:
+                    continue
+                x = x[0]
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
 
     s = str(v).strip()
     if not s:
