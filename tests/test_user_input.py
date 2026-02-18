@@ -47,5 +47,6 @@ def test_build_run_spec_accepts_gui_variant_tuples() -> None:
 def test_expand_variants_preset_and_unique() -> None:
     variants, explain = expand_variants(["basic", "te_directed", "basic"])
     assert "preset 'basic'" in explain
-    assert variants.count("corr_full") == 1
+    # После канонизации алиасов ожидаем canonical-имя variant
+    assert variants.count("correlation_full") == 1
     assert variants.count("te_directed") == 1

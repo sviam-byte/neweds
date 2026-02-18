@@ -22,6 +22,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.core.engine import BigMasterTool, method_mapping
 from src.core import data_loader, generator
 from src.config import AnalysisConfig, PYINFORM_AVAILABLE
+from src.core.preprocessing import configure_warnings
+
+# Подавляем FutureWarning от statsmodels (verbose deprecated)
+configure_warnings()
 
 
 class App(tk.Tk):

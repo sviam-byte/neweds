@@ -117,13 +117,14 @@ def expand_variants(tokens: List[str]) -> Tuple[List[str], str]:
             # Пробуем разрешить алиас, чтобы пользователь мог писать 'corr_full'
             out.append(_resolve_alias(key))
 
-    # unique with stable order
+    # unique with stable order + resolve aliases
     seen = set()
     uniq: List[str] = []
     for variant in out:
-        if variant not in seen:
-            uniq.append(variant)
-            seen.add(variant)
+        canonical = _resolve_alias(variant)
+        if canonical not in seen:
+            uniq.append(canonical)
+            seen.add(canonical)
 
     if not explain:
         explain.append("variants задан списком напрямую")
