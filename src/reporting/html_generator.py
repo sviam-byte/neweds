@@ -345,8 +345,23 @@ class HTMLReportGenerator:
         cols = list(df.columns)
         variants = list(self.tool.results.keys())
 
+        # Короткое русское описание параметров/предобработки/partial/direct.
+        run_summary = ""
+        try:
+            from src.reporting.run_summary import build_run_summary_ru
+
+            run_summary = build_run_summary_ru(self.tool, run_dir=str(Path(output_path).parent))
+        except Exception:
+            run_summary = ""
+
         sections = []
         toc = []
+
+        if run_summary:
+            toc.append(("Что сделано", "what_done"))
+            sections.append(
+                "<h2 id='what_done'>Что сделано</h2>" + f"<pre>{html.escape(run_summary)}</pre>"
+            )
 
         # Главный экран: raw/proc в едином масштабе + отчёт предобработки + гармоники.
         try:

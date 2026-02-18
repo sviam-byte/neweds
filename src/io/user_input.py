@@ -216,6 +216,10 @@ class RunSpec:
     include_fft_plots: bool
     harmonic_top_k: int
 
+    # QC / сохранение
+    qc_enabled: bool
+    save_series_bundle: bool
+
     def explain(self) -> str:
         """Возвращает человеко-понятное описание параметров запуска."""
         lines: List[str] = []
@@ -237,6 +241,8 @@ class RunSpec:
         lines.append(f"main_window_cube={self.window_cube_level} (eval_limit={self.window_cube_eval_limit})")
 
         lines.append(f"output_mode={self.output_mode}")
+        lines.append(f"qc_enabled={'on' if self.qc_enabled else 'off'}")
+        lines.append(f"save_series_bundle={'on' if self.save_series_bundle else 'off'}")
         lines.append(
             "html: "
             + f"diagnostics={'on' if self.include_diagnostics else 'off'}, "
@@ -332,6 +338,10 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     include_fft_plots = _parse_bool(user_cfg.get("include_fft_plots", False), False)
     harmonic_top_k = _parse_int(user_cfg.get("harmonic_top_k", 5), 5, min_v=1, max_v=20)
 
+    # --- QC / сохранение ---
+    qc_enabled = _parse_bool(user_cfg.get("qc_enabled", True), True)
+    save_series_bundle = _parse_bool(user_cfg.get("save_series_bundle", True), True)
+
     # --- scans flags ---
     scan_window_pos = _parse_bool(user_cfg.get("scan_window_pos", True), True)
     scan_window_size = _parse_bool(user_cfg.get("scan_window_size", True), True)
@@ -426,4 +436,6 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
         include_matrix_tables=include_matrix_tables,
         include_fft_plots=include_fft_plots,
         harmonic_top_k=harmonic_top_k,
+        qc_enabled=qc_enabled,
+        save_series_bundle=save_series_bundle,
     )

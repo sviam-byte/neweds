@@ -69,10 +69,109 @@ def _detect_header(df_raw: pd.DataFrame) -> bool:
 
 
 def _maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Поддержка формата: одна колонка строк, внутри ',' ';' '\\t'."""
-    if df_raw.shape[1] == 1 and isinstance(df_raw.iloc[0, 0], str):
-        return df_raw[0].astype(str).str.split(r"[,;\t]", expand=True)
+    """Поддержка формата: «CSV в ячейке».
+
+    Встречается в XLSX, когда каждая строка лежит в одной ячейке и содержит
+    `x,y,z,t0,t1,...` (или `;`/`	` разделители). Также бывает вариант, когда
+    Excel разнес 1–2 первых колонок, а остальное пустое.
+    """
+    try:
+        # 1) строго одна колонка строк
+        if df_raw.shape[1] == 1 and isinstance(df_raw.iloc[0, 0], str):
+            return df_raw[0].astype(str).str.split(r"[,;\t]", expand=True)
+
+        # 2) «почти одна колонка»: >80% значений в первой колонке непустые, остальные почти пустые
+        if df_raw.shape[1] > 1:
+            nonnull = df_raw.notna().mean(axis=0)
+            if float(nonnull.iloc[0]) >= 0.8 and bool((nonnull.iloc[1:] <= 0.05).all()):
+                if isinstance(df_raw.iloc[0, 0], str):
+                    return df_raw.iloc[:, [0]].copy().iloc[:, 0].astype(str).str.split(r"[,;\t]", expand=True)
+
+        # 3) строка целиком в одной ячейке, но не в первой колонке (редко)
+        if df_raw.shape[1] > 1:
+            best_j = None
+            best_score = 0.0
+            for j in range(df_raw.shape[1]):
+                col = df_raw.iloc[:, j]
+                is_str = col.apply(lambda v: isinstance(v, str) and ("," in v or ";" in v or "\t" in v))
+                score = float(is_str.mean())
+                if score > best_score:
+                    best_score = score
+                    best_j = j
+            if best_j is not None and best_score >= 0.8:
+                return df_raw.iloc[:, [best_j]].copy().iloc[:, 0].astype(str).str.split(r"[,;\t]", expand=True)
+    except Exception:
+        pass
     return df_raw
+
+
+
+def _detect_voxel_wide(df: pd.DataFrame) -> tuple[bool, dict[str, str]]:
+    """Проверяет формат вида x,y,z,t0..tN."""
+    cols = list(df.columns)
+    lower = {str(c).strip().lower(): str(c) for c in cols}
+    if not {"x", "y", "z"}.issubset(set(lower.keys())):
+        return False, lower
+    other = [c for c in cols if str(c).strip().lower() not in {"x", "y", "z"}]
+    if len(other) < 2:
+        return False, lower
+    return True, lower
+
+
+def voxel_wide_to_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+    """Конвертирует таблицу x,y,z,t0..tN в матрицу time × voxel.
+
+    Метаданные координат сохраняются в out.attrs['coords'] как DataFrame.
+    """
+    is_vox, lower = _detect_voxel_wide(df)
+    if not is_vox:
+        return df
+
+    xcol, ycol, zcol = lower["x"], lower["y"], lower["z"]
+    time_cols = [c for c in df.columns if str(c).strip().lower() not in {"x", "y", "z"}]
+
+    coords = df[[xcol, ycol, zcol]].copy()
+    coords.columns = ["x", "y", "z"]
+    for c in ["x", "y", "z"]:
+        coords[c] = pd.to_numeric(coords[c], errors="coerce")
+
+    ts = df[time_cols].copy().apply(pd.to_numeric, errors="coerce")
+
+    def _t_index(name: str) -> int | None:
+        s = str(name).strip().lower()
+        if s.startswith("t") and s[1:].isdigit():
+            return int(s[1:])
+        if s.isdigit():
+            return int(s)
+        return None
+
+    t_ids = [_t_index(c) for c in time_cols]
+    if all(v is not None for v in t_ids):
+        order = np.argsort(np.asarray(t_ids, dtype=int))
+        ts = ts.iloc[:, order]
+        time_cols_sorted = [time_cols[i] for i in order]
+    else:
+        time_cols_sorted = list(time_cols)
+
+    voxel_ids: list[str] = []
+    for i in range(len(coords)):
+        x, y, z = coords.iloc[i].tolist()
+        voxel_ids.append(
+            f"v{i:04d}_x{int(x) if np.isfinite(x) else 'nan'}_y{int(y) if np.isfinite(y) else 'nan'}_z{int(z) if np.isfinite(z) else 'nan'}"
+        )
+    coords.insert(0, "voxel_id", voxel_ids)
+    try:
+        dup = coords.duplicated(subset=["x", "y", "z"], keep=False)
+        coords["coord_duplicate"] = dup.astype(int)
+    except Exception:
+        coords["coord_duplicate"] = 0
+
+    ts.index = voxel_ids
+    out = ts.T
+    out.columns = voxel_ids
+    out.attrs["coords"] = coords
+    out.attrs["voxel_time_cols"] = [str(c) for c in time_cols_sorted]
+    return out
 
 
 def _detect_time_like_col(col: pd.Series) -> bool:
@@ -122,6 +221,12 @@ def tidy_timeseries_table(
     """Превращает сырую таблицу в numeric матрицу вида time × features."""
     out = df.copy()
     out = out.dropna(axis=1, how="all")
+
+    # Спец-кейс: x,y,z,t0..tN (воксельный wide-формат)
+    try:
+        out = voxel_wide_to_timeseries(out)
+    except Exception:
+        pass
 
     if time_col not in {"auto", "none"} and time_col not in out.columns:
         raise ValueError(f"time_col '{time_col}' not found in columns")
@@ -315,6 +420,12 @@ def load_or_generate(
     try:
         raw = read_input_table(filepath, header=header)
         df = tidy_timeseries_table(raw, time_col=time_col, transpose=transpose)
+        coords_df = None
+        try:
+            coords_df = df.attrs.get("coords")
+        except Exception:
+            coords_df = None
+
         df_out = preprocess_timeseries(
             df,
             enabled=preprocess,
@@ -332,6 +443,15 @@ def load_or_generate(
             df, report = df_out  # type: ignore[misc]
         else:
             df, report = df_out, None
+
+        # Прокидываем метаданные (например, координаты вокселей) в report.notes
+        if report is not None and coords_df is not None:
+            try:
+                report.notes["format"] = "voxel_wide"
+                report.notes["n_voxels"] = int(getattr(coords_df, "shape", [0])[0])
+                report.notes["coords"] = coords_df.to_dict(orient="records")
+            except Exception:
+                pass
         logging.info(
             f"[Load] OK shape={df.shape} header={header} time_col={time_col} transpose={transpose} preprocess={preprocess}"
         )

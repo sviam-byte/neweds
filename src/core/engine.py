@@ -1505,6 +1505,8 @@ def compute_connectivity_variant(
     partial_mode: str = "global",
     pairwise_policy: str = "others",
     custom_controls: Optional[List[str]] = None,
+    control_strategy: str = "none",
+    control_pca_k: int = 0,
 ):
     """
     variant: ключ из method_mapping.
@@ -1520,6 +1522,41 @@ def compute_connectivity_variant(
     try:
         if control is not None and len(control) == 0:
             control = None
+
+        # Универсальные «контроли» для partial: global mean / trend / PCA.
+        # Это важно для больших N (например, 165 вокселей), где "контроль = все остальные"
+        # превращается в плохо интерпретируемый и вычислительно тяжёлый режим.
+        control_matrix = None
+        control_desc: list[str] = []
+        if isinstance(variant, str) and variant.endswith("_partial") and control is None and control_strategy != "none":
+            try:
+                n = int(len(data))
+                ctrls = []
+                if control_strategy in {"global", "global_mean", "global_mean_trend", "mean_trend"}:
+                    gm = pd.to_numeric(data.mean(axis=1), errors="coerce").to_numpy(dtype=np.float64)
+                    ctrls.append(gm)
+                    control_desc.append("global_mean")
+                if control_strategy in {"global_mean_trend", "mean_trend", "trend"}:
+                    t = np.arange(n, dtype=np.float64)
+                    t = (t - t.mean()) / (t.std() + 1e-12) if n > 1 else t
+                    ctrls.append(t)
+                    control_desc.append("linear_trend")
+                k = int(max(0, control_pca_k))
+                if k > 0:
+                    X = data.to_numpy(dtype=np.float64)
+                    X = np.nan_to_num(X, nan=0.0)
+                    # SVD: time×features
+                    U, S, _Vt = np.linalg.svd(X, full_matrices=False)
+                    kk = int(min(k, U.shape[1]))
+                    if kk > 0:
+                        for i in range(kk):
+                            ctrls.append(U[:, i] * S[i])
+                            control_desc.append(f"pca[{i+1}]")
+                if ctrls:
+                    control_matrix = np.vstack(ctrls).T
+            except Exception:
+                control_matrix = None
+                control_desc = []
 
         # pairwise-partial (нужно для N=3..4)
         if partial_mode == "pairwise" and isinstance(variant, str) and variant.endswith("_partial"):
@@ -1553,7 +1590,7 @@ def compute_connectivity_variant(
 
         if variant in method_mapping:
             metric_func = get_metric_func(variant)
-            return metric_func(data, lag=lag, control=control)
+            return metric_func(data, lag=lag, control=control, control_matrix=control_matrix, control_desc=control_desc)
 
         return connectivity.correlation_matrix(data)
     except Exception as e:
@@ -2042,6 +2079,7 @@ class BigMasterTool:
 
     def load_data_excel(self, filepath: str, **kwargs) -> pd.DataFrame:
         """Загружает данные, чистит их и опционально устраняет нестационарность."""
+        qc_enabled = bool(kwargs.pop("qc_enabled", True))
         # 1) Сырой numeric-слепок без предобработки для честного before/after в отчёте.
         try:
             self.data_raw = load_or_generate(
@@ -2062,6 +2100,36 @@ class BigMasterTool:
         else:
             self.data, self.preprocessing_report = df_out, None
         self.data_preprocessed = self.data.copy()
+
+        # Координаты (для voxel-wide формата) и QC
+        self.coords_df = None
+        self.qc_raw = None
+        self.qc_clean = None
+        try:
+            notes = (self.preprocessing_report.notes if self.preprocessing_report is not None else {}) or {}
+            coords = notes.get("coords")
+            if isinstance(coords, list) and coords:
+                self.coords_df = pd.DataFrame(coords)
+        except Exception:
+            self.coords_df = None
+
+        # QC только если включено и (есть много рядов или есть coords)
+        try:
+            from ..analysis import stats as _stats
+            if qc_enabled and (self.coords_df is not None or int(self.data.shape[1]) >= 20):
+                if getattr(self, "data_raw", pd.DataFrame()).empty is False:
+                    self.qc_raw = _stats.voxel_qc(self.data_raw, coords=self.coords_df)
+                self.qc_clean = _stats.voxel_qc(self.data, coords=self.coords_df)
+        except Exception:
+            self.qc_raw = None
+            self.qc_clean = None
+
+        # Запоминаем настройку QC (нужно для отчётов/пояснений)
+        try:
+            self.results_meta.setdefault("__run__", {})
+            self.results_meta["__run__"].setdefault("qc_enabled", qc_enabled)
+        except Exception:
+            pass
 
         self.data = self.data.fillna(self.data.mean(numeric_only=True))
 
@@ -2120,10 +2188,13 @@ class BigMasterTool:
         if self.data_normalized.empty:
             return
 
+        prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
         self.results = {}
         # Метаданные (лаг, окна, partial-контроль и т.п.) — чтобы отчёты могли
         # объяснять пользователю «что именно было исключено/подобрано».
         self.results_meta = {}
+        if prev_run_meta:
+            self.results_meta["__run__"] = prev_run_meta
         self.variant_lags = {}
         self.window_analysis = {}
 
@@ -2151,9 +2222,31 @@ class BigMasterTool:
         Возвращает словарь {метод: использованный_лаг}.
         """
         self.normalize_data()
+        prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
         self.results = {}
         self.results_meta = {}
+        if prev_run_meta:
+            self.results_meta["__run__"] = prev_run_meta
         self.window_analysis = {}
+
+        # сохраняем параметры запуска (для UI/CLI пояснений)
+        try:
+            self.results_meta.setdefault("__run__", {})
+            self.results_meta["__run__"].update(
+                {
+                    "variants": list(variants),
+                    "max_lag": int(max_lag),
+                    "lag_selection": (kwargs.get("lag_selection") or self.config.lag_selection),
+                    "lag": kwargs.get("lag"),
+                    "window_sizes": kwargs.get("window_sizes"),
+                    "window_stride": kwargs.get("window_stride"),
+                    "window_policy": kwargs.get("window_policy"),
+                    "control_strategy": kwargs.get("control_strategy", "none"),
+                    "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
+                }
+            )
+        except Exception:
+            pass
 
         # max_lag аргументом оставляем, но если задан self.config.max_lag —
         # берём максимум из них (чтобы не ломать старые вызовы).
@@ -2206,6 +2299,8 @@ class BigMasterTool:
                 "mode": kwargs.get("partial_mode", "pairwise"),
                 "pairwise_policy": kwargs.get("pairwise_policy", "others"),
                 "custom_controls": kwargs.get("custom_controls"),
+                "control_strategy": kwargs.get("control_strategy", "none"),
+                "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
                 "explain": "Для каждой пары (Xi, Xj) исключено линейное влияние набора control.",
             }
 
@@ -2224,6 +2319,8 @@ class BigMasterTool:
                 partial_mode=kwargs.get("partial_mode", "pairwise"),
                 pairwise_policy=kwargs.get("pairwise_policy", "others"),
                 custom_controls=kwargs.get("custom_controls"),
+                control_strategy=kwargs.get("control_strategy", "none"),
+                control_pca_k=int(kwargs.get("control_pca_k", 0) or 0),
             )
 
         chosen_lag = 1
@@ -2745,7 +2842,41 @@ class BigMasterTool:
             if not norm_df.empty:
                 norm_df.to_excel(writer, sheet_name='NORMALIZED', index=False)
 
+            # QC (если есть)
+            try:
+                qc_raw = getattr(self, 'qc_raw', None)
+                qc_clean = getattr(self, 'qc_clean', None)
+                if qc_raw is not None and not getattr(qc_raw, 'empty', True):
+                    qc_raw.to_excel(writer, sheet_name='QC_RAW', index=False)
+                if qc_clean is not None and not getattr(qc_clean, 'empty', True):
+                    qc_clean.to_excel(writer, sheet_name='QC_CLEAN', index=False)
+            except Exception:
+                pass
+
+            # Координаты (если есть)
+            try:
+                coords = getattr(self, 'coords_df', None)
+                if coords is not None and not getattr(coords, 'empty', True):
+                    coords.to_excel(writer, sheet_name='COORDS', index=False)
+            except Exception:
+                pass
+
         logging.info('[Series] Сохранены ряды: %s', save_path)
+
+        # Метаданные прогона рядом (JSON)
+        try:
+            import json
+            meta_path = Path(save_path).with_suffix('.meta.json')
+            meta = {
+                'series_file': str(Path(save_path).name),
+                'data_shape': list(getattr(self, 'data', pd.DataFrame()).shape),
+                'preprocessing': self.get_preprocessing_summary(),
+                'methods': list(getattr(self, 'results', {}).keys()),
+                'results_meta': getattr(self, 'results_meta', {}),
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
         return save_path
 
     def test_stationarity(self, series: pd.Series) -> Tuple[Optional[float], Optional[float]]:

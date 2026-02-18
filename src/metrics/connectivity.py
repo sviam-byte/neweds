@@ -18,16 +18,95 @@ from statsmodels.tsa.vector_ar.var_model import VAR
 from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 
 
+def _as_2d_controls(df: pd.DataFrame, control: Optional[list[str]] = None, control_matrix: Optional[np.ndarray] = None) -> tuple[np.ndarray, list[str]]:
+    """Возвращает (X_ctrl, desc).
+
+    - control: список колонок из df
+    - control_matrix: внешняя матрица регрессоров (time × k)
+    """
+    if control_matrix is not None:
+        X = np.asarray(control_matrix, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        return X, [f"ctrl[{i}]" for i in range(X.shape[1])]
+    if control:
+        cols = [c for c in control if c in df.columns]
+        if cols:
+            X = df[cols].to_numpy(dtype=np.float64)
+            return X, [str(c) for c in cols]
+    return np.empty((len(df), 0), dtype=np.float64), []
+
+
+def _residualize_1d(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if X is None or X.size == 0:
+        return y
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    n = int(min(y.size, X.shape[0]))
+    y = y[:n]
+    X = X[:n, :]
+    # добавляем константу
+    A = np.c_[np.ones(n), X]
+    try:
+        beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+        return y - A @ beta
+    except Exception:
+        return y
+
+
+def _residualize_df(df: pd.DataFrame, control: Optional[list[str]] = None, control_matrix: Optional[np.ndarray] = None) -> tuple[pd.DataFrame, list[str]]:
+    X_ctrl, desc = _as_2d_controls(df, control=control, control_matrix=control_matrix)
+    if X_ctrl.size == 0:
+        return df, []
+    out = pd.DataFrame(index=df.index)
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        # общий dropna по y и X (иначе рассинхрон времени)
+        y = s.to_numpy(dtype=np.float64)
+        mask = np.isfinite(y)
+        if X_ctrl.size:
+            mask = mask & np.isfinite(X_ctrl).all(axis=1)
+        if int(mask.sum()) < 8:
+            out[c] = np.nan
+            continue
+        y_res = _residualize_1d(y[mask], X_ctrl[mask])
+        # вернем на исходную длину
+        tmp = np.full_like(y, np.nan, dtype=np.float64)
+        tmp[mask] = y_res
+        out[c] = tmp
+    return out, desc
+
+
 def correlation_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
     """Вычисляет матрицу корреляции Пирсона для числовых колонок."""
     return data.corr().values
 
 
-def partial_correlation_matrix(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
-    """Вычисляет матрицу частных корреляций через матрицу точности."""
+def partial_correlation_matrix(
+    df: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    control_matrix: Optional[np.ndarray] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Частная корреляция.
+
+    Если передан control_matrix (или control как список регрессоров), считаем
+    корреляцию на резидуалах после линейной регрессии на control.
+
+    Иначе используем прежнюю матрицу точности (для совместимости).
+    """
     cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     n_cols = len(cols)
     n_rows = len(df)
+
+    # Предпочтительно: резидуализация на заданных контролях (честно и прозрачно)
+    if control_matrix is not None or (control is not None and len(control) > 0):
+        sub = df[cols].copy()
+        sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
+        return sub.corr().values
 
     # Защита от проклятия размерности: при N <= P инверсия/псевдоинверсия крайне нестабильна.
     if n_rows <= n_cols + 2:
@@ -168,7 +247,18 @@ def mutual_info_matrix(data: pd.DataFrame, lag: int = 1, control: Optional[list[
 
 
 def mutual_info_matrix_partial(data: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, k: int = DEFAULT_K_MI, **_: dict) -> np.ndarray:
-    """Вычисляет матрицу условной взаимной информации I(X;Y|Z)."""
+    """Partial MI.
+
+    По умолчанию (как раньше): условная MI I(X;Y|Z) через kNN.
+
+    Если передан control_matrix: используем линейную резидуализацию и считаем
+    MI на резидуалах (практичный компромисс для больших N).
+    """
+    control_matrix = _.get("control_matrix", None)
+    if control_matrix is not None:
+        sub = data.copy()
+        sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
+        return mutual_info_matrix(sub, lag=lag, control=None, k=k)
     cols = list(data.columns)
     n_cols = len(cols)
     pmi = np.zeros((n_cols, n_cols), dtype=float)
@@ -239,6 +329,12 @@ def granger_matrix(df: pd.DataFrame, lag: int = DEFAULT_MAX_LAG, control: Option
 
 def granger_matrix_partial(df: pd.DataFrame, lag: int = DEFAULT_MAX_LAG, control: Optional[list[str]] = None, **_: dict) -> np.ndarray:
     """Вычисляет условную причинность Грейнджера (p-value) через многомерную VAR."""
+    control_matrix = _.get("control_matrix", None)
+    if control_matrix is not None:
+        # Резидуализация на внешних контролях и обычный Granger
+        sub = df.copy()
+        sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
+        return granger_matrix(sub, lag=lag, control=None)
     columns = list(df.columns)
     n_cols = len(columns)
     out = np.full((n_cols, n_cols), np.nan, dtype=float)
@@ -376,10 +472,15 @@ def transfer_entropy_matrix(df: pd.DataFrame, lag: int = 1, control: Optional[li
 
 
 def transfer_entropy_matrix_partial(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = None, bins: int = DEFAULT_BINS, **_: dict) -> np.ndarray:
-    """Вычисляет приближенную частную Transfer Entropy через линейную резидуализацию."""
+    """Partial TE через линейную резидуализацию.
+
+    Если передан control_matrix: используем его как общий набор регрессоров.
+    """
     cols = list(df.columns)
     n_cols = len(cols)
     out = np.zeros((n_cols, n_cols))
+
+    control_matrix = _.get("control_matrix", None)
 
     def residualize(y: np.ndarray, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -392,6 +493,23 @@ def transfer_entropy_matrix_partial(df: pd.DataFrame, lag: int = 1, control: Opt
         for j, tgt in enumerate(cols):
             if i == j:
                 continue
+            # общий dropna на src/tgt/controls, иначе рассинхрон
+            if control_matrix is not None:
+                sub = df[[src, tgt]].dropna()
+                if sub.shape[0] <= lag + 1:
+                    out[i, j] = np.nan
+                    continue
+                # выравниваем X_ctrl по тем же индексам
+                X_ctrl, _desc = _as_2d_controls(df, control=control, control_matrix=control_matrix)
+                X_sub = X_ctrl[sub.index.to_numpy()]
+                try:
+                    src_res = residualize(sub[src].values, X_sub)
+                    tgt_res = residualize(sub[tgt].values, X_sub)
+                    out[i, j] = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins)
+                except Exception:
+                    out[i, j] = np.nan
+                continue
+
             ctrl_cols = control if control is not None else [c for c in cols if c not in (src, tgt)]
             ctrl_cols = [c for c in ctrl_cols if c in df.columns]
             sub = df[[src, tgt] + ctrl_cols].dropna()
