@@ -154,6 +154,9 @@ def preprocess_timeseries(
     remove_outliers: bool = True,
     normalize: bool = True,
     fill_missing: bool = True,
+    remove_ar1: bool = False,
+    remove_seasonality: bool = False,
+    season_period: int | None = None,
     check_stationarity: bool = False,
     return_report: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, PreprocessReport]:
@@ -197,6 +200,61 @@ def preprocess_timeseries(
         report.add("[Preprocess] fill_missing: linear interpolate + bfill/ffill")
         out = out.interpolate(method="linear", limit_direction="both", axis=0).bfill().ffill().fillna(0)
 
+    if remove_ar1:
+        report.add("[Preprocess] remove AR(1): y[t] <- y[t] - phi*y[t-1] (phi=lag1 corr)")
+        for col in out.columns:
+            if not pd.api.types.is_numeric_dtype(out[col]):
+                continue
+            x = out[col].astype(float).to_numpy(copy=True)
+            if x.size < 5:
+                continue
+            x0, x1 = x[:-1], x[1:]
+            denom = (np.std(x0) * np.std(x1))
+            phi = float(np.corrcoef(x0, x1)[0, 1]) if denom > 1e-12 else 0.0
+            if not np.isfinite(phi):
+                phi = 0.0
+            y = np.empty_like(x)
+            y[0] = 0.0
+            y[1:] = x1 - phi * x0
+            out[col] = y
+            report.add(f"[Preprocess] AR(1) phi≈{phi:.3f}", col=col)
+
+    if remove_seasonality:
+        # STL сезонность: либо заданный период, либо пробуем оценить.
+        report.add("[Preprocess] remove seasonality: STL (if period detected)")
+        try:
+            from statsmodels.tsa.seasonal import STL
+            from ..analysis import stats as analysis_stats
+        except Exception:
+            STL = None
+            analysis_stats = None
+
+        if STL is not None and analysis_stats is not None:
+            for col in out.columns:
+                if not pd.api.types.is_numeric_dtype(out[col]):
+                    continue
+                x = out[col].astype(float)
+                if x.size < 30:
+                    continue
+                per = int(season_period) if season_period is not None and int(season_period) >= 2 else None
+                if per is None:
+                    try:
+                        ss = analysis_stats.detect_seasonality(x)
+                        cand = ss.get("acf_period")
+                        strength = ss.get("acf_strength")
+                        if cand is not None and strength is not None and float(strength) >= 0.2:
+                            per = int(cand)
+                    except Exception:
+                        per = None
+                if per is None or per < 2:
+                    continue
+                try:
+                    stl = STL(x, period=int(per), robust=True).fit()
+                    out[col] = (x - stl.seasonal).to_numpy()
+                    report.add(f"[Preprocess] STL period={int(per)}", col=col)
+                except Exception:
+                    continue
+
     if normalize:
         report.add("[Preprocess] normalize: z-score")
         cols_to_norm = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
@@ -228,6 +286,9 @@ def load_or_generate(
     remove_outliers: bool = True,
     normalize: bool = True,
     fill_missing: bool = True,
+    remove_ar1: bool = False,
+    remove_seasonality: bool = False,
+    season_period: int | None = None,
     check_stationarity: bool = False,
     return_report: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, PreprocessReport]:
@@ -261,6 +322,9 @@ def load_or_generate(
             remove_outliers=remove_outliers,
             normalize=normalize,
             fill_missing=fill_missing,
+            remove_ar1=remove_ar1,
+            remove_seasonality=remove_seasonality,
+            season_period=season_period,
             check_stationarity=check_stationarity,
             return_report=bool(return_report),
         )

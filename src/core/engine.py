@@ -1257,6 +1257,42 @@ def is_directed_method(variant: str) -> bool:
     return variant.lower() in DIRECTED_METHODS
 
 
+def _pair_score(variant: str, mat: np.ndarray, i: int, j: int) -> float:
+    """Скалярная метрика для одной пары (i,j) из матрицы связности.
+
+    Используется для 3D-"кубиков" по парам.
+
+    Правила:
+    - p-value методы: чем меньше p, тем "лучше" связь -> score = 1 - p (в [0,1])
+    - directed методы: берём i -> j
+    - undirected: берём max(|A[i,j]|, |A[j,i]|)
+    """
+    if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
+        return float("nan")
+    n = int(mat.shape[0])
+    if i < 0 or j < 0 or i >= n or j >= n or i == j:
+        return float("nan")
+
+    try:
+        if is_directed_method(variant):
+            v = float(mat[i, j])
+        else:
+            v = float(mat[i, j])
+            v2 = float(mat[j, i])
+            v = float(max(abs(v), abs(v2)))
+
+        if is_pvalue_method(variant):
+            # p-value: меньше = лучше -> инвертируем.
+            if not np.isfinite(v):
+                return float("nan")
+            v = float(np.clip(v, 0.0, 1.0))
+            return float(1.0 - v)
+
+        return float(abs(v)) if np.isfinite(v) else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def is_control_sensitive_method(variant: str) -> bool:
     # сейчас "partial" = методы с контролем; остальные control игнорируют
     return "_partial" in variant.lower()
@@ -2493,6 +2529,82 @@ class BigMasterTool:
 
                 if cube_matrix_mode == "all":
                     scan_meta["cube"]["selectable_ids"] = [p.get("id") for p in points if p.get("matrix") is not None]
+
+                # --- дополнительные "кубики" по парам (только если ровно 3 переменные
+                # или пользователь явно передал список пар через kwargs).
+                # Идея: один и тот же набор точек (w,lag,start) визуализируем разными метриками
+                # для пар (X–Y, X–Z, Y–Z).
+                try:
+                    cube_pairs = kwargs.get("cube_pairs")
+                except Exception:
+                    cube_pairs = None
+
+                pair_specs: list[tuple[int, int, str]] = []
+                cols0 = list(getattr(df, "columns", []))
+                if cube_pairs:
+                    # ожидаем список вида [(0,1), ("X","Y"), "X-Y", ...]
+                    for item in (cube_pairs or []):
+                        try:
+                            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                a, b = item[0], item[1]
+                            elif isinstance(item, str):
+                                s = item.replace("→", "-").replace(">", "-").replace(":", "-")
+                                a, b = [x.strip() for x in s.split("-")[:2]]
+                            else:
+                                continue
+
+                            if isinstance(a, int) and isinstance(b, int):
+                                i, j = int(a), int(b)
+                                name = f"{cols0[i]}—{cols0[j]}" if i < len(cols0) and j < len(cols0) else f"{i}—{j}"
+                                pair_specs.append((i, j, name))
+                            else:
+                                if str(a) in cols0 and str(b) in cols0:
+                                    i, j = cols0.index(str(a)), cols0.index(str(b))
+                                    pair_specs.append((i, j, f"{a}—{b}"))
+                        except Exception:
+                            continue
+                elif int(df.shape[1]) == 3:
+                    pair_specs = [
+                        (0, 1, f"{cols0[0]}—{cols0[1]}"),
+                        (0, 2, f"{cols0[0]}—{cols0[2]}"),
+                        (1, 2, f"{cols0[1]}—{cols0[2]}"),
+                    ]
+
+                if pair_specs:
+                    cubes_by_pair: dict[str, dict] = {}
+                    for i, j, nm in pair_specs:
+                        pts_p = []
+                        for p in points:
+                            pid = p.get("id")
+                            mat0 = p.get("matrix")
+                            if pid is None or mat0 is None:
+                                continue
+                            scv = _pair_score(variant, np.asarray(mat0), int(i), int(j))
+                            if not np.isfinite(float(scv)):
+                                continue
+                            pts_p.append({
+                                "id": pid,
+                                "window_size": p.get("window_size"),
+                                "lag": p.get("lag"),
+                                "start": p.get("start"),
+                                "end": p.get("end"),
+                                "metric": float(scv),
+                                "tag": p.get("tag"),
+                            })
+
+                        extp = _select_best_median_worst(pts_p, key="metric")
+                        cubes_by_pair[nm] = {
+                            "pair": [int(i), int(j)],
+                            "points": pts_p,
+                            "extremes": {
+                                "best": (pts_p[int(extp["best"])]["id"] if pts_p and extp.get("best") is not None else None),
+                                "median": (pts_p[int(extp["median"])]["id"] if pts_p and extp.get("median") is not None else None),
+                                "worst": (pts_p[int(extp["worst"])]["id"] if pts_p and extp.get("worst") is not None else None),
+                            },
+                        }
+
+                    if cubes_by_pair:
+                        scan_meta["cube_pairs"] = cubes_by_pair
 
             meta["window_scans"] = scan_meta
 

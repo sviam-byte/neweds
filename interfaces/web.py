@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -67,7 +68,7 @@ def main() -> None:
 
     source = st.radio(
         "Источник данных",
-        ["Файл (CSV/XLSX)", "Синтетика (формулы)"],
+        ["Файл (CSV/XLSX)", "Синтетика (формулы)", "Синтетика (пресеты)"],
         index=0,
         horizontal=True,
     )
@@ -78,7 +79,7 @@ def main() -> None:
 
     if source.startswith("Файл"):
         uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx"])
-    else:
+    elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
             c0, c1, c2 = st.columns(3)
             with c0:
@@ -124,6 +125,31 @@ def main() -> None:
                 except Exception as e:
                     st.error(f"Ошибка генерации: {e}")
 
+    else:
+        with st.expander("Синтетика: пресеты", expanded=True):
+            preset = st.selectbox(
+                "Набор",
+                ["Coupled system (X→Y, Z noise, S season)", "Random walks"],
+                index=0,
+                key="preset",
+            )
+            n_samples = st.number_input("n_samples", min_value=20, max_value=200000, value=800, step=10, key="preset_n_samples")
+            seed = st.number_input("seed", min_value=0, max_value=10_000_000, value=42, step=1, key="preset_seed")
+            synth_name = st.text_input("Имя набора (для папки/файлов)", value=synth_name)
+
+            if st.button("Сгенерировать preview", type="secondary", key="preset_preview"):
+                try:
+                    if preset.startswith("Coupled"):
+                        synth_df = generator.generate_coupled_system(n_samples=int(n_samples))
+                    else:
+                        synth_df = generator.generate_random_walks(n_vars=3, n_samples=int(n_samples))
+                    st.success(f"OK: shape={synth_df.shape}")
+                    with st.expander("Preview рядов", expanded=False):
+                        st.line_chart(synth_df)
+                        st.dataframe(synth_df.head(200))
+                except Exception as e:
+                    st.error(f"Ошибка генерации: {e}")
+
     with st.expander("Параметры запуска", expanded=True):
         colA, colB, colC = st.columns(3)
         with colA:
@@ -144,6 +170,9 @@ def main() -> None:
             fill_missing = st.checkbox("Заполнять пропуски (interp)", value=True)
             remove_outliers = st.checkbox("Убирать выбросы (Z)", value=True)
             log_transform = st.checkbox("Лог-преобразование (только >0)", value=False)
+            remove_ar1 = st.checkbox("Убрать AR(1) (прибл. prewhitening)", value=False)
+            remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
+            season_period = st.number_input("Период сезонности (0=авто)", min_value=0, max_value=1000000, value=0, step=1)
 
         with colC:
             output_mode = st.selectbox("Режим вывода", ["both", "html", "excel"], index=0)
@@ -239,24 +268,32 @@ def main() -> None:
                 input_path.write_bytes(uploaded_file.getbuffer())
             else:
                 # генерируем синтетику прямо сейчас (без отдельного клика)
-                x_expr = st.session_state.get("x_expr", "sin(2*pi*t/50) + 0.2*randn()")
-                y_expr = st.session_state.get("y_expr", "0.8*X + 0.3*randn()")
-                z_expr = st.session_state.get("z_expr", "rw(0.5)")
-                # дефолты, если preview не запускали
-                n_samples = int(st.session_state.get("n_samples", 800) or 800)
-                dt = float(st.session_state.get("dt", 1.0) or 1.0)
-                seed = int(st.session_state.get("seed", 42) or 42)
-
-                synth_df = generator.generate_formula_dataset(
-                    n_samples=n_samples,
-                    dt=dt,
-                    seed=seed,
-                    specs=[
-                        generator.FormulaSpec("X", x_expr),
-                        generator.FormulaSpec("Y", y_expr),
-                        generator.FormulaSpec("Z", z_expr),
-                    ],
-                )
+                if source.startswith("Синтетика (пресеты)"):
+                    preset = st.session_state.get("preset", "Coupled system (X→Y, Z noise, S season)")
+                    n_samples = int(st.session_state.get("preset_n_samples", 800) or 800)
+                    seed = int(st.session_state.get("preset_seed", 42) or 42)
+                    np.random.seed(seed)
+                    if str(preset).startswith("Coupled"):
+                        synth_df = generator.generate_coupled_system(n_samples=n_samples)
+                    else:
+                        synth_df = generator.generate_random_walks(n_vars=3, n_samples=n_samples)
+                else:
+                    x_expr = st.session_state.get("x_expr", "sin(2*pi*t/50) + 0.2*randn()")
+                    y_expr = st.session_state.get("y_expr", "0.8*X + 0.3*randn()")
+                    z_expr = st.session_state.get("z_expr", "rw(0.5)")
+                    n_samples = int(st.session_state.get("n_samples", 800) or 800)
+                    dt = float(st.session_state.get("dt", 1.0) or 1.0)
+                    seed = int(st.session_state.get("seed", 42) or 42)
+                    synth_df = generator.generate_formula_dataset(
+                        n_samples=n_samples,
+                        dt=dt,
+                        seed=seed,
+                        specs=[
+                            generator.FormulaSpec("X", x_expr),
+                            generator.FormulaSpec("Y", y_expr),
+                            generator.FormulaSpec("Z", z_expr),
+                        ],
+                    )
                 input_path = run_dir / f"{stem}_input.csv"
                 synth_df.to_csv(input_path, index=False)
         except Exception as e:
@@ -274,6 +311,9 @@ def main() -> None:
                     fill_missing=fill_missing,
                     remove_outliers=remove_outliers,
                     log_transform=log_transform,
+                    remove_ar1=bool(remove_ar1),
+                    remove_seasonality=bool(remove_seasonality),
+                    season_period=(None if int(season_period) == 0 else int(season_period)),
                 )
 
                 # main windows

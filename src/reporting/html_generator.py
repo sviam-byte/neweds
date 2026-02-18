@@ -196,6 +196,35 @@ class HTMLReportGenerator:
                 "extremes": cube.get("extremes") or {},
                 "matrices": mats,
             }
+
+        # Дополнительные кубы по парам (X–Y, X–Z, Y–Z), если доступны.
+        cp = sc.get("cube_pairs") or {}
+        if isinstance(cp, dict) and cp:
+            out_cp: dict = {}
+            for name, item in cp.items():
+                if not isinstance(item, dict):
+                    continue
+                pts = []
+                for p in (item.get("points") or []):
+                    pid = p.get("id")
+                    if not pid:
+                        continue
+                    pts.append({
+                        "id": pid,
+                        "window_size": p.get("window_size"),
+                        "lag": p.get("lag"),
+                        "start": p.get("start"),
+                        "end": p.get("end"),
+                        "metric": p.get("metric"),
+                        "tag": p.get("tag"),
+                    })
+                out_cp[str(name)] = {
+                    "pair": item.get("pair"),
+                    "points": pts,
+                    "extremes": item.get("extremes") or {},
+                }
+            if out_cp:
+                payload["cube_pairs"] = out_cp
         return payload
 
     def _build_scans_interactive_html(self, payload: dict) -> str:
@@ -215,9 +244,9 @@ class HTMLReportGenerator:
                 f"  <div><div class='scanplot' id='{prefix}_{key}_plot'></div></div>"
                 f"  <div>"
                 f"    <div class='scancontrols'>"
-                f"      <button class='btn' id='{prefix}_{key}_best'>best</button>"
-                f"      <button class='btn' id='{prefix}_{key}_median'>median</button>"
-                f"      <button class='btn' id='{prefix}_{key}_worst'>worst</button>"
+                f"      <button class='btn' id='{prefix}_{key}_best'>лучшее</button>"
+                f"      <button class='btn' id='{prefix}_{key}_median'>медиана</button>"
+                f"      <button class='btn' id='{prefix}_{key}_worst'>худшее</button>"
                 f"      <select class='sel' id='{prefix}_{key}_sel'></select>"
                 f"    </div>"
                 f"    <div class='muted' id='{prefix}_{key}_meta'></div>"
@@ -228,22 +257,29 @@ class HTMLReportGenerator:
             )
 
         if payload.get("window_pos"):
-            blocks.append(_scan_block("Window position scan", "pos"))
+            blocks.append(_scan_block("Скан: положение окна", "pos"))
         if payload.get("window_size"):
-            blocks.append(_scan_block("Window size scan", "wsize"))
+            blocks.append(_scan_block("Скан: размер окна", "wsize"))
         if payload.get("lag"):
-            blocks.append(_scan_block("Lag scan", "lag"))
+            blocks.append(_scan_block("Скан: лаг", "lag"))
         if payload.get("cube"):
+            pair_sel_html = ""
+            if payload.get("cube_pairs"):
+                pair_sel_html = (
+                    f"<div class='muted' style='margin-bottom:6px'>"
+                    f"Пара для кубика: <select class='sel' id='{prefix}_cube_pair_sel'></select>"
+                    f"</div>"
+                )
             blocks.append(
                 f"<div class='scanblock'>"
-                f"<h3>Cube scan (window_size × lag × position)</h3>"
+                f"<h3>3D-скан: размер окна × лаг × положение</h3>"
                 f"<div class='grid2'>"
-                f"  <div><div class='scanplot' id='{prefix}_cube_plot'></div></div>"
+                f"  <div>{pair_sel_html}<div class='scanplot' id='{prefix}_cube_plot'></div></div>"
                 f"  <div>"
                 f"    <div class='scancontrols'>"
-                f"      <button class='btn' id='{prefix}_cube_best'>best</button>"
-                f"      <button class='btn' id='{prefix}_cube_median'>median</button>"
-                f"      <button class='btn' id='{prefix}_cube_worst'>worst</button>"
+                f"      <button class='btn' id='{prefix}_cube_best'>лучшее</button>"
+                f"      <button class='btn' id='{prefix}_cube_median'>медиана</button>"
+                f"      <button class='btn' id='{prefix}_cube_worst'>худшее</button>"
                 f"      <select class='sel' id='{prefix}_cube_sel'></select>"
                 f"    </div>"
                 f"    <div class='muted' id='{prefix}_cube_meta'></div>"
@@ -584,8 +620,8 @@ class HTMLReportGenerator:
             cube = meta.get("window_cube") or {}
             if isinstance(cube, dict) and (cube.get("points") or []):
                 try:
-                    b64 = self._plot_cube3d_b64(cube.get("points") or [], f"{variant}: window×lag×position")
-                    cube_html = "<div class='card'><h3>3D: window×lag×position</h3><img src='data:image/png;base64," + b64 + "'/></div>"
+                    b64 = self._plot_cube3d_b64(cube.get("points") or [], f"{variant}: размер окна×лаг×положение")
+                    cube_html = "<div class='card'><h3>3D: размер окна × лаг × положение</h3><img src='data:image/png;base64," + b64 + "'/></div>"
                 except Exception:
                     cube_html = ""
 
@@ -686,11 +722,12 @@ function _renderHeat(id, labels, z){
 function _renderLine(id, xs, ys, xTitle){
   if(!window.Plotly){ return; }
   const d = document.getElementById(id); if(!d){ return; }
-  Plotly.newPlot(d, [{type:'scatter', mode:'lines+markers', x:xs||[], y:ys||[]}], {margin:{t:10,r:10,b:40,l:45}, xaxis:{title:xTitle}, yaxis:{title:'metric'}});
+  Plotly.newPlot(d, [{type:'scatter', mode:'lines+markers', x:xs||[], y:ys||[]}], {margin:{t:10,r:10,b:40,l:45}, xaxis:{title:xTitle}, yaxis:{title:'метрика'}});
 }
 function _init1D(prefix, key, data, labels){
   const plotId = `${prefix}_${key}_plot`, heatId = `${prefix}_${key}_heat`, selId = `${prefix}_${key}_sel`, metaId = `${prefix}_${key}_meta`;
-  _renderLine(plotId, (data.curve||{}).x||[], (data.curve||{}).y||[], key);
+  const xTitle = (key==='pos') ? 'старт окна' : (key==='wsize') ? 'размер окна' : (key==='lag') ? 'лаг' : String(key);
+  _renderLine(plotId, (data.curve||{}).x||[], (data.curve||{}).y||[], xTitle);
   const ticks = data.ticks||[]; const mats = data.matrices||{}; const ext = data.extremes||{};
   const sel = document.getElementById(selId); if(!sel){ return; }
   sel.innerHTML = ticks.map((t,i)=>`<option value="${t.id}">#${i} ${t.id}</option>`).join('');
@@ -701,17 +738,35 @@ function _init1D(prefix, key, data, labels){
 }
 function _initCube(prefix, data, labels){
   if(!window.Plotly){ return; }
-  const pts = data.points||[], mats=data.matrices||{}, ext=data.extremes||{};
+  const mats=data.matrices||{};
   const plot = document.getElementById(`${prefix}_cube_plot`), sel=document.getElementById(`${prefix}_cube_sel`), meta=document.getElementById(`${prefix}_cube_meta`);
   if(!plot || !sel){ return; }
-  Plotly.newPlot(plot, [{type:'scatter3d', mode:'markers', x:pts.map(p=>p.window_size), y:pts.map(p=>p.lag), z:pts.map(p=>p.start), text:pts.map(p=>`${p.id} q=${_fmt(p.metric)} ${p.tag||''}`), marker:{size:4,color:pts.map(p=>p.metric),colorscale:'Viridis'}}], {margin:{t:10,r:10,b:10,l:10}, scene:{xaxis:{title:'window'},yaxis:{title:'lag'},zaxis:{title:'start'}}});
-  sel.innerHTML = pts.map((p,i)=>`<option value="${p.id}">#${i} ${p.id}</option>`).join('');
-  const show=(id)=>{ _renderHeat(`${prefix}_cube_heat`, labels, mats[id]); const p=pts.find(x=>x.id===id)||{}; if(meta){ meta.textContent = JSON.stringify(p); } if(sel.value!==id){ sel.value=id; } };
-  sel.onchange = ()=>show(sel.value);
-  plot.on('plotly_click', (ev)=>{ const p=(ev.points||[])[0]; if(p){ const id=pts[p.pointIndex] && pts[p.pointIndex].id; if(id){ show(id); } }});
-  ['best','median','worst'].forEach(tag=>{ const b=document.getElementById(`${prefix}_cube_${tag}`); if(b){ b.onclick=()=>{ if(ext[tag]) show(ext[tag]); }; }});
-  const first = ext.best || (pts[0]||{}).id; if(first){ show(first); }
+
+  const pairSel = document.getElementById(`${prefix}_cube_pair_sel`);
+
+  const render = (pts, ext)=>{
+    pts = pts||[]; ext = ext||{};
+    Plotly.newPlot(plot, [{type:'scatter3d', mode:'markers', x:pts.map(p=>p.window_size), y:pts.map(p=>p.lag), z:pts.map(p=>p.start), text:pts.map(p=>`${p.id} q=${_fmt(p.metric)} ${p.tag||''}`), marker:{size:4,color:pts.map(p=>p.metric),colorscale:'Viridis'}}], {margin:{t:10,r:10,b:10,l:10}, scene:{xaxis:{title:'размер окна'},yaxis:{title:'лаг'},zaxis:{title:'старт окна'}}});
+    sel.innerHTML = pts.map((p,i)=>`<option value="${p.id}">#${i} ${p.id}</option>`).join('');
+    const show=(id)=>{ _renderHeat(`${prefix}_cube_heat`, labels, mats[id]); const p=pts.find(x=>x.id===id)||{}; if(meta){ meta.textContent = JSON.stringify(p); } if(sel.value!==id){ sel.value=id; } };
+    sel.onchange = ()=>show(sel.value);
+    plot.on('plotly_click', (ev)=>{ const p=(ev.points||[])[0]; if(p){ const id=pts[p.pointIndex] && pts[p.pointIndex].id; if(id){ show(id); } }});
+    ['best','median','worst'].forEach(tag=>{ const b=document.getElementById(`${prefix}_cube_${tag}`); if(b){ b.onclick=()=>{ if(ext[tag]) show(ext[tag]); }; }});
+    const first = ext.best || (pts[0]||{}).id; if(first){ show(first); }
+  };
+
+  const cps = data.cube_pairs||null;
+  if(pairSel && cps){
+    const names = Object.keys(cps);
+    pairSel.innerHTML = names.map(n=>`<option value="${n}">${n}</option>`).join('');
+    const choose = (nm)=>{ const d=cps[nm]||{}; render(d.points||[], d.extremes||{}); };
+    pairSel.onchange = ()=>choose(pairSel.value);
+    if(names[0]){ choose(names[0]); }
+  }else{
+    render(data.points||[], data.extremes||{});
+  }
 }
+
 function _initScans(){
   document.querySelectorAll('script[id^="scan_data_"]').forEach((el)=>{
     try{
@@ -719,7 +774,11 @@ function _initScans(){
       if(payload.window_pos){ _init1D(prefix, 'pos', payload.window_pos, labels); }
       if(payload.window_size){ _init1D(prefix, 'wsize', payload.window_size, labels); }
       if(payload.lag){ _init1D(prefix, 'lag', payload.lag, labels); }
-      if(payload.cube){ _initCube(prefix, payload.cube, labels); }
+      if(payload.cube){
+        // если есть кубы по парам — прокидываем их внутрь куб-пейлоада
+        if(payload.cube_pairs){ payload.cube.cube_pairs = payload.cube_pairs; }
+        _initCube(prefix, payload.cube, labels);
+      }
     }catch(e){ console.warn('scan init failed', e); }
   });
 }

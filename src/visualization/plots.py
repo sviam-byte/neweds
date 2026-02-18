@@ -281,9 +281,10 @@ def plot_window_cube_3d(points: list[dict], title: str) -> BytesIO:
     fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.08, label="metric")
 
     ax.set_title(title, fontsize=10)
-    ax.set_xlabel("window_size")
-    ax.set_ylabel("lag")
-    ax.set_zlabel("start_pos")
+    # Русские подписи: так понятнее в отчёте/скриншотах.
+    ax.set_xlabel("размер окна")
+    ax.set_ylabel("лаг")
+    ax.set_zlabel("старт окна")
     plt.tight_layout()
     fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
