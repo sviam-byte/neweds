@@ -93,6 +93,16 @@ class App(tk.Tk):
         self.cube_gallery_k = tk.IntVar(value=1)
         self.cube_gallery_limit = tk.IntVar(value=60)
 
+        # Упрощение для больших N: режим расчёта по парам/соседям
+        self.pair_mode = tk.StringVar(value="auto")  # auto|full|pairs|neighbors|random
+        self.pair_auto_threshold = tk.IntVar(value=600)  # если N>=threshold, auto -> neighbors
+        self.pairs_text = tk.StringVar(value="")
+        self.max_pairs = tk.IntVar(value=50000)
+        self.neighbor_kind = tk.StringVar(value="26")  # 6|26
+        self.neighbor_radius = tk.IntVar(value=1)
+        self.screen_metric = tk.StringVar(value="corr")  # reserved (future)
+        self.topk_per_node = tk.IntVar(value=10)  # reserved (future)
+
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -526,6 +536,14 @@ class App(tk.Tk):
             cube_gallery_limit=int(self.cube_gallery_limit.get()),
             method_options=method_options,
             cube_pairs=cube_pairs,
+            pair_mode=str(self.pair_mode.get()),
+            pair_auto_threshold=int(self.pair_auto_threshold.get()),
+            pairs_text=str(self.pairs_text.get() or ""),
+            max_pairs=int(self.max_pairs.get()),
+            neighbor_kind=str(self.neighbor_kind.get()),
+            neighbor_radius=int(self.neighbor_radius.get()),
+            screen_metric=str(self.screen_metric.get()),
+            topk_per_node=int(self.topk_per_node.get()),
         )
 
         os.makedirs(out_dir, exist_ok=True)

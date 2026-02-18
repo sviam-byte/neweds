@@ -1438,6 +1438,7 @@ def compute_connectivity_variant(
     lag=1,
     control=None,
     *,
+    pairs: Optional[list[tuple[int, int]]] = None,
     partial_mode: str = "global",
     pairwise_policy: str = "others",
     custom_controls: Optional[List[str]] = None,
@@ -1526,7 +1527,14 @@ def compute_connectivity_variant(
 
         if variant in method_mapping:
             metric_func = get_metric_func(variant)
-            return metric_func(data, lag=lag, control=control, control_matrix=control_matrix, control_desc=control_desc)
+            return metric_func(
+                data,
+                lag=lag,
+                control=control,
+                control_matrix=control_matrix,
+                control_desc=control_desc,
+                pairs=pairs,
+            )
 
         return connectivity.correlation_matrix(data)
     except Exception as e:
@@ -1582,6 +1590,7 @@ def analyze_sliding_windows_with_metric(
     stride: int,
     *,
     lag: int = 1,
+    pairs: Optional[list[tuple[int, int]]] = None,
     start_min: int | None = None,
     start_max: int | None = None,
     max_windows: int = 400,
@@ -1637,7 +1646,7 @@ def analyze_sliding_windows_with_metric(
             break
         chunk = data.iloc[start:end]
         try:
-            mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)))
+            mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)), pairs=pairs)
             score = _lag_quality(variant, mat)
         except Exception as ex:
             logging.error(f"[SlidingWindow] {variant} win={w} start={start}: {ex}")
@@ -2240,6 +2249,141 @@ class BigMasterTool:
                 "explain": "Для каждой пары (Xi, Xj) исключено линейное влияние набора control.",
             }
 
+        # --- large-N simplification: full matrix vs pairs vs spatial neighbors ---
+        n_cols = int(df.shape[1])
+        pair_mode = str(kwargs.get("pair_mode") or "auto").lower()
+        auto_thr = int(kwargs.get("pair_auto_threshold") or 0)
+        if auto_thr <= 0:
+            auto_thr = 600
+
+        def _parse_pairs_text(text: str) -> list[tuple[int, int]]:
+            """Parse user pairs like: a-b; a->b; 0-1; 0->1.
+
+            Names are matched against df.columns.
+            """
+            text = (text or "").strip()
+            if not text:
+                return []
+            # normalize separators
+            raw_items: list[str] = []
+            for token in text.replace("—", "-").replace(",", ";").split(";"):
+                tt = token.strip()
+                if tt:
+                    raw_items.append(tt)
+            col_to_idx = {str(c): i for i, c in enumerate(df.columns)}
+            pairs_out: list[tuple[int, int]] = []
+            for it in raw_items:
+                if "->" in it:
+                    a, b = [x.strip() for x in it.split("->", 1)]
+                elif "-" in it:
+                    a, b = [x.strip() for x in it.split("-", 1)]
+                else:
+                    continue
+                def _to_idx(x: str) -> Optional[int]:
+                    if x.isdigit():
+                        ix = int(x)
+                        return ix if 0 <= ix < n_cols else None
+                    return col_to_idx.get(x)
+                ia = _to_idx(a)
+                ib = _to_idx(b)
+                if ia is None or ib is None or ia == ib:
+                    continue
+                pairs_out.append((int(ia), int(ib)))
+            return pairs_out
+
+        def _build_neighbor_pairs(kind: str, radius: int) -> list[tuple[int, int]]:
+            """Spatial neighborhood pairs from coords_df (voxel_id/x/y/z).
+
+            If coords are missing, returns empty list.
+            """
+            if getattr(self, "coords_df", None) is None or self.coords_df is None:
+                return []
+            coords = self.coords_df
+            if coords.empty:
+                return []
+            # map voxel_id -> column index
+            col_to_idx = {str(c): i for i, c in enumerate(df.columns)}
+            # build coord -> index
+            coord_to_idx: dict[tuple[int, int, int], int] = {}
+            for _, r in coords.iterrows():
+                vid = str(r.get("voxel_id"))
+                if vid not in col_to_idx:
+                    continue
+                try:
+                    x = int(r.get("x"))
+                    y = int(r.get("y"))
+                    z = int(r.get("z"))
+                except Exception:
+                    continue
+                coord_to_idx[(x, y, z)] = int(col_to_idx[vid])
+
+            if not coord_to_idx:
+                return []
+            kind = str(kind or "26")
+            radius = int(max(1, radius))
+            pairs_out: list[tuple[int, int]] = []
+            # neighbor offsets
+            offsets: list[tuple[int, int, int]] = []
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    for dz in range(-radius, radius + 1):
+                        if dx == dy == dz == 0:
+                            continue
+                        if kind == "6":
+                            if abs(dx) + abs(dy) + abs(dz) == 1:
+                                offsets.append((dx, dy, dz))
+                        else:
+                            # 26-neighborhood (chebyshev)
+                            if max(abs(dx), abs(dy), abs(dz)) <= radius:
+                                offsets.append((dx, dy, dz))
+
+            seen = set()
+            for (x, y, z), i in coord_to_idx.items():
+                for dx, dy, dz in offsets:
+                    j = coord_to_idx.get((x + dx, y + dy, z + dz))
+                    if j is None or j == i:
+                        continue
+                    a, b = (i, j) if i < j else (j, i)
+                    key = (a, b)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pairs_out.append((a, b))
+            return pairs_out
+
+        # resolve effective pairs list
+        pairs_idx: Optional[list[tuple[int, int]]] = None
+        if pair_mode == "auto":
+            pair_mode = "neighbors" if n_cols >= auto_thr else "full"
+        if pair_mode == "pairs":
+            pairs_idx = _parse_pairs_text(str(kwargs.get("pairs_text") or ""))
+        elif pair_mode == "neighbors":
+            pairs_idx = _build_neighbor_pairs(str(kwargs.get("neighbor_kind") or "26"), int(kwargs.get("neighbor_radius") or 1))
+        elif pair_mode == "random":
+            # random undirected pairs (fallback when no coords). Deterministic seed.
+            max_pairs = int(max(1, kwargs.get("max_pairs") or 50000))
+            rng = np.random.default_rng(12345)
+            # sample indices in upper triangle
+            m = min(max_pairs, max(1, n_cols * 5))
+            pairs_out = set()
+            while len(pairs_out) < m:
+                i = int(rng.integers(0, n_cols))
+                j = int(rng.integers(0, n_cols))
+                if i == j:
+                    continue
+                a, b = (i, j) if i < j else (j, i)
+                pairs_out.add((a, b))
+            pairs_idx = list(pairs_out)
+        else:
+            pairs_idx = None
+
+        if pairs_idx is not None:
+            meta["pair_mode"] = str(pair_mode)
+            meta["pairs_count"] = int(len(pairs_idx))
+            meta["pairs_explain"] = (
+                "Матрица считается упрощённо: только по выбранным парам (остальные пары заполняются дефолтом метода)."
+            )
+
         # --- lag selection ---
         supports_lag = is_directed_method(variant) or variant.startswith("granger") or variant.startswith("te_") or variant.startswith("ah_")
         lag_sel = (kwargs.get("lag_selection") or self.config.lag_selection or "optimize").lower()
@@ -2252,6 +2396,7 @@ class BigMasterTool:
                 variant,
                 lag=int(max(1, lag)),
                 control=kwargs.get("control"),
+                pairs=pairs_idx,
                 partial_mode=kwargs.get("partial_mode", "pairwise"),
                 pairwise_policy=kwargs.get("pairwise_policy", "others"),
                 custom_controls=kwargs.get("custom_controls"),
@@ -2343,6 +2488,7 @@ class BigMasterTool:
                     df, variant, window_size=default_w, stride=stride, lag=int(chosen_lag),
                     start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                     return_matrices=True,
+                    pairs=pairs_idx,
                 )
                 ticks = []
                 for i, t in enumerate((info or {}).get("ticks") or []):
@@ -2371,6 +2517,7 @@ class BigMasterTool:
                         df, variant, window_size=int(w), stride=stride, lag=int(chosen_lag),
                         start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                         return_matrices=False,
+                        pairs=pairs_idx,
                     )
                     bw = (info or {}).get("best_window") or {}
                     q = bw.get("metric", float("nan"))
@@ -2440,6 +2587,7 @@ class BigMasterTool:
                         start_min=w_start_min, start_max=w_start_max,
                         max_windows=per_combo_max_windows,
                         return_matrices=(cube_matrix_mode == "all"),
+                        pairs=pairs_idx,
                     )
                     for t in (info or {}).get("ticks") or []:
                         try:
@@ -2668,7 +2816,7 @@ class BigMasterTool:
 
             for w, lag in combos:
                 stride = int(stride_override) if stride_override is not None else int(max(1, int(w) // 5))
-                w_info = analyze_sliding_windows_with_metric(df, variant, window_size=int(w), stride=int(stride), lag=int(lag))
+                w_info = analyze_sliding_windows_with_metric(df, variant, window_size=int(w), stride=int(stride), lag=int(lag), pairs=pairs_idx)
                 bw = w_info.get("best_window") if w_info else None
                 q = float(bw.get("metric", float("nan"))) if bw else float("nan")
                 grid.append({"window_size": int(w), "lag": int(lag), "best_metric": q, "best_start": (bw.get("start") if bw else None)})
@@ -2710,7 +2858,7 @@ class BigMasterTool:
 
         for w in window_sizes:
             stride = int(stride_override) if stride_override is not None else int(max(1, w // 5))
-            w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag)
+            w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag, pairs=pairs_idx)
             if not w_info:
                 continue
             # best window for this w
