@@ -46,6 +46,16 @@ class App(tk.Tk):
         self.include_scans = tk.BooleanVar(value=True)
         self.include_matrix_tables = tk.BooleanVar(value=False)
 
+        # Предобработка (до анализа)
+        self.preproc_enabled = tk.BooleanVar(value=True)
+        self.preproc_remove_outliers = tk.BooleanVar(value=True)
+        self.preproc_remove_ar1 = tk.BooleanVar(value=False)
+        self.preproc_remove_seasonality = tk.BooleanVar(value=False)
+        self.preproc_season_period = tk.IntVar(value=0)  # 0 => auto
+        self.preproc_log_transform = tk.BooleanVar(value=False)
+        self.preproc_normalize = tk.BooleanVar(value=True)
+        self.preproc_fill_missing = tk.BooleanVar(value=True)
+
         # Скан-параметры (window/lag/position)
         self.scan_window_pos = tk.BooleanVar(value=False)
         self.scan_window_size = tk.BooleanVar(value=False)
@@ -69,6 +79,10 @@ class App(tk.Tk):
         self.cube_eval_limit = tk.IntVar(value=225)
         self.cube_matrix_mode = tk.StringVar(value="all")  # selected|all
         self.cube_matrix_limit = tk.IntVar(value=225)
+
+        # Кубики по парам: какие пары строить (для 3–4 переменных)
+        self.cube_pairs_all = tk.BooleanVar(value=False)
+        self.cube_pairs_text = tk.StringVar(value="")
 
         # Cube gallery (матрицы в отчёте для выбранных точек куба)
         self.cube_gallery_mode = tk.StringVar(value="extremes")  # extremes|topbottom|quantiles
@@ -131,26 +145,63 @@ class App(tk.Tk):
         ).pack()
 
     def _build_gen_tab(self, parent: ttk.Frame) -> None:
+        """Строит вкладку генерации синтетических данных по пресетам."""
         frame = ttk.LabelFrame(parent, text="Создание синтетических данных", padding=10)
         frame.pack(fill="x", padx=10, pady=10)
 
         self.gen_samples = tk.IntVar(value=500)
         self.gen_coupling = tk.DoubleVar(value=0.8)
+        self.gen_noise = tk.DoubleVar(value=0.2)
+        self.gen_ar_phi = tk.DoubleVar(value=0.7)
+        self.gen_season_period = tk.IntVar(value=50)
+        self.gen_nvars = tk.IntVar(value=3)
+        self.gen_preset = tk.StringVar(value="Система: X→Y + шум + сезон")
 
         r1 = ttk.Frame(frame)
-        r1.pack(fill="x", pady=5)
+        r1.pack(fill="x", pady=4)
         ttk.Label(r1, text="Количество точек:").pack(side="left")
         ttk.Entry(r1, textvariable=self.gen_samples, width=10).pack(side="left", padx=5)
 
         r2 = ttk.Frame(frame)
-        r2.pack(fill="x", pady=5)
-        ttk.Label(r2, text="Сила связи (X->Y):").pack(side="left")
-        ttk.Entry(r2, textvariable=self.gen_coupling, width=10).pack(side="left", padx=5)
+        r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="Пресет:").pack(side="left")
+        ttk.Combobox(
+            r2,
+            textvariable=self.gen_preset,
+            values=[
+                "Система: X→Y + шум + сезон",
+                "Случайные блуждания",
+                "Независимые AR(1)",
+                "Цепочка 4D: X1→X2→X3→X4",
+            ],
+            state="readonly",
+            width=32,
+        ).pack(side="left", padx=5)
+
+        r3 = ttk.Frame(frame)
+        r3.pack(fill="x", pady=4)
+        ttk.Label(r3, text="Число переменных (для RW/AR1):").pack(side="left")
+        ttk.Spinbox(r3, from_=2, to=8, textvariable=self.gen_nvars, width=5).pack(side="left", padx=5)
+
+        r4 = ttk.Frame(frame)
+        r4.pack(fill="x", pady=4)
+        ttk.Label(r4, text="Сила связи (coupling):").pack(side="left")
+        ttk.Entry(r4, textvariable=self.gen_coupling, width=10).pack(side="left", padx=5)
+        ttk.Label(r4, text="Шум (sigma):").pack(side="left", padx=(15, 0))
+        ttk.Entry(r4, textvariable=self.gen_noise, width=10).pack(side="left", padx=5)
+        ttk.Label(r4, text="AR(1) phi:").pack(side="left", padx=(15, 0))
+        ttk.Entry(r4, textvariable=self.gen_ar_phi, width=10).pack(side="left", padx=5)
+        ttk.Label(r4, text="Период сезона:").pack(side="left", padx=(15, 0))
+        ttk.Entry(r4, textvariable=self.gen_season_period, width=10).pack(side="left", padx=5)
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", pady=10)
-        ttk.Button(btn_frame, text="Генерировать систему (X->Y, Шум, Сезон)", command=self._run_gen_system).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Генерировать случ. блуждания", command=self._run_gen_rw).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Сгенерировать и сохранить...", command=self._run_gen).pack(side="left", padx=5)
+        ttk.Label(
+            frame,
+            text="Примечание: после сохранения можно сразу открыть файл во вкладке «Один файл».",
+            foreground="gray",
+        ).pack(anchor="w")
 
     def _build_settings_panel(self) -> None:
         frame = ttk.LabelFrame(self, text="Настройки методов анализа", padding=10)
@@ -189,34 +240,50 @@ class App(tk.Tk):
         ttk.Checkbutton(p_frame, text="Сканы", variable=self.include_scans).pack(side="left", padx=6)
         ttk.Checkbutton(p_frame, text="Таблицы матриц", variable=self.include_matrix_tables).pack(side="left", padx=6)
 
+        pre = ttk.LabelFrame(frame, text="Предобработка (до анализа)", padding=6)
+        pre.pack(fill="x", pady=6)
+        pr0 = ttk.Frame(pre)
+        pr0.pack(fill="x", pady=2)
+        ttk.Checkbutton(pr0, text="Включить предобработку", variable=self.preproc_enabled).pack(side="left")
+        ttk.Checkbutton(pr0, text="Убирать выбросы", variable=self.preproc_remove_outliers).pack(side="left", padx=10)
+        ttk.Checkbutton(pr0, text="Убирать AR(1)", variable=self.preproc_remove_ar1).pack(side="left", padx=10)
+        ttk.Checkbutton(pr0, text="Убирать сезонность (STL)", variable=self.preproc_remove_seasonality).pack(side="left", padx=10)
+        ttk.Label(pr0, text="Период сезонности (0=авто):").pack(side="left", padx=(10, 5))
+        ttk.Entry(pr0, textvariable=self.preproc_season_period, width=6).pack(side="left")
+        pr1 = ttk.Frame(pre)
+        pr1.pack(fill="x", pady=2)
+        ttk.Checkbutton(pr1, text="Лог-преобразование (+)", variable=self.preproc_log_transform).pack(side="left")
+        ttk.Checkbutton(pr1, text="Нормализация (z-score)", variable=self.preproc_normalize).pack(side="left", padx=10)
+        ttk.Checkbutton(pr1, text="Заполнять пропуски", variable=self.preproc_fill_missing).pack(side="left", padx=10)
+
         scans = ttk.LabelFrame(frame, text="Сканы window/lag/position (опционально)", padding=6)
         scans.pack(fill="x", pady=6)
 
         r0 = ttk.Frame(scans)
         r0.pack(fill="x", pady=2)
-        ttk.Checkbutton(r0, text="pos", variable=self.scan_window_pos).pack(side="left")
-        ttk.Checkbutton(r0, text="window_size", variable=self.scan_window_size).pack(side="left", padx=10)
+        ttk.Checkbutton(r0, text="положение окна", variable=self.scan_window_pos).pack(side="left")
+        ttk.Checkbutton(r0, text="размер окна", variable=self.scan_window_size).pack(side="left", padx=10)
         ttk.Checkbutton(r0, text="lag", variable=self.scan_lag).pack(side="left", padx=10)
-        ttk.Checkbutton(r0, text="cube (3D)", variable=self.scan_cube).pack(side="left", padx=10)
+        ttk.Checkbutton(r0, text="куб (3D)", variable=self.scan_cube).pack(side="left", padx=10)
 
         r1 = ttk.Frame(scans)
         r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="window_sizes:").pack(side="left")
+        ttk.Label(r1, text="Размеры окон:").pack(side="left")
         ttk.Entry(r1, textvariable=self.window_sizes_text, width=24).pack(side="left", padx=5)
-        ttk.Label(r1, text="default_w:").pack(side="left", padx=(15, 0))
+        ttk.Label(r1, text="Окно по умолч.:").pack(side="left", padx=(15, 0))
         ttk.Entry(r1, textvariable=self.window_size_default, width=6).pack(side="left", padx=5)
-        ttk.Label(r1, text="stride:").pack(side="left", padx=(15, 0))
+        ttk.Label(r1, text="Шаг (stride):").pack(side="left", padx=(15, 0))
         ttk.Entry(r1, textvariable=self.window_stride, width=6).pack(side="left", padx=5)
-        ttk.Label(r1, text="max_windows:").pack(side="left", padx=(15, 0))
+        ttk.Label(r1, text="Макс. окон:").pack(side="left", padx=(15, 0))
         ttk.Entry(r1, textvariable=self.window_max_windows, width=6).pack(side="left", padx=5)
 
         r1b = ttk.Frame(scans)
         r1b.pack(fill="x", pady=2)
-        ttk.Label(r1b, text="window_min/max/step:").pack(side="left")
+        ttk.Label(r1b, text="Окно мин/макс/шаг:").pack(side="left")
         ttk.Entry(r1b, textvariable=self.window_min, width=6).pack(side="left", padx=2)
         ttk.Entry(r1b, textvariable=self.window_max, width=6).pack(side="left", padx=2)
         ttk.Entry(r1b, textvariable=self.window_step, width=6).pack(side="left", padx=2)
-        ttk.Label(r1b, text="cube_eval_limit:").pack(side="left", padx=(10, 0))
+        ttk.Label(r1b, text="Лимит точек куба:").pack(side="left", padx=(10, 0))
         ttk.Entry(r1b, textvariable=self.cube_eval_limit, width=8).pack(side="left", padx=5)
 
         r2 = ttk.Frame(scans)
@@ -225,20 +292,27 @@ class App(tk.Tk):
         ttk.Entry(r2, textvariable=self.window_start_min, width=8).pack(side="left", padx=5)
         ttk.Label(r2, text="start_max (0=auto):").pack(side="left", padx=(10, 0))
         ttk.Entry(r2, textvariable=self.window_start_max, width=8).pack(side="left", padx=5)
-        ttk.Label(r2, text="lag_min/max/step:").pack(side="left", padx=(10, 0))
+        ttk.Label(r2, text="Лаг мин/макс/шаг:").pack(side="left", padx=(10, 0))
         ttk.Entry(r2, textvariable=self.lag_min, width=4).pack(side="left", padx=2)
         ttk.Entry(r2, textvariable=self.lag_max, width=4).pack(side="left", padx=2)
         ttk.Entry(r2, textvariable=self.lag_step, width=4).pack(side="left", padx=2)
-        ttk.Label(r2, text="cube combos:").pack(side="left", padx=(10, 0))
+        ttk.Label(r2, text="Комбо (w×lag):").pack(side="left", padx=(10, 0))
         ttk.Entry(r2, textvariable=self.cube_combo_limit, width=6).pack(side="left", padx=5)
-        ttk.Label(r2, text="cube_matrix_mode:").pack(side="left", padx=(10, 0))
+        ttk.Label(r2, text="Матрицы для куба:").pack(side="left", padx=(10, 0))
         ttk.Combobox(r2, textvariable=self.cube_matrix_mode, values=["selected", "all"], state="readonly", width=9).pack(side="left", padx=5)
-        ttk.Label(r2, text="matrix_limit:").pack(side="left", padx=(10, 0))
+        ttk.Label(r2, text="Лимит матриц:").pack(side="left", padx=(10, 0))
         ttk.Entry(r2, textvariable=self.cube_matrix_limit, width=8).pack(side="left", padx=5)
+
+        r2b = ttk.Frame(scans)
+        r2b.pack(fill="x", pady=2)
+        ttk.Checkbutton(r2b, text="Кубики по всем парам (для 3–4 переменных)", variable=self.cube_pairs_all).pack(side="left")
+        ttk.Label(r2b, text="Пары для куба (если не все):").pack(side="left", padx=(15, 5))
+        ttk.Entry(r2b, textvariable=self.cube_pairs_text, width=40).pack(side="left", padx=5)
+        ttk.Label(r2b, text="пример: X-Y; X-Z; Y-Z").pack(side="left", padx=(10, 0))
 
         r3 = ttk.Frame(scans)
         r3.pack(fill="x", pady=2)
-        ttk.Label(r3, text="cube gallery:").pack(side="left")
+        ttk.Label(r3, text="Галерея куба:").pack(side="left")
         ttk.Combobox(
             r3,
             textvariable=self.cube_gallery_mode,
@@ -251,7 +325,7 @@ class App(tk.Tk):
         ttk.Label(r3, text="limit:").pack(side="left", padx=(10, 0))
         ttk.Entry(r3, textvariable=self.cube_gallery_limit, width=6).pack(side="left", padx=5)
 
-        adv = ttk.LabelFrame(frame, text="Advanced per-method options (JSON, optional)", padding=6)
+        adv = ttk.LabelFrame(frame, text="Доп. опции по методам (JSON, необязательно)", padding=6)
         adv.pack(fill="both", expand=False, pady=6)
         self.method_options_text = tk.Text(adv, height=4)
         self.method_options_text.pack(fill="both", expand=True)
@@ -345,6 +419,26 @@ class App(tk.Tk):
         except Exception:
             method_options = {}
 
+        # --- cube pairs (для 3–4 переменных) ---
+        cube_pairs = None
+        try:
+            if bool(self.scan_cube.get()):
+                ncols = int(df.shape[1])
+                if bool(self.cube_pairs_all.get()) and (3 <= ncols <= 4):
+                    cube_pairs = [(i, j) for i in range(ncols) for j in range(i + 1, ncols)]
+                else:
+                    raw_pairs = (self.cube_pairs_text.get() or "").strip()
+                    if raw_pairs:
+                        parts: list[str] = []
+                        for token in raw_pairs.replace("—", "-").split(";"):
+                            for t in token.split(","):
+                                tt = t.strip()
+                                if tt:
+                                    parts.append(tt)
+                        cube_pairs = parts if parts else None
+        except Exception:
+            cube_pairs = None
+
         # --- scan params ---
         stride = int(self.window_stride.get())
         stride = None if stride <= 0 else stride
@@ -378,6 +472,7 @@ class App(tk.Tk):
             cube_gallery_k=int(self.cube_gallery_k.get()),
             cube_gallery_limit=int(self.cube_gallery_limit.get()),
             method_options=method_options,
+            cube_pairs=cube_pairs,
         )
 
         os.makedirs(out_dir, exist_ok=True)
@@ -409,7 +504,17 @@ class App(tk.Tk):
             return
 
         try:
-            df = data_loader.load_or_generate(fp)
+            df = data_loader.load_or_generate(
+                fp,
+                preprocess=bool(self.preproc_enabled.get()),
+                log_transform=bool(self.preproc_log_transform.get()),
+                remove_outliers=bool(self.preproc_remove_outliers.get()),
+                normalize=bool(self.preproc_normalize.get()),
+                fill_missing=bool(self.preproc_fill_missing.get()),
+                remove_ar1=bool(self.preproc_remove_ar1.get()),
+                remove_seasonality=bool(self.preproc_remove_seasonality.get()),
+                season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
+            )
             out_dir = os.path.dirname(fp)
             name = Path(fp).stem
 
@@ -442,7 +547,17 @@ class App(tk.Tk):
         for f in files:
             fp = os.path.join(folder, f)
             try:
-                df = data_loader.load_or_generate(fp)
+                df = data_loader.load_or_generate(
+                    fp,
+                    preprocess=bool(self.preproc_enabled.get()),
+                    log_transform=bool(self.preproc_log_transform.get()),
+                    remove_outliers=bool(self.preproc_remove_outliers.get()),
+                    normalize=bool(self.preproc_normalize.get()),
+                    fill_missing=bool(self.preproc_fill_missing.get()),
+                    remove_ar1=bool(self.preproc_remove_ar1.get()),
+                    remove_seasonality=bool(self.preproc_remove_seasonality.get()),
+                    season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
+                )
                 name = Path(f).stem
                 file_out_dir = os.path.join(out_root, name)
                 self._run_tool(df, file_out_dir, "report")
@@ -455,22 +570,60 @@ class App(tk.Tk):
 
         messagebox.showinfo("Готово", f"Обработано {success_count} из {len(files)} файлов.\nРезультаты в: {out_root}")
 
-    def _run_gen_system(self) -> None:
+    def _run_gen(self) -> None:
+        """Диспетчер генератора пресетов для синтетических наборов данных."""
         try:
-            df = generator.generate_coupled_system(
-                n_samples=self.gen_samples.get(),
-                coupling_strength=self.gen_coupling.get(),
-            )
-            self._save_and_open_gen(df, "coupled_system")
+            preset = (self.gen_preset.get() or "").strip()
+            n = int(self.gen_samples.get())
+            coupling = float(self.gen_coupling.get())
+            noise = float(self.gen_noise.get())
+            phi = float(self.gen_ar_phi.get())
+            per = int(self.gen_season_period.get())
+            nvars = int(self.gen_nvars.get())
+
+            if preset.startswith("Система"):
+                df = generator.generate_coupled_system(
+                    n_samples=n,
+                    coupling_strength=coupling,
+                    noise_level=noise,
+                )
+                name = "system_xy_noise_season"
+            elif preset.startswith("Случайные"):
+                df = generator.generate_random_walks(n_vars=nvars, n_samples=n)
+                name = f"random_walks_{nvars}v"
+            elif preset.startswith("Независимые"):
+                df = generator.generate_independent_ar1(
+                    n_vars=nvars,
+                    n_samples=n,
+                    phi=phi,
+                    noise_level=noise,
+                )
+                name = f"ar1_{nvars}v"
+            elif preset.startswith("Цепочка 4D"):
+                df = generator.generate_chain_system_4d(
+                    n_samples=n,
+                    coupling_strength=coupling,
+                    noise_level=noise,
+                    season_period=per,
+                )
+                name = "chain_4d"
+            else:
+                messagebox.showerror("Ошибка", f"Неизвестный пресет: {preset}")
+                return
+
+            self._save_and_open_gen(df, name)
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Ошибка", str(e))
+
+    def _run_gen_system(self) -> None:
+        """Совместимость со старой кнопкой генерации системы."""
+        self.gen_preset.set("Система: X→Y + шум + сезон")
+        self._run_gen()
 
     def _run_gen_rw(self) -> None:
-        try:
-            df = generator.generate_random_walks(n_samples=self.gen_samples.get())
-            self._save_and_open_gen(df, "random_walks")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        """Совместимость со старой кнопкой генерации блужданий."""
+        self.gen_preset.set("Случайные блуждания")
+        self._run_gen()
 
     def _save_and_open_gen(self, df: pd.DataFrame, name_base: str) -> None:
         f = filedialog.asksaveasfilename(initialfile=f"{name_base}.csv", filetypes=[("CSV", "*.csv")])
