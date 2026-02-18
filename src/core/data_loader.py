@@ -191,13 +191,44 @@ def _detect_time_like_col(col: pd.Series) -> bool:
     return False
 
 
-def read_input_table(filepath: str, header: str = "auto") -> pd.DataFrame:
-    """Чтение CSV/XLSX с поддержкой автодетекта заголовка и одной строковой колонки."""
+def read_input_table(
+    filepath: str,
+    header: str = "auto",
+    *,
+    usecols: Any = "auto",
+    csv_engine: str = "auto",
+) -> pd.DataFrame:
+    """Чтение CSV/XLSX/PARQUET с поддержкой автодетекта заголовка и «CSV в ячейке».
+
+    Для больших файлов:
+    - XLSX + usecols="auto": сначала читаем только 1-ю колонку (частый кейс, когда
+      каждая строка лежит в одной ячейке и содержит `x,y,z,t0,...`). Это в разы
+      снижает память.
+    - CSV + csv_engine="pyarrow": ускоряет чтение больших CSV (если установлен pyarrow).
+    """
     fp = str(filepath)
-    if fp.lower().endswith(".csv"):
-        df0 = pd.read_csv(fp, header=None)
+    low = fp.lower()
+
+    if low.endswith(".parquet"):
+        df0 = pd.read_parquet(fp)
+        if header not in {"auto", "yes", "no"}:
+            raise ValueError("header must be one of: auto|yes|no")
+        return df0
+
+    if low.endswith(".csv"):
+        kw: Dict[str, Any] = {"header": None}
+        if csv_engine in {"pyarrow", "c", "python"}:
+            kw["engine"] = csv_engine
+        df0 = pd.read_csv(fp, **kw)
     else:
-        df0 = pd.read_excel(fp, header=None)
+        xl_usecols = usecols
+        if usecols == "auto":
+            xl_usecols = [0]
+        try:
+            df0 = pd.read_excel(fp, header=None, usecols=xl_usecols)
+        except Exception:
+            # fallback: читаем целиком
+            df0 = pd.read_excel(fp, header=None)
     df0 = _maybe_split_single_column(df0)
 
     if header not in {"auto", "yes", "no"}:
@@ -217,6 +248,14 @@ def tidy_timeseries_table(
     df: pd.DataFrame,
     time_col: str = "auto",
     transpose: str = "auto",
+    *,
+    dtype: str | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    time_stride: int | None = None,
+    feature_limit: int | None = None,
+    feature_sampling: str = "first",
+    feature_seed: int = 13,
 ) -> pd.DataFrame:
     """Превращает сырую таблицу в numeric матрицу вида time × features."""
     out = df.copy()
@@ -227,6 +266,10 @@ def tidy_timeseries_table(
         out = voxel_wide_to_timeseries(out)
     except Exception:
         pass
+
+    # Если есть coords — это уже time×voxel. Авто-транспонирование запрещаем,
+    # иначе можно случайно перевернуть огромные данные и убить память.
+    has_coords = bool(getattr(out, "attrs", {}) and out.attrs.get("coords") is not None)
 
     if time_col not in {"auto", "none"} and time_col not in out.columns:
         raise ValueError(f"time_col '{time_col}' not found in columns")
@@ -242,10 +285,57 @@ def tidy_timeseries_table(
 
     if transpose not in {"auto", "yes", "no"}:
         raise ValueError("transpose must be one of: auto|yes|no")
-    do_t = (out.shape[0] < out.shape[1]) if transpose == "auto" else (transpose == "yes")
+    if has_coords and transpose == "auto":
+        do_t = False
+    else:
+        do_t = (out.shape[0] < out.shape[1]) if transpose == "auto" else (transpose == "yes")
     if do_t:
         out = out.T
         out.columns = [f"c{i+1}" for i in range(out.shape[1])]
+
+    # --- Big-data friendly slicing (до предобработки) ---
+    # time slicing
+    try:
+        t0 = int(time_start) if time_start is not None else None
+        t1 = int(time_end) if time_end is not None else None
+        ts = int(time_stride) if time_stride is not None else None
+        if ts is not None and ts <= 0:
+            ts = None
+        if t0 is not None or t1 is not None or ts is not None:
+            out = out.iloc[slice(t0, t1, ts), :]
+    except Exception:
+        pass
+
+    # feature downselect
+    try:
+        if feature_limit is not None and int(feature_limit) > 0 and out.shape[1] > int(feature_limit):
+            mode = str(feature_sampling or "first").strip().lower()
+            k = int(feature_limit)
+            if mode in {"random", "rand"}:
+                rng = np.random.default_rng(int(feature_seed))
+                cols = list(out.columns)
+                pick = rng.choice(len(cols), size=k, replace=False)
+                out = out.loc[:, [cols[i] for i in sorted(pick)]]
+            elif mode in {"variance", "var", "topvar"}:
+                sub = out
+                if sub.shape[0] > 2000:
+                    sub = sub.iloc[:: max(1, sub.shape[0] // 2000), :]
+                v = sub.var(axis=0, skipna=True).to_numpy(dtype=float)
+                order = np.argsort(-np.nan_to_num(v, nan=-np.inf))
+                keep = [out.columns[i] for i in order[:k]]
+                out = out.loc[:, keep]
+            else:
+                out = out.iloc[:, :k]
+    except Exception:
+        pass
+
+    # dtype cast (последним, чтобы не плодить копии)
+    if dtype:
+        dt = str(dtype).strip().lower()
+        if dt in {"float32", "f4"}:
+            out = out.astype(np.float32)
+        elif dt in {"float64", "f8"}:
+            out = out.astype(np.float64)
 
     out = out.dropna(axis=0, how="all")
     return out
@@ -386,6 +476,16 @@ def load_or_generate(
     header: str = "auto",
     time_col: str = "auto",
     transpose: str = "auto",
+    # big data / performance
+    dtype: str | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    time_stride: int | None = None,
+    feature_limit: int | None = None,
+    feature_sampling: str = "first",
+    feature_seed: int = 13,
+    usecols: Any = "auto",
+    csv_engine: str = "auto",
     preprocess: bool = True,
     log_transform: bool = False,
     remove_outliers: bool = True,
@@ -418,8 +518,19 @@ def load_or_generate(
         для последующей визуализации шагов предобработки в UI/HTML-отчёте.
     """
     try:
-        raw = read_input_table(filepath, header=header)
-        df = tidy_timeseries_table(raw, time_col=time_col, transpose=transpose)
+        raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
+        df = tidy_timeseries_table(
+            raw,
+            time_col=time_col,
+            transpose=transpose,
+            dtype=dtype,
+            time_start=time_start,
+            time_end=time_end,
+            time_stride=time_stride,
+            feature_limit=feature_limit,
+            feature_sampling=feature_sampling,
+            feature_seed=feature_seed,
+        )
         coords_df = None
         try:
             coords_df = df.attrs.get("coords")
