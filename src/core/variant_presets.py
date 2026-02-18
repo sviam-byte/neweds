@@ -5,6 +5,23 @@ from __future__ import annotations
 from typing import List, Tuple
 
 
+# Алиасы коротких имён → каноническое имя в реестре (registry.py).
+# Позволяет использовать сокращения в пресетах и пользовательском вводе.
+VARIANT_ALIASES: dict[str, str] = {
+    "corr_full": "correlation_full",
+    "corr_partial": "correlation_partial",
+    "corr_directed": "correlation_directed",
+    "coh_full": "coherence_full",
+    "coh_partial": "coherence_partial",
+    "fftcoh_full": "coherence_full",  # legacy alias
+}
+
+
+def _resolve_alias(name: str) -> str:
+    """Возвращает каноническое имя метрики (или само имя, если алиаса нет)."""
+    return VARIANT_ALIASES.get(name, name)
+
+
 PRESETS = {
     # максимально безопасный по времени и интерпретации
     "basic": [
@@ -15,17 +32,25 @@ PRESETS = {
     # частотные/сложностные
     "spectral": [
         "coh_full",
-        "fftcoh_full",
+        "coh_partial",
     ],
     "entropy": [
         "mutinf_full",
         "mutinf_partial",
+    ],
+    # нелинейные (без параметров)
+    "nonlinear": [
+        "dcor_full",
+        "dcor_partial",
+        "ordinal_full",
     ],
     # направленные/каузальные
     "causal": [
         "granger_directed",
         "te_directed",
         "ah_directed",
+        "dcor_directed",
+        "ordinal_directed",
     ],
     # «всё адекватное»: без слишком экспериментальных комбинаций
     "full": [
@@ -34,6 +59,8 @@ PRESETS = {
         "coh_full",
         "mutinf_full",
         "mutinf_partial",
+        "dcor_full",
+        "ordinal_full",
         "granger_directed",
         "te_directed",
         "ah_directed",
@@ -42,8 +69,16 @@ PRESETS = {
         "corr_full",
         "corr_partial",
         "coh_full",
+        "coh_partial",
         "mutinf_full",
         "mutinf_partial",
+        "dcor_full",
+        "dcor_partial",
+        "dcor_directed",
+        "ordinal_full",
+        "ordinal_directed",
+        "granger_full",
+        "granger_partial",
         "granger_directed",
         "te_full",
         "te_partial",
@@ -79,7 +114,8 @@ def expand_variants(tokens: List[str]) -> Tuple[List[str], str]:
             explain.append(f"preset '{key}' -> {', '.join(vs)}")
             out.extend(vs)
         else:
-            out.append(key)
+            # Пробуем разрешить алиас, чтобы пользователь мог писать 'corr_full'
+            out.append(_resolve_alias(key))
 
     # unique with stable order
     seen = set()

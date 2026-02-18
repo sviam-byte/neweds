@@ -36,7 +36,10 @@ STABLE_METHODS = [
     "correlation_full",
     "correlation_partial",
     "coherence_full",
+    "coherence_partial",
     "granger_full",
+    "dcor_full",
+    "ordinal_full",
 ]
 
 # Экспериментальные методы (базовый список)
@@ -49,6 +52,9 @@ EXPERIMENTAL_METHODS_BASE = [
     "ah_full",
     "ah_partial",
     "ah_directed",
+    "dcor_partial",
+    "dcor_directed",
+    "ordinal_directed",
 ]
 
 # Если pyinform недоступен, скрываем TE-методы
@@ -78,6 +84,8 @@ DIRECTED_METHODS = {
     "ah_full",
     "ah_partial",
     "ah_directed",
+    "dcor_directed",
+    "ordinal_directed",
 }
 
 # Информация о методах
@@ -105,6 +113,30 @@ METHOD_INFO = {
     "coherence_full": {
         "title": "Когерентность",
         "meaning": "Частотная синхронизация. Обычно в [0, 1]. Больше = сильнее.",
+    },
+    "coherence_partial": {
+        "title": "Частичная когерентность",
+        "meaning": "Частотная синхронизация при контроле. Обычно в [0, 1]. Больше = сильнее.",
+    },
+    "dcor_full": {
+        "title": "Дистанционная корреляция (dCor)",
+        "meaning": "Нелинейная зависимость без параметров. [0, 1]. dCor=0 ⟺ независимость.",
+    },
+    "dcor_partial": {
+        "title": "Partial dCor",
+        "meaning": "dCor при контроле (через резидуализацию). [0, 1].",
+    },
+    "dcor_directed": {
+        "title": "Lagged dCor (directed)",
+        "meaning": "dCor(X(t), Y(t+lag)). Нелинейная направленная зависимость.",
+    },
+    "ordinal_full": {
+        "title": "Ordinal MI (permutation)",
+        "meaning": "Зависимость через порядковые паттерны (Bandt-Pompe). ≥0. Устойчива к шуму.",
+    },
+    "ordinal_directed": {
+        "title": "Ordinal MI (directed)",
+        "meaning": "Лаговая ordinal MI. Больше = сильнее направленная зависимость.",
     },
     "h2_full": {
         "title": "H2 (полная)", 
@@ -157,6 +189,70 @@ METHOD_INFO = {
 }
 
 
+
+
+@dataclass(slots=True)
+class ComputationContract:
+    """Контракт вычисления — явная декларация что/как/почему считалось.
+
+    Каждый результат (матрица) сопровождается контрактом, позволяющим
+    однозначно воспроизвести и интерпретировать результат.
+    """
+
+    variant: str = ""
+    input_channels: int = 0
+    input_T: int = 0
+    input_missing_frac: float = 0.0
+
+    preprocess_steps: list = None  # type: ignore[assignment]
+    controls: list = None  # type: ignore[assignment]
+    control_strategy: str = "none"
+
+    directed: bool = False
+    directed_lag: int = 1
+    lag_selection: str = "fixed"
+
+    validity_warnings: list = None  # type: ignore[assignment]
+
+    output_shape: tuple = (0, 0)
+    output_type: str = "matrix_NxN"
+
+    seed: int | None = None
+    config_hash: str = ""
+
+    def __post_init__(self):
+        if self.preprocess_steps is None:
+            self.preprocess_steps = []
+        if self.controls is None:
+            self.controls = []
+        if self.validity_warnings is None:
+            self.validity_warnings = []
+
+    def as_dict(self) -> dict:
+        return {
+            "variant": self.variant,
+            "input": {"channels": self.input_channels, "T": self.input_T, "missing_frac": self.input_missing_frac},
+            "preprocess": list(self.preprocess_steps),
+            "controls": {"strategy": self.control_strategy, "variables": list(self.controls)},
+            "directed": {"is_directed": self.directed, "lag": self.directed_lag, "lag_selection": self.lag_selection},
+            "validity": list(self.validity_warnings),
+            "output": {"shape": list(self.output_shape), "type": self.output_type},
+            "repro": {"seed": self.seed, "config_hash": self.config_hash},
+        }
+
+    def summary_text(self) -> str:
+        lines = [
+            f"Считали: {self.variant}",
+            f"Вход: {self.input_channels} каналов × {self.input_T} точек (пропуски: {self.input_missing_frac:.1%})",
+            f"Предобработка: {', '.join(self.preprocess_steps) if self.preprocess_steps else 'нет'}",
+            f"Контроль: {self.control_strategy} ({', '.join(self.controls) if self.controls else '—'})",
+        ]
+        if self.directed:
+            lines.append(f"Направление: lag={self.directed_lag}, выбор={self.lag_selection}")
+        if self.validity_warnings:
+            lines.append(f"Предупреждения: {'; '.join(self.validity_warnings)}")
+        lines.append(f"Выход: {self.output_type} {self.output_shape}")
+        return "\n".join(lines)
 
 
 @dataclass(slots=True)

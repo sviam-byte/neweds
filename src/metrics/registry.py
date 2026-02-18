@@ -30,12 +30,20 @@ METRICS_REGISTRY: dict[str, MetricFunc] = {
     "mutinf_full": connectivity.mutual_info_matrix,
     "mutinf_partial": connectivity.mutual_info_matrix_partial,
     "coherence_full": connectivity.coherence_matrix,
+    "coherence_partial": connectivity.coherence_matrix_partial,
     "granger_full": connectivity.granger_matrix,
     "granger_partial": connectivity.granger_matrix_partial,
     "granger_directed": connectivity.granger_matrix,
     "te_full": connectivity.transfer_entropy_matrix,
     "te_partial": connectivity.transfer_entropy_matrix_partial,
     "te_directed": connectivity.transfer_entropy_matrix,
+    # --- spec metric #6: Distance correlation ---
+    "dcor_full": connectivity.dcor_matrix,
+    "dcor_partial": connectivity.dcor_matrix_partial,
+    "dcor_directed": connectivity.dcor_matrix_directed,
+    # --- spec metric #7: Ordinal / Permutation dependence ---
+    "ordinal_full": connectivity.ordinal_matrix,
+    "ordinal_directed": connectivity.ordinal_matrix_directed,
 }
 
 

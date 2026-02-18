@@ -1224,37 +1224,12 @@ class MethodSpec:
 
 # -----------------------------
 # Метод-метаданные и логика
+# (PVAL_METHODS, DIRECTED_METHODS, METHOD_INFO импортированы из config.py
+#  через `from ..config import *` выше)
 # -----------------------------
 
-# p-value методы: меньше = сильнее свидетельство связи (нужно invert_threshold=True)
-PVAL_METHODS = {
-    "granger_full",
-    "granger_partial",
-    "granger_directed",
-}
-
-# directed методы: матрица A[i,j] интерпретируется как i -> j
-DIRECTED_METHODS = {
-    "correlation_directed",
-    "h2_directed",
-    "granger_full",
-    "granger_partial",
-    "granger_directed",
-    "te_full",
-    "te_partial",
-    "te_directed",
-    "ah_full",
-    "ah_partial",
-    "ah_directed",
-}
-
-
-def is_pvalue_method(variant: str) -> bool:
-    return variant.lower() in PVAL_METHODS
-
-
-def is_directed_method(variant: str) -> bool:
-    return variant.lower() in DIRECTED_METHODS
+# is_pvalue_method, is_directed_method, is_control_sensitive_method
+# уже импортированы из config.py через `from ..config import *`
 
 
 def _pair_score(variant: str, mat: np.ndarray, i: int, j: int) -> float:
@@ -1293,49 +1268,10 @@ def _pair_score(variant: str, mat: np.ndarray, i: int, j: int) -> float:
         return float("nan")
 
 
-def is_control_sensitive_method(variant: str) -> bool:
-    # сейчас "partial" = методы с контролем; остальные control игнорируют
-    return "_partial" in variant.lower()
+# is_control_sensitive_method — из config.py
 
 
-METHOD_INFO: Dict[str, Dict[str, str]] = {
-    "correlation_full": {
-        "title": "Корреляция (полная)",
-        "meaning": "Линейная связь. Значение в [-1, 1]. |value| ближе к 1 = сильнее.",
-    },
-    "correlation_partial": {
-        "title": "Частичная корреляция",
-        "meaning": "Линейная связь при контроле остальных переменных. [-1, 1].",
-    },
-    "correlation_directed": {
-        "title": "Лаговая корреляция (directed)",
-        "meaning": "Оценка направленной связи через сдвиг по лагу. Чем больше |value|, тем сильнее.",
-    },
-    "mutinf_full": {
-        "title": "Взаимная информация (MI)",
-        "meaning": "Нелинейная зависимость. >= 0. Больше = сильнее.",
-    },
-    "mutinf_partial": {
-        "title": "Частичная MI",
-        "meaning": "MI при контроле переменных. >= 0. Больше = сильнее.",
-    },
-    "coherence_full": {
-        "title": "Когерентность",
-        "meaning": "Частотная синхронизация. Обычно в [0, 1]. Больше = сильнее.",
-    },
-    "h2_full": {"title": "H2 (полная)", "meaning": "Нелинейная связность. Обычно в [0, 1]. Больше = сильнее."},
-    "h2_partial": {"title": "H2 (partial)", "meaning": "H2 при контроле. Обычно в [0, 1]. Больше = сильнее."},
-    "h2_directed": {"title": "H2 (directed)", "meaning": "Направленная H2. Больше = сильнее."},
-    "granger_full": {"title": "Granger (p-values)", "meaning": "p-value теста. Меньше = сильнее свидетельство причинности."},
-    "granger_partial": {"title": "Granger partial (p-values)", "meaning": "Granger partial (linear control; best lag up to L): p-value после удаления влияния control. Меньше = сильнее."},
-    "granger_directed": {"title": "Granger directed (p-values)", "meaning": "То же семейство p-values. Меньше = сильнее."},
-    "te_full": {"title": "Transfer Entropy", "meaning": "Направленный поток информации. Больше = сильнее."},
-    "te_partial": {"title": "Transfer Entropy (partial)", "meaning": "TE при контроле. Больше = сильнее."},
-    "te_directed": {"title": "Transfer Entropy (directed)", "meaning": "TE (directed). Больше = сильнее."},
-    "ah_full": {"title": "AH (directed)", "meaning": "Нелинейная направленная мера. Больше = сильнее."},
-    "ah_partial": {"title": "AH (partial)", "meaning": "AH при контроле. Больше = сильнее."},
-    "ah_directed": {"title": "AH (directed)", "meaning": "AH (directed). Больше = сильнее."},
-}
+# METHOD_INFO — из config.py (через `from ..config import *`)
 
 
 def _is_pvalue_method(variant: str) -> bool:
@@ -3029,6 +2965,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable experimental sliding-window analyses.",
     )
+    parser.add_argument(
+        "--no-excel",
+        action="store_true",
+        help="Skip Excel report generation.",
+    )
+    parser.add_argument(
+        "--report-html",
+        default=None,
+        dest="report_html",
+        help="Path for HTML report output (optional).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -3038,7 +2985,7 @@ if __name__ == "__main__":
     configure_warnings(quiet=args.quiet_warnings)
 
     filepath = os.path.abspath(args.input_file)
-    output_path = args.output or os.path.join(save_folder, "AllMethods_Full.xlsx")
+    output_path = args.output or os.path.join(SAVE_FOLDER, "AllMethods_Full.xlsx")
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -3053,7 +3000,7 @@ if __name__ == "__main__":
         fill_missing=True,
         check_stationarity=not args.no_stationarity_check,
     )
-    tool.run_all_methods(precompute_controls=not args.no_excel, precompute_pairs=not args.no_excel)
+    tool.run_all_methods()
     do_excel = not args.no_excel
     do_report = bool(args.report_html)
     if not do_excel and not do_report:
@@ -3064,13 +3011,6 @@ if __name__ == "__main__":
             output_path,
             threshold=args.graph_threshold,
             p_value_alpha=args.pvalue_alpha,
-            window_size=100,
-            overlap=50,
-            log_transform=args.log,
-            remove_outliers=not args.no_outliers,
-            normalize=not args.no_normalize,
-            fill_missing=True,
-            check_stationarity=not args.no_stationarity_check,
         )
 
     if do_report:
