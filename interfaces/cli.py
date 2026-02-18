@@ -79,6 +79,9 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             '  {"preset":"basic","method_options":{"te_directed":{"scan_cube":0}}}'
         )
         print("  qc_enabled=1; save_series_bundle=1")
+        print("  dtype=float32; feature_limit=2000; feature_sampling=variance")
+        print("  time_start=0; time_end=6000; time_stride=2  # обрезка/даунсэмплинг по времени")
+        print("  usecols=auto; csv_engine=pyarrow  # быстрее для больших CSV")
         print("Пусто -> дефолты.\n")
         user_text = input("Config> ").strip()
 
@@ -104,6 +107,16 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             "header",
             "time_col",
             "transpose",
+            # big data
+            "dtype",
+            "time_start",
+            "time_end",
+            "time_stride",
+            "feature_limit",
+            "feature_sampling",
+            "feature_seed",
+            "usecols",
+            "csv_engine",
         ]:
             if key in opts:
                 load_kwargs[key] = opts[key]
