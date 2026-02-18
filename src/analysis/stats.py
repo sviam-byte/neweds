@@ -202,10 +202,12 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
 
     Возвращает таблицу (rows = voxel) с:
       - missing_frac
-      - mean/std
+      - mean/std/robust_std (MAD-based)
+      - outlier_frac (по robust z > 3)
       - drift_slope (линейный тренд)
       - spikes_frac (доля больших скачков по производной)
       - ar1 (corr(x[t], x[t-1]))
+      - stationarity_hint (ADF p-value, предупреждение, не истина)
 
     Если переданы coords (voxel_id,x,y,z) — подмешивает их в результат.
     """
@@ -227,6 +229,28 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         x = s.to_numpy(dtype=np.float64)
         mean = float(np.nanmean(x)) if np.isfinite(np.nanmean(x)) else np.nan
         std = float(np.nanstd(x)) if np.isfinite(np.nanstd(x)) else np.nan
+
+        # --- Robust std (MAD * 1.4826) ---
+        robust_std = np.nan
+        try:
+            xf = x[np.isfinite(x)]
+            if xf.size >= 5:
+                med = np.median(xf)
+                mad = np.median(np.abs(xf - med))
+                robust_std = float(mad * 1.4826)  # scale для совпадения с std при нормальности
+        except Exception:
+            robust_std = np.nan
+
+        # --- Outlier fraction (robust z > 3) ---
+        outlier_frac = np.nan
+        try:
+            xf = x[np.isfinite(x)]
+            if xf.size >= 5 and robust_std > 1e-12:
+                med = np.median(xf)
+                rz = np.abs(xf - med) / (robust_std + 1e-12)
+                outlier_frac = float((rz > 3.0).mean())
+        except Exception:
+            outlier_frac = np.nan
 
         # drift: slope в линейной регрессии x ~ t
         slope = np.nan
@@ -263,15 +287,31 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         except Exception:
             ar1 = np.nan
 
+        # --- Stationarity hint (ADF p-value) ---
+        stationarity_pval = np.nan
+        try:
+            xf = x[np.isfinite(x)]
+            if xf.size >= 20:
+                _, stationarity_pval = test_stationarity(pd.Series(xf))
+                if stationarity_pval is None:
+                    stationarity_pval = np.nan
+                else:
+                    stationarity_pval = float(stationarity_pval)
+        except Exception:
+            stationarity_pval = np.nan
+
         out_rows.append(
             {
                 "voxel_id": str(col),
                 "missing_frac": missing,
                 "mean": mean,
                 "std": std,
+                "robust_std": robust_std,
+                "outlier_frac": outlier_frac,
                 "drift_slope": slope,
                 "spikes_frac": spikes_frac,
                 "ar1": ar1,
+                "stationarity_pval": stationarity_pval,
             }
         )
 
