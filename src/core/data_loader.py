@@ -10,11 +10,11 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ..config import DEFAULT_OUTLIER_Z
 from .preprocessing import additional_preprocessing
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import adfuller
 import numpy as np
+from scipy import stats
 
 
 @dataclass
@@ -341,13 +341,187 @@ def tidy_timeseries_table(
     return out
 
 
+# ---------------------------------------------------------------------------
+#  Доп. утилиты предобработки: выбросы и ранговая нормализация
+# ---------------------------------------------------------------------------
+
+def _rank_normalize_1d(x: np.ndarray, *, mode: str = "dense", ties: str = "average") -> np.ndarray:
+    """Ранговая нормализация (структурная): значения -> ранги.
+
+    Пример (dense): [100, 33, 98, 2] -> [4, 2, 3, 1]
+    """
+    x = np.asarray(x, dtype=float)
+    out = np.full_like(x, np.nan, dtype=float)
+    m = np.isfinite(x)
+    if m.sum() == 0:
+        return out
+
+    ties = str(ties or "average").strip().lower()
+    if ties not in {"average", "min", "max", "dense", "ordinal", "first"}:
+        ties = "average"
+
+    if ties == "first":
+        idx = np.where(m)[0]
+        vals = x[idx]
+        order = np.lexsort((idx, vals))
+        ranks = np.empty_like(order, dtype=float)
+        ranks[order] = np.arange(1, order.size + 1, dtype=float)
+        out[idx] = ranks
+    else:
+        method = "ordinal" if ties == "ordinal" else ties
+        out[m] = stats.rankdata(x[m], method=method)
+
+    mode = str(mode or "dense").strip().lower()
+    if mode in {"pct", "percent", "percentile"}:
+        denom = max(1.0, float(np.nanmax(out) - 1.0))
+        out[m] = (out[m] - 1.0) / denom
+    return out
+
+
+def _apply_outliers_1d(
+    x: np.ndarray,
+    *,
+    rule: str = "robust_z",
+    action: str = "mask",
+    z: float = 5.0,
+    k: float = 1.5,
+    abs_thr: float | None = None,
+    p_low: float = 0.5,
+    p_high: float = 99.5,
+    hampel_window: int = 7,
+    jump_thr: float | None = None,
+    local_median_window: int = 7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Находит/обрабатывает выбросы в 1D и возвращает (new_x, mask)."""
+    x = np.asarray(x, dtype=float)
+    y = x.copy()
+    m = np.isfinite(x)
+    mask = np.zeros_like(m, dtype=bool)
+    rule = str(rule or "robust_z").strip().lower()
+    action = str(action or "mask").strip().lower()
+
+    if m.sum() == 0:
+        return y, mask
+
+    def _apply_action(msk: np.ndarray) -> None:
+        nonlocal y
+        if not msk.any():
+            return
+        if action in {"mask", "nan"}:
+            y[msk] = np.nan
+            return
+        if action in {"median"}:
+            med = float(np.nanmedian(y[m]))
+            y[msk] = med
+            return
+        if action in {"local_median"}:
+            s = pd.Series(y)
+            local = s.rolling(window=int(max(3, local_median_window)), center=True, min_periods=1).median().to_numpy()
+            y[msk] = local[msk]
+            return
+        if action in {"clip", "winsorize"}:
+            # Клиппинг к заданным перцентильным границам (задаётся p_low/p_high)
+            vals = y[m]
+            lo = float(np.nanpercentile(vals, float(p_low)))
+            hi = float(np.nanpercentile(vals, float(p_high)))
+            y[msk] = np.clip(y[msk], lo, hi)
+            return
+        y[msk] = np.nan
+
+    vals = y[m]
+
+    if rule in {"z", "zscore"}:
+        mu = float(np.nanmean(vals))
+        sd = float(np.nanstd(vals)) + 1e-12
+        mask[m] = np.abs((vals - mu) / sd) > float(z)
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"robust", "robust_z", "mad"}:
+        med = float(np.nanmedian(vals))
+        mad = float(np.nanmedian(np.abs(vals - med))) * 1.4826 + 1e-12
+        mask[m] = np.abs((vals - med) / mad) > float(z)
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"iqr"}:
+        q1 = float(np.nanpercentile(vals, 25))
+        q3 = float(np.nanpercentile(vals, 75))
+        iqr = (q3 - q1) + 1e-12
+        lo, hi = q1 - float(k) * iqr, q3 + float(k) * iqr
+        mask[m] = (vals < lo) | (vals > hi)
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"abs", "absolute"}:
+        if abs_thr is None or not np.isfinite(abs_thr):
+            return y, mask
+        mask[m] = np.abs(vals) > float(abs_thr)
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"percentile", "pct"}:
+        lo = float(np.nanpercentile(vals, float(p_low)))
+        hi = float(np.nanpercentile(vals, float(p_high)))
+        mask[m] = (vals < lo) | (vals > hi)
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"hampel"}:
+        s = pd.Series(y)
+        w = int(max(3, hampel_window))
+        med = s.rolling(window=w, center=True, min_periods=1).median()
+        abs_dev = (s - med).abs()
+        mad = abs_dev.rolling(window=w, center=True, min_periods=1).median() * 1.4826 + 1e-12
+        rz = (s - med) / mad
+        mask = np.asarray(np.isfinite(rz) & (rz.abs() > float(z)))
+        _apply_action(mask)
+        return y, mask
+
+    if rule in {"jump", "diff"}:
+        d = np.abs(np.diff(y, prepend=np.nan))
+        if jump_thr is None or not np.isfinite(jump_thr):
+            dv = d[np.isfinite(d)]
+            if dv.size == 0:
+                return y, mask
+            med = float(np.nanmedian(dv))
+            mad = float(np.nanmedian(np.abs(dv - med))) * 1.4826 + 1e-12
+            thr = med + float(z) * mad
+        else:
+            thr = float(jump_thr)
+        mask = np.isfinite(d) & (d > thr)
+        _apply_action(mask)
+        return y, mask
+
+    return y, mask
+
+
 def preprocess_timeseries(
     df: pd.DataFrame,
     *,
     enabled: bool = True,
     log_transform: bool = False,
+
+    # выбросы
     remove_outliers: bool = True,
+    outlier_rule: str = "robust_z",
+    outlier_action: str = "mask",
+    outlier_z: float = 5.0,
+    outlier_k: float = 1.5,
+    outlier_abs: float | None = None,
+    outlier_p_low: float = 0.5,
+    outlier_p_high: float = 99.5,
+    outlier_hampel_window: int = 7,
+    outlier_jump_thr: float | None = None,
+    outlier_local_median_window: int = 7,
+
+    # нормализация
     normalize: bool = True,
+    normalize_mode: str = "zscore",
+    rank_mode: str = "dense",
+    rank_ties: str = "average",
+
+    # пропуски/структурные шаги
     fill_missing: bool = True,
     remove_ar1: bool = False,
     remove_seasonality: bool = False,
@@ -380,16 +554,33 @@ def preprocess_timeseries(
         out = out.applymap(lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x)
 
     if remove_outliers:
+        rule = str(outlier_rule or "robust_z")
+        action = str(outlier_action or "mask")
+        report.add(f"[Preprocess] outliers: rule={rule}, action={action}")
+        total = 0
         for col in out.columns:
-            if pd.api.types.is_numeric_dtype(out[col]):
-                series = out[col]
-                mean, std = series.mean(skipna=True), series.std(skipna=True)
-                if std > 0:
-                    upper, lower = mean + DEFAULT_OUTLIER_Z * std, mean - DEFAULT_OUTLIER_Z * std
-                    outliers = (series < lower) | (series > upper)
-                    if outliers.any():
-                        report.add(f"[Preprocess] outliers->NaN: z>{DEFAULT_OUTLIER_Z} (n={int(outliers.sum())})", col=col)
-                        out.loc[outliers, col] = np.nan
+            if not pd.api.types.is_numeric_dtype(out[col]):
+                continue
+            x = out[col].astype(float).to_numpy()
+            y, msk = _apply_outliers_1d(
+                x,
+                rule=rule,
+                action=action,
+                z=float(outlier_z),
+                k=float(outlier_k),
+                abs_thr=(None if outlier_abs is None else float(outlier_abs)),
+                p_low=float(outlier_p_low),
+                p_high=float(outlier_p_high),
+                hampel_window=int(outlier_hampel_window),
+                jump_thr=(None if outlier_jump_thr is None else float(outlier_jump_thr)),
+                local_median_window=int(outlier_local_median_window),
+            )
+            n = int(np.sum(msk))
+            if n:
+                total += n
+                out[col] = y
+                report.add(f"[Preprocess] outliers: n={n}", col=col)
+        report.add(f"[Preprocess] outliers total: {total}")
 
     if fill_missing:
         report.add("[Preprocess] fill_missing: linear interpolate + bfill/ffill")
@@ -451,11 +642,36 @@ def preprocess_timeseries(
                     continue
 
     if normalize:
-        report.add("[Preprocess] normalize: z-score")
-        cols_to_norm = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
-        if cols_to_norm:
+        mode = str(normalize_mode or "zscore").strip().lower()
+        cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+        if not cols:
+            mode = "none"
+
+        if mode in {"none", "off", "false"}:
+            report.add("[Preprocess] normalize: off")
+        elif mode in {"z", "zscore", "standard"}:
+            report.add("[Preprocess] normalize: z-score (mean/std) per series")
             scaler = StandardScaler()
-            out[cols_to_norm] = scaler.fit_transform(out[cols_to_norm])
+            out[cols] = scaler.fit_transform(out[cols])
+        elif mode in {"robust", "robust_z", "mad"}:
+            report.add("[Preprocess] normalize: robust z-score (median/MAD) per series")
+            for col in cols:
+                s = out[col].astype(float)
+                med = float(s.median())
+                mad = float((s - med).abs().median()) * 1.4826 + 1e-12
+                out[col] = (s - med) / mad
+        elif mode in {"rank", "rank_dense", "rank_pct", "rank_percentile"}:
+            rmode = str(rank_mode or "dense").strip().lower()
+            if mode in {"rank_pct", "rank_percentile"}:
+                rmode = "pct"
+            report.add(f"[Preprocess] normalize: rank ({rmode}, ties={rank_ties})")
+            for col in cols:
+                x = out[col].astype(float).to_numpy()
+                out[col] = _rank_normalize_1d(x, mode=rmode, ties=str(rank_ties))
+        else:
+            report.add(f"[Preprocess] normalize: unknown mode '{mode}', fallback to z-score")
+            scaler = StandardScaler()
+            out[cols] = scaler.fit_transform(out[cols])
 
     if check_stationarity:
         report.add("[Preprocess] stationarity check: ADF")
@@ -489,7 +705,20 @@ def load_or_generate(
     preprocess: bool = True,
     log_transform: bool = False,
     remove_outliers: bool = True,
+    outlier_rule: str = "robust_z",
+    outlier_action: str = "mask",
+    outlier_z: float = 5.0,
+    outlier_k: float = 1.5,
+    outlier_abs: float | None = None,
+    outlier_p_low: float = 0.5,
+    outlier_p_high: float = 99.5,
+    outlier_hampel_window: int = 7,
+    outlier_jump_thr: float | None = None,
+    outlier_local_median_window: int = 7,
     normalize: bool = True,
+    normalize_mode: str = "zscore",
+    rank_mode: str = "dense",
+    rank_ties: str = "average",
     fill_missing: bool = True,
     remove_ar1: bool = False,
     remove_seasonality: bool = False,
@@ -542,7 +771,20 @@ def load_or_generate(
             enabled=preprocess,
             log_transform=log_transform,
             remove_outliers=remove_outliers,
+            outlier_rule=outlier_rule,
+            outlier_action=outlier_action,
+            outlier_z=outlier_z,
+            outlier_k=outlier_k,
+            outlier_abs=outlier_abs,
+            outlier_p_low=outlier_p_low,
+            outlier_p_high=outlier_p_high,
+            outlier_hampel_window=outlier_hampel_window,
+            outlier_jump_thr=outlier_jump_thr,
+            outlier_local_median_window=outlier_local_median_window,
             normalize=normalize,
+            normalize_mode=normalize_mode,
+            rank_mode=rank_mode,
+            rank_ties=rank_ties,
             fill_missing=fill_missing,
             remove_ar1=remove_ar1,
             remove_seasonality=remove_seasonality,

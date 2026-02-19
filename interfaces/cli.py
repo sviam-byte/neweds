@@ -59,7 +59,18 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
         pvalue_correction=args.pvalue_correction,
     )
 
-    tool = BigMasterTool(config=cfg)
+    def _stage_cb(stage: str, progress, meta: dict):
+        """Печатает этапы выполнения в CLI (без падения на форматировании)."""
+        try:
+            if progress is None:
+                print(f"[Stage] {stage}")
+            else:
+                pct = int(max(0.0, min(1.0, float(progress))) * 100)
+                print(f"[Stage {pct:3d}%] {stage}")
+        except Exception:
+            print(f"[Stage] {stage}")
+
+    tool = BigMasterTool(config=cfg, stage_callback=_stage_cb)
 
     spec = None
 
@@ -79,6 +90,8 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             '  {"preset":"basic","method_options":{"te_directed":{"scan_cube":0}}}'
         )
         print("  qc_enabled=1; save_series_bundle=1")
+        print("  preprocess_options={'normalize_mode':'rank_dense', 'rank_ties':'average'}")
+        print("  preprocess_options={'remove_outliers':1, 'outlier_rule':'hampel', 'outlier_action':'mask', 'outlier_z':3, 'outlier_hampel_window':11}")
         print("  dtype=float32; feature_limit=2000; feature_sampling=variance")
         print("  time_start=0; time_end=6000; time_stride=2  # обрезка/даунсэмплинг по времени")
         print("  usecols=auto; csv_engine=pyarrow  # быстрее для больших CSV")
@@ -101,7 +114,20 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
         for key in [
             "log_transform",
             "remove_outliers",
+            "outlier_rule",
+            "outlier_action",
+            "outlier_z",
+            "outlier_k",
+            "outlier_abs",
+            "outlier_p_low",
+            "outlier_p_high",
+            "outlier_hampel_window",
+            "outlier_jump_thr",
+            "outlier_local_median_window",
             "normalize",
+            "normalize_mode",
+            "rank_mode",
+            "rank_ties",
             "fill_missing",
             "check_stationarity",
             "header",
@@ -209,6 +235,16 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             harmonic_top_k=(spec.harmonic_top_k if spec else 5),
             include_series_files=True,
         )
+
+    # Машиночитаемый экспорт матриц/графов (CSV/NPZ/manifest)
+    try:
+        tool.export_connectivity_bundle(
+            out_dir,
+            name_prefix=name,
+            include_scan_matrices=(spec.include_scans if spec else True),
+        )
+    except Exception:
+        pass
 
     # Явное русское пояснение того, что сделано.
     try:
