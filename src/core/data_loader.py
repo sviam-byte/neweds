@@ -552,7 +552,12 @@ def preprocess_timeseries(
 
     if log_transform:
         report.add("[Preprocess] log-transform: applied to positive values")
-        out = out.applymap(lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x)
+        fn = lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x
+        # pandas 2.2+ постепенно уводит applymap, предпочтительнее DataFrame.map.
+        try:
+            out = out.map(fn)  # type: ignore[attr-defined]
+        except Exception:
+            out = out.applymap(fn)
 
     if remove_outliers:
         rule = str(outlier_rule or "robust_z")

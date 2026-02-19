@@ -48,6 +48,26 @@ from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
 from tqdm import tqdm
 
+
+class RunLog:
+    """Мини-лог для сообщений пайплайна (без зависимости от внешних классов).
+
+    Нужен, чтобы UI/отчёты могли аккуратно показывать, что было сделано,
+    и чтобы вызовы вида self.log.add(...) не падали.
+    """
+
+    def __init__(self) -> None:
+        self.items: List[str] = []
+
+    def add(self, msg: object) -> None:
+        try:
+            self.items.append(str(msg))
+        except Exception:
+            pass
+
+    def as_text(self) -> str:
+        return "\n".join(self.items)
+
 # --- Optional dependency: nolds ---
 # nolds==0.5.2 imports pkg_resources, which is removed in setuptools>=81.
 # On fresh Python 3.13 installs this often breaks with:
@@ -1995,6 +2015,9 @@ class BigMasterTool:
         config: Optional[AnalysisConfig] = None,
         stage_callback=None,
     ) -> None:
+        # Внутренний лог пайплайна (для UI/отчётов). Не путать с модулем logging.
+        self.log = RunLog()
+
         # Инициализация данных
         # Снимки для отчёта: raw -> preprocessed -> after auto-diff.
         self.data_raw = pd.DataFrame()
@@ -3238,9 +3261,15 @@ class BigMasterTool:
                 check_stationarity=False,
                 return_report=False,
             )
-            self.log.add("Post-preprocess: applied")
+            try:
+                getattr(self, "log", RunLog()).add("Post-preprocess: applied")
+            except Exception:
+                logging.info("Post-preprocess: applied")
         except Exception as e:
-            self.log.add(f"Post-preprocess failed: {e}")
+            try:
+                getattr(self, "log", RunLog()).add(f"Post-preprocess failed: {e}")
+            except Exception:
+                logging.warning("Post-preprocess failed: %s", e)
 
 
     def export_connectivity_bundle(
