@@ -25,6 +25,8 @@ from pathlib import Path
 from itertools import chain, combinations, permutations
 from typing import Dict, List, Optional, Tuple
 
+from src.analysis.dimred import apply_dimred
+
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
@@ -1994,6 +1996,11 @@ class BigMasterTool:
         self.data_after_autodiff = pd.DataFrame()
         self.preprocessing_report = None  # type: ignore
         self.autodiff_report = {"enabled": False, "differenced": []}
+        # Уменьшение размерности: снимок состояния текущего запуска.
+        self.dimred_report = {"enabled": False, "method": "none"}
+        self.dimred_mapping: pd.DataFrame = pd.DataFrame()
+        self.data_dimred: pd.DataFrame = pd.DataFrame()
+        self.data_dimred_base: Optional[pd.DataFrame] = None
         self.pairwise_summaries = {}
         if data is not None:
             # Чистка константных колонок
@@ -2129,6 +2136,8 @@ class BigMasterTool:
 
     def run_all_methods(self, **kwargs) -> None:
         """Запуск всех доступных методов анализа."""
+        # Опционально уменьшаем размерность до нормализации/оценки связности.
+        self._maybe_apply_dimred(**kwargs)
         self.normalize_data()
         if self.data_normalized.empty:
             return
@@ -2166,6 +2175,8 @@ class BigMasterTool:
         Запуск конкретных выбранных методов.
         Возвращает словарь {метод: использованный_лаг}.
         """
+        # Опционально уменьшаем размерность до нормализации/оценки связности.
+        self._maybe_apply_dimred(**kwargs)
         self.normalize_data()
         prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
         self.results = {}
@@ -2188,6 +2199,7 @@ class BigMasterTool:
                     "window_policy": kwargs.get("window_policy"),
                     "control_strategy": kwargs.get("control_strategy", "none"),
                     "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
+                    "dimred": dict(getattr(self, "dimred_report", {}) or {}),
                 }
             )
         except Exception:
@@ -2963,6 +2975,133 @@ class BigMasterTool:
             pass
         return save_path
 
+    def _maybe_apply_dimred(self, **kwargs) -> None:
+        """Предобработка: опциональное уменьшение размерности для больших N."""
+        enabled = bool(kwargs.get("dimred_enabled", False))
+        method = str(kwargs.get("dimred_method") or "none").strip().lower()
+        target_n = int(kwargs.get("dimred_target", 0) or 0)
+        save_variants = bool(kwargs.get("dimred_save_variants", False))
+        variants_text = str(kwargs.get("dimred_variants") or "").strip()
+        seed = int(kwargs.get("dimred_seed", 0) or 0)
+        spatial_bin = int(kwargs.get("dimred_spatial_bin", 2) or 2)
+        kmeans_batch = int(kwargs.get("dimred_kmeans_batch", 2048) or 2048)
+
+        base = (
+            self.data_preprocessed
+            if isinstance(getattr(self, "data_preprocessed", None), pd.DataFrame) and not self.data_preprocessed.empty
+            else getattr(self, "data", None)
+        )
+        if base is None or getattr(base, "empty", True):
+            self.dimred_report = {"enabled": False, "reason": "no_data"}
+            self.data_dimred = pd.DataFrame()
+            self.dimred_mapping = pd.DataFrame()
+            return
+
+        self.data_dimred_base = base
+        n0 = int(base.shape[1])
+        if (not enabled) or (method in ("none", "off", "disabled")):
+            self.dimred_report = {"enabled": False, "method": "none", "k": n0}
+            self.data_dimred = base.copy()
+            self.dimred_mapping = pd.DataFrame({"source": list(base.columns), "target": list(base.columns), "weight": 1.0})
+            self.data = base.copy()
+            return
+
+        if target_n <= 0:
+            target_n = int(min(500, n0))
+
+        res = apply_dimred(
+            base,
+            method=method,
+            target_n=int(min(target_n, n0)),
+            seed=seed,
+            coords_df=getattr(self, "coords_df", None),
+            kmeans_batch=kmeans_batch,
+            spatial_bin=spatial_bin,
+        )
+        self.data_dimred = res.reduced
+        self.dimred_mapping = res.mapping
+        self.dimred_report = {"enabled": True, **(res.meta or {}), "n_before": n0, "n_after": int(res.reduced.shape[1])}
+        self.data_preprocessed = self.data_dimred.copy()
+        self.data = self.data_dimred.copy()
+
+        if save_variants and variants_text:
+            try:
+                parts = [p.strip() for p in variants_text.replace(";", ",").split(",") if p.strip()]
+                targets = sorted(set(int(float(p)) for p in parts if float(p) > 0))
+                self.dimred_report["saved_variants"] = targets
+            except Exception as e:
+                self.dimred_report["saved_variants_error"] = str(e)
+
+    def export_dimred_bundle(self, out_dir: str, name_prefix: str = "run") -> Dict[str, str]:
+        """Экспортирует уменьшенные ряды и source->target mapping в ``out_dir/data``."""
+        import json
+        from pathlib import Path
+
+        data_dir = Path(out_dir) / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        paths: Dict[str, str] = {}
+        pref = f"{name_prefix}_" if name_prefix else ""
+
+        try:
+            df = getattr(self, "data_dimred", None)
+            if df is not None and not getattr(df, "empty", True):
+                p = data_dir / f"{pref}timeseries_dimred.csv"
+                df.to_csv(p, index=True)
+                paths["timeseries_dimred_csv"] = str(p)
+        except Exception:
+            pass
+
+        try:
+            mp = getattr(self, "dimred_mapping", None)
+            if mp is not None and not getattr(mp, "empty", True):
+                p = data_dir / f"{pref}dimred_mapping.csv"
+                mp.to_csv(p, index=False)
+                paths["dimred_mapping_csv"] = str(p)
+        except Exception:
+            pass
+
+        try:
+            rep = getattr(self, "dimred_report", {}) or {}
+            p = data_dir / f"{pref}dimred_meta.json"
+            p.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
+            paths["dimred_meta_json"] = str(p)
+        except Exception:
+            pass
+
+        try:
+            rep = getattr(self, "dimred_report", {}) or {}
+            targets = rep.get("saved_variants") or []
+            m = str(rep.get("method", "none")).strip().lower()
+            if targets and m not in ("none", "off", "disabled"):
+                base = getattr(self, "data_dimred_base", None)
+                if base is not None and not getattr(base, "empty", True):
+                    vroot = data_dir / f"{pref}dimred_variants"
+                    vroot.mkdir(parents=True, exist_ok=True)
+                    for t in targets:
+                        try:
+                            t2 = int(min(int(t), int(base.shape[1])))
+                            rr = apply_dimred(
+                                base,
+                                method=m,
+                                target_n=t2,
+                                seed=int(rep.get("seed", 0) or 0),
+                                coords_df=getattr(self, "coords_df", None),
+                                kmeans_batch=int(rep.get("batch_size", 2048) or 2048),
+                                spatial_bin=int(rep.get("bin_size", 2) or 2),
+                            )
+                            sub = vroot / f"{m}_n{t2}"
+                            sub.mkdir(parents=True, exist_ok=True)
+                            rr.reduced.to_csv(sub / "timeseries_dimred.csv", index=True)
+                            rr.mapping.to_csv(sub / "dimred_mapping.csv", index=False)
+                            (sub / "dimred_meta.json").write_text(json.dumps(rr.meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                        except Exception:
+                            continue
+                    paths["dimred_variants_dir"] = str(vroot)
+        except Exception:
+            pass
+
+        return paths
+
 
     def export_connectivity_bundle(
         self,
@@ -2991,6 +3130,12 @@ class BigMasterTool:
 
         data_dir = str(Path(out_dir) / "data")
         os.makedirs(data_dir, exist_ok=True)
+
+        # Экспорт артефактов уменьшения размерности (если использовалось).
+        try:
+            self.export_dimred_bundle(out_dir, name_prefix=name_prefix)
+        except Exception:
+            pass
 
         # Имена узлов из доступных источников.
         try:

@@ -60,6 +60,16 @@ class App(tk.Tk):
         self.preproc_normalize = tk.BooleanVar(value=True)
         self.preproc_fill_missing = tk.BooleanVar(value=True)
 
+        # Уменьшение размерности (очень большие N): опционально до анализа.
+        self.dimred_enabled = tk.BooleanVar(value=False)
+        self.dimred_method = tk.StringVar(value="variance")
+        self.dimred_target = tk.IntVar(value=500)
+        self.dimred_spatial_bin = tk.IntVar(value=2)
+        self.dimred_kmeans_batch = tk.IntVar(value=2048)
+        self.dimred_seed = tk.IntVar(value=0)
+        self.dimred_save_variants = tk.BooleanVar(value=False)
+        self.dimred_variants = tk.StringVar(value="100,200,500")
+
         # Скан-параметры (window/lag/position)
         self.scan_window_pos = tk.BooleanVar(value=False)
         self.scan_window_size = tk.BooleanVar(value=False)
@@ -305,6 +315,36 @@ class App(tk.Tk):
         ttk.Checkbutton(pr1, text="Нормализация (z-score)", variable=self.preproc_normalize).pack(side="left", padx=10)
         ttk.Checkbutton(pr1, text="Заполнять пропуски", variable=self.preproc_fill_missing).pack(side="left", padx=10)
 
+        dr = ttk.LabelFrame(frame, text="Уменьшение размерности (до анализа, опционально)", padding=6)
+        dr.pack(fill="x", pady=6)
+
+        d0 = ttk.Frame(dr)
+        d0.pack(fill="x", pady=2)
+        ttk.Checkbutton(d0, text="Включить", variable=self.dimred_enabled).pack(side="left")
+        ttk.Label(d0, text="Метод:").pack(side="left", padx=(10, 5))
+        ttk.Combobox(
+            d0,
+            textvariable=self.dimred_method,
+            values=["variance", "kmeans", "spatial", "random"],
+            state="readonly",
+            width=10,
+        ).pack(side="left")
+        ttk.Label(d0, text="Цель N (сколько рядов оставить/получить):").pack(side="left", padx=(10, 5))
+        ttk.Entry(d0, textvariable=self.dimred_target, width=8).pack(side="left")
+        ttk.Label(d0, text="Seed:").pack(side="left", padx=(10, 5))
+        ttk.Entry(d0, textvariable=self.dimred_seed, width=6).pack(side="left")
+
+        d1 = ttk.Frame(dr)
+        d1.pack(fill="x", pady=2)
+        ttk.Label(d1, text="Параметры метода:").pack(side="left")
+        ttk.Label(d1, text="kmeans batch:").pack(side="left", padx=(10, 5))
+        ttk.Entry(d1, textvariable=self.dimred_kmeans_batch, width=8).pack(side="left")
+        ttk.Label(d1, text="spatial bin (шаг по xyz):").pack(side="left", padx=(10, 5))
+        ttk.Entry(d1, textvariable=self.dimred_spatial_bin, width=6).pack(side="left")
+        ttk.Checkbutton(d1, text="Сохранить несколько вариантов", variable=self.dimred_save_variants).pack(side="left", padx=(15, 0))
+        ttk.Label(d1, text="Варианты N (через запятую):").pack(side="left", padx=(10, 5))
+        ttk.Entry(d1, textvariable=self.dimred_variants, width=18).pack(side="left")
+
         scans = ttk.LabelFrame(frame, text="Сканы window/lag/position (опционально)", padding=6)
         scans.pack(fill="x", pady=6)
 
@@ -546,6 +586,14 @@ class App(tk.Tk):
         tool.run_selected_methods(
             methods,
             max_lag=cfg.max_lag,
+            dimred_enabled=bool(self.dimred_enabled.get()),
+            dimred_method=str(self.dimred_method.get()),
+            dimred_target=int(self.dimred_target.get()),
+            dimred_spatial_bin=int(self.dimred_spatial_bin.get()),
+            dimred_kmeans_batch=int(self.dimred_kmeans_batch.get()),
+            dimred_seed=int(self.dimred_seed.get()),
+            dimred_save_variants=bool(self.dimred_save_variants.get()),
+            dimred_variants=str(self.dimred_variants.get() or ""),
             window_sizes_grid=w_sizes,
             window_min=int(self.window_min.get()),
             window_max=int(self.window_max.get()),

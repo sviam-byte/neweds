@@ -1,5 +1,5 @@
 """Analysis package."""
 
-from . import stats
+from . import dimred, stats
 
-__all__ = ["stats"]
+__all__ = ["stats", "dimred"]
