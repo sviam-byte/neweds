@@ -169,10 +169,23 @@ def main() -> None:
             threshold = st.number_input("Порог графа (Threshold)", 0.0, 1.0, 0.2, 0.05)
 
         with colB:
-            normalize = st.checkbox("Нормализация (Z-score)", value=True)
+            normalize_mode_label = st.selectbox("Нормализация", ["нет", "z-score", "robust z (median/MAD)", "rank (dense: 1..K)", "rank (percentile: 0..1)"], index=1)
+            normalize = (normalize_mode_label != "нет")
+            normalize_mode = ("zscore" if normalize_mode_label.startswith("z-score") else ("robust_z" if normalize_mode_label.startswith("robust") else ("rank_dense" if "dense" in normalize_mode_label else ("rank_pct" if "percentile" in normalize_mode_label else "none"))))
+            rank_ties = st.selectbox("Rank ties (если rank)", ["average", "min", "max", "dense", "first"], index=0)
             preprocess = st.checkbox("Предобработка (fill/outliers/log)", value=True)
             fill_missing = st.checkbox("Заполнять пропуски (interp)", value=True)
-            remove_outliers = st.checkbox("Убирать выбросы (Z)", value=True)
+            remove_outliers = st.checkbox("Убирать выбросы", value=True)
+            outlier_rule = st.selectbox("Правило выбросов", ["robust_z", "zscore", "iqr", "percentile", "hampel", "jump"], index=0)
+            outlier_action = st.selectbox("Что делать с выбросами", ["mask (NaN)", "clip (winsorize)", "median (global)", "local_median"], index=0)
+            outlier_z = st.number_input("Порог z (для z/robust_z/hampel/jump)", min_value=0.5, max_value=50.0, value=5.0, step=0.5)
+            outlier_k = st.number_input("Параметр k (для IQR)", min_value=0.5, max_value=10.0, value=1.5, step=0.1)
+            outlier_p_low = st.number_input("Перцентиль low (для percentile/clip)", min_value=0.0, max_value=49.0, value=0.5, step=0.5)
+            outlier_p_high = st.number_input("Перцентиль high (для percentile/clip)", min_value=51.0, max_value=100.0, value=99.5, step=0.5)
+            outlier_hampel_window = st.number_input("Окно Hampel", min_value=3, max_value=501, value=7, step=2)
+            outlier_jump_thr = st.number_input("Порог jump (0=auto)", min_value=0.0, max_value=1e9, value=0.0, step=1.0)
+            outlier_local_median_window = st.number_input("Окно local_median", min_value=3, max_value=501, value=7, step=2)
+            _out_act = ("mask" if outlier_action.startswith("mask") else ("clip" if outlier_action.startswith("clip") else ("median" if outlier_action.startswith("median") else "local_median")))
             log_transform = st.checkbox("Лог-преобразование (только >0)", value=False)
             remove_ar1 = st.checkbox("Убрать AR(1) (прибл. prewhitening)", value=False)
             remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
@@ -277,6 +290,28 @@ def main() -> None:
     all_methods = STABLE_METHODS + EXPERIMENTAL_METHODS
     selected_methods = st.multiselect("Выберите методы", all_methods, default=STABLE_METHODS[:2])
 
+    with st.expander("План запуска (что будет сделано)", expanded=False):
+        st.write({
+            "preprocess": preprocess,
+            "fill_missing": fill_missing,
+            "remove_outliers": remove_outliers,
+            "outlier_rule": outlier_rule,
+            "outlier_action": _out_act,
+            "outlier_z": float(outlier_z),
+            "outlier_k": float(outlier_k),
+            "outlier_p_low": float(outlier_p_low),
+            "outlier_p_high": float(outlier_p_high),
+            "outlier_hampel_window": int(outlier_hampel_window),
+            "outlier_jump_thr": (None if float(outlier_jump_thr)==0.0 else float(outlier_jump_thr)),
+            "normalize": normalize,
+            "normalize_mode": normalize_mode,
+            "rank_ties": rank_ties,
+            "remove_ar1": bool(remove_ar1),
+            "remove_seasonality": bool(remove_seasonality),
+            "season_period": (None if int(season_period)==0 else int(season_period)),
+            "qc_enabled": bool(qc_enabled),
+        })
+
     if st.button("Запустить анализ", type="primary"):
         if source.startswith("Файл") and not uploaded_file:
             st.error("Файл не загружен!")
@@ -326,7 +361,19 @@ def main() -> None:
             st.error(f"Ошибка подготовки данных: {e}")
             return
 
-        tool = engine.BigMasterTool()
+        stage_box = st.empty()
+        prog = st.progress(0)
+
+        def _stage_cb(stage: str, progress, meta: dict):
+            """Показывает этап текущего запуска и процент готовности."""
+            try:
+                stage_box.markdown(f"**Этап:** {stage}")
+                if progress is not None:
+                    prog.progress(int(max(0.0, min(1.0, float(progress))) * 100))
+            except Exception:
+                pass
+
+        tool = engine.BigMasterTool(stage_callback=_stage_cb)
 
         with st.spinner("Загрузка и расчёт..."):
             try:
@@ -334,8 +381,19 @@ def main() -> None:
                     str(input_path),
                     preprocess=preprocess,
                     normalize=normalize,
+                    normalize_mode=normalize_mode,
+                    rank_ties=rank_ties,
                     fill_missing=fill_missing,
                     remove_outliers=remove_outliers,
+                    outlier_rule=outlier_rule,
+                    outlier_action=_out_act,
+                    outlier_z=float(outlier_z),
+                    outlier_k=float(outlier_k),
+                    outlier_p_low=float(outlier_p_low),
+                    outlier_p_high=float(outlier_p_high),
+                    outlier_hampel_window=int(outlier_hampel_window),
+                    outlier_jump_thr=(None if float(outlier_jump_thr)==0.0 else float(outlier_jump_thr)),
+                    outlier_local_median_window=int(outlier_local_median_window),
                     log_transform=log_transform,
                     remove_ar1=bool(remove_ar1),
                     remove_seasonality=bool(remove_seasonality),
@@ -436,6 +494,10 @@ def main() -> None:
 
                 st.success("Готово!")
                 st.code(str(run_dir))
+                try:
+                    prog.progress(100)
+                except Exception:
+                    pass
 
                 # Явное русское пояснение
                 try:

@@ -23,6 +23,7 @@ class ExportPolicy:
     dense_n_limit: int = 2000
     topk_per_node: int = 50
     min_abs_weight: float = 0.0
+    dense_csv: bool = True
 
 
 def _safe_variant(name: str) -> str:
@@ -86,9 +87,13 @@ def export_connectivity_matrix(
     sparse.save_npz(sparse_path, sp)
 
     dense_file = None
+    dense_csv_file = None
     if n <= int(policy.dense_n_limit):
         dense_file = f"{name_prefix}_{var}_dense.npy"
         np.save(os.path.join(data_dir, dense_file), arr)
+        if bool(getattr(policy, "dense_csv", True)):
+            dense_csv_file = f"{name_prefix}_{var}_dense.csv"
+            pd.DataFrame(arr, index=names, columns=names).to_csv(os.path.join(data_dir, dense_csv_file), index=True)
 
     meta = {
         "variant": variant,
@@ -96,6 +101,7 @@ def export_connectivity_matrix(
         "edges_file": os.path.basename(edges_path),
         "sparse_file": os.path.basename(sparse_path),
         "dense_file": dense_file,
+        "dense_csv_file": dense_csv_file,
         "edges_count": int(sp.nnz),
     }
     if extra_meta is not None:

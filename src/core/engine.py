@@ -1988,7 +1988,13 @@ class BigMasterTool:
     Управляет загрузкой данных, запуском расчетов и вызовом генераторов отчетов.
     """
 
-    def __init__(self, data: pd.DataFrame = None, enable_experimental: bool = False, config: Optional[AnalysisConfig] = None) -> None:
+    def __init__(
+        self,
+        data: pd.DataFrame = None,
+        enable_experimental: bool = False,
+        config: Optional[AnalysisConfig] = None,
+        stage_callback=None,
+    ) -> None:
         # Инициализация данных
         # Снимки для отчёта: raw -> preprocessed -> after auto-diff.
         self.data_raw = pd.DataFrame()
@@ -2022,6 +2028,10 @@ class BigMasterTool:
         self.window_analysis: dict = {}
         self.config: AnalysisConfig = config or AnalysisConfig(enable_experimental=enable_experimental)
 
+        # Коллбек прогресса/этапов для UI/CLI.
+        # Сигнатура: cb(stage: str, progress: float|None, meta: dict)
+        self._stage_callback = stage_callback
+
         # Настройки
         self.fs: float = 1.0  # Частота дискретизации
 
@@ -2029,11 +2039,32 @@ class BigMasterTool:
         self.undirected_methods = [m for m in method_mapping if not get_method_spec(m).directed]
         self.directed_methods = [m for m in method_mapping if get_method_spec(m).directed]
 
+    def set_stage_callback(self, cb) -> None:
+        """Установить коллбек прогресса/этапов (для GUI/Web/CLI)."""
+        self._stage_callback = cb
+
+    def _stage(self, stage: str, progress: Optional[float] = None, **meta) -> None:
+        """Сообщить текущий этап. progress ∈ [0..1] или None."""
+        try:
+            logging.info("[Stage] %s", stage)
+        except Exception:
+            pass
+        cb = getattr(self, "_stage_callback", None)
+        if cb is None:
+            return
+        try:
+            cb(stage, progress, dict(meta or {}))
+        except Exception:
+            # UI не должен валить вычисления.
+            return
+
     def load_data_excel(self, filepath: str, **kwargs) -> pd.DataFrame:
         """Загружает данные, чистит их и опционально устраняет нестационарность."""
+        self._stage("Загрузка данных", 0.0, file=str(filepath))
         qc_enabled = bool(kwargs.pop("qc_enabled", True))
         # 1) Сырой numeric-слепок без предобработки для честного before/after в отчёте.
         try:
+            self._stage("Загрузка RAW (без предобработки)", 0.05)
             self.data_raw = load_or_generate(
                 filepath,
                 preprocess=False,
@@ -2046,12 +2077,15 @@ class BigMasterTool:
             self.data_raw = pd.DataFrame()
 
         # 2) Основной путь загрузки (с учётом выбранных опций) + структурированный отчёт.
+        self._stage("Загрузка + предобработка", 0.15)
         df_out = load_or_generate(filepath, return_report=True, **kwargs)
         if isinstance(df_out, tuple):
             self.data, self.preprocessing_report = df_out
         else:
             self.data, self.preprocessing_report = df_out, None
         self.data_preprocessed = self.data.copy()
+
+        self._stage("Данные загружены", 0.35, shape=list(self.data.shape))
 
         # Координаты (для voxel-wide формата) и QC
         self.coords_df = None
@@ -2069,6 +2103,7 @@ class BigMasterTool:
         try:
             from ..analysis import stats as _stats
             if qc_enabled and (self.coords_df is not None or int(self.data.shape[1]) >= 20):
+                self._stage("QC (качество вокселей/рядов)", 0.45)
                 if getattr(self, "data_raw", pd.DataFrame()).empty is False:
                     self.qc_raw = _stats.voxel_qc(self.data_raw, coords=self.coords_df)
                 self.qc_clean = _stats.voxel_qc(self.data, coords=self.coords_df)
@@ -2087,6 +2122,7 @@ class BigMasterTool:
 
         if self.config.auto_difference:
             self.autodiff_report = {"enabled": True, "differenced": []}
+            self._stage("Проверка стационарности + авто-дифференцирование", 0.55)
             logging.info("Запущена проверка стационарности и авто-дифференцирование...")
             diff_count = 0
             for col in self.data.columns:
@@ -2106,6 +2142,7 @@ class BigMasterTool:
 
         self.data_after_autodiff = self.data.copy()
         logging.info("[BigMasterTool] Данные готовы: %s", self.data.shape)
+        self._stage("Данные готовы", 0.70, shape=list(self.data.shape))
         return self.data
 
     def normalize_data(self) -> None:
@@ -2113,6 +2150,8 @@ class BigMasterTool:
         if self.data.empty:
             logging.warning("Нет данных для нормализации.")
             return
+
+        self._stage("Нормализация", 0.75)
 
         cols = [c for c in self.data.columns if pd.api.types.is_numeric_dtype(self.data[c])]
         scaler = StandardScaler()
@@ -2136,6 +2175,7 @@ class BigMasterTool:
 
     def run_all_methods(self, **kwargs) -> None:
         """Запуск всех доступных методов анализа."""
+        self._stage("Подготовка: dimred/нормализация", 0.72)
         # Опционально уменьшаем размерность до нормализации/оценки связности.
         self._maybe_apply_dimred(**kwargs)
         self.normalize_data()
@@ -2152,7 +2192,16 @@ class BigMasterTool:
         self.variant_lags = {}
         self.window_analysis = {}
 
-        for variant in method_mapping.keys():
+        variants_all = list(method_mapping.keys())
+        n_total = max(1, len(variants_all))
+        for idx, variant in enumerate(variants_all, start=1):
+            self._stage(
+                f"Расчёт: {variant} ({idx}/{n_total})",
+                0.80 + 0.18 * (idx - 1) / n_total,
+                variant=variant,
+                i=idx,
+                n=n_total,
+            )
             logging.info("Расчет метода: %s...", variant)
             try:
                 mat, meta = self._compute_variant_auto(variant, **kwargs)
@@ -2168,6 +2217,7 @@ class BigMasterTool:
                 self.results_meta[variant] = {"error": str(e)}
 
         self._apply_fdr_correction()
+        self._stage("Готово: расчёты завершены", 1.0)
         logging.info("Все расчеты завершены.")
 
     def run_selected_methods(self, variants: List[str], max_lag: int = 5, **kwargs) -> Dict[str, int]:
@@ -2175,6 +2225,7 @@ class BigMasterTool:
         Запуск конкретных выбранных методов.
         Возвращает словарь {метод: использованный_лаг}.
         """
+        self._stage("Подготовка: dimred/нормализация", 0.72)
         # Опционально уменьшаем размерность до нормализации/оценки связности.
         self._maybe_apply_dimred(**kwargs)
         self.normalize_data()
@@ -2214,7 +2265,15 @@ class BigMasterTool:
             method_options = {}
 
         used_lags: Dict[str, int] = {}
-        for variant in variants:
+        n_total = max(1, len(variants))
+        for idx, variant in enumerate(variants, start=1):
+            self._stage(
+                f"Расчёт: {variant} ({idx}/{n_total})",
+                0.80 + 0.18 * (idx - 1) / n_total,
+                variant=variant,
+                i=idx,
+                n=n_total,
+            )
             if variant not in method_mapping:
                 continue
             try:
@@ -2235,6 +2294,7 @@ class BigMasterTool:
                 self.results_meta[variant] = {"error": str(e)}
 
         self.variant_lags = used_lags
+        self._stage("Готово: расчёты завершены", 1.0)
         return used_lags
 
     def _compute_variant_auto(self, variant: str, **kwargs) -> tuple[np.ndarray | None, dict]:

@@ -58,6 +58,17 @@ class App(tk.Tk):
         self.preproc_season_period = tk.IntVar(value=0)  # 0 => auto
         self.preproc_log_transform = tk.BooleanVar(value=False)
         self.preproc_normalize = tk.BooleanVar(value=True)
+        self.preproc_normalize_mode = tk.StringVar(value="zscore")  # zscore|robust_z|rank_dense|rank_pct|none
+        self.preproc_rank_ties = tk.StringVar(value="average")
+        self.preproc_outlier_rule = tk.StringVar(value="robust_z")  # robust_z|zscore|iqr|percentile|hampel|jump
+        self.preproc_outlier_action = tk.StringVar(value="mask")  # mask|clip|median|local_median
+        self.preproc_outlier_z = tk.DoubleVar(value=5.0)
+        self.preproc_outlier_k = tk.DoubleVar(value=1.5)
+        self.preproc_outlier_p_low = tk.DoubleVar(value=0.5)
+        self.preproc_outlier_p_high = tk.DoubleVar(value=99.5)
+        self.preproc_outlier_hampel_window = tk.IntVar(value=7)
+        self.preproc_outlier_jump_thr = tk.DoubleVar(value=0.0)  # 0 => auto
+        self.preproc_outlier_local_median_window = tk.IntVar(value=7)
         self.preproc_fill_missing = tk.BooleanVar(value=True)
 
         # Уменьшение размерности (очень большие N): опционально до анализа.
@@ -114,6 +125,36 @@ class App(tk.Tk):
         self.topk_per_node = tk.IntVar(value=10)  # reserved (future)
 
         self._init_ui()
+
+        # Строка статуса (этапы выполнения).
+        self.status_var = tk.StringVar(value="Готово")
+        self.status_bar = ttk.Label(self, textvariable=self.status_var, anchor="w")
+        self.status_bar.pack(side="bottom", fill="x")
+        self.stage_progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", maximum=100)
+        self.stage_progress.pack(side="bottom", fill="x")
+
+
+    def _set_stage(self, stage: str, progress=None) -> None:
+        """Обновляет строку статуса и прогресс-бар безопасно для Tk main-loop."""
+        def _apply() -> None:
+            try:
+                self.status_var.set(stage)
+                if progress is None:
+                    self.stage_progress.configure(mode="indeterminate")
+                    self.stage_progress.start(10)
+                else:
+                    self.stage_progress.stop()
+                    self.stage_progress.configure(mode="determinate")
+                    pct = int(max(0.0, min(1.0, float(progress))) * 100)
+                    self.stage_progress["value"] = pct
+                self.update_idletasks()
+            except Exception:
+                pass
+
+        try:
+            self.after(0, _apply)
+        except Exception:
+            _apply()
 
     def _init_ui(self) -> None:
         """Инициализирует структуру вкладок и общую панель настроек."""
@@ -312,8 +353,32 @@ class App(tk.Tk):
         pr1 = ttk.Frame(pre)
         pr1.pack(fill="x", pady=2)
         ttk.Checkbutton(pr1, text="Лог-преобразование (+)", variable=self.preproc_log_transform).pack(side="left")
-        ttk.Checkbutton(pr1, text="Нормализация (z-score)", variable=self.preproc_normalize).pack(side="left", padx=10)
+        ttk.Checkbutton(pr1, text="Нормализация", variable=self.preproc_normalize).pack(side="left", padx=10)
+        ttk.Label(pr1, text="режим:").pack(side="left", padx=(0,5))
+        ttk.Combobox(pr1, textvariable=self.preproc_normalize_mode, values=["zscore","robust_z","rank_dense","rank_pct","none"], state="readonly", width=10).pack(side="left")
+        ttk.Label(pr1, text="ties:").pack(side="left", padx=(10,5))
+        ttk.Combobox(pr1, textvariable=self.preproc_rank_ties, values=["average","min","max","dense","first"], state="readonly", width=8).pack(side="left")
         ttk.Checkbutton(pr1, text="Заполнять пропуски", variable=self.preproc_fill_missing).pack(side="left", padx=10)
+
+        pr2 = ttk.Frame(pre)
+        pr2.pack(fill="x", pady=2)
+        ttk.Label(pr2, text="Выбросы:").pack(side="left")
+        ttk.Combobox(pr2, textvariable=self.preproc_outlier_rule, values=["robust_z","zscore","iqr","percentile","hampel","jump"], state="readonly", width=10).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="action:").pack(side="left")
+        ttk.Combobox(pr2, textvariable=self.preproc_outlier_action, values=["mask","clip","median","local_median"], state="readonly", width=12).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="z:").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_z, width=6).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="IQR k:").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_k, width=6).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="pct lo/hi:").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_p_low, width=5).pack(side="left", padx=(5,2))
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_p_high, width=5).pack(side="left", padx=(2,10))
+        ttk.Label(pr2, text="Hampel win:").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_hampel_window, width=5).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="jump thr(0=auto):").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_jump_thr, width=7).pack(side="left", padx=(5,10))
+        ttk.Label(pr2, text="local win:").pack(side="left")
+        ttk.Entry(pr2, textvariable=self.preproc_outlier_local_median_window, width=5).pack(side="left", padx=(5,10))
 
         dr = ttk.LabelFrame(frame, text="Уменьшение размерности (до анализа, опционально)", padding=6)
         dr.pack(fill="x", pady=6)
@@ -517,7 +582,12 @@ class App(tk.Tk):
             messagebox.showwarning("Ошибка", "Выберите хотя бы один метод!")
             return None
 
-        tool = BigMasterTool(df, config=cfg)
+        def _stage_cb(stage: str, progress, meta: dict):
+            """Проксирует этапы движка в статус-бар GUI."""
+            self._set_stage(stage, progress)
+
+        self._set_stage("Старт анализа", 0.0)
+        tool = BigMasterTool(df, config=cfg, stage_callback=_stage_cb)
         tool.data = df.fillna(df.mean(numeric_only=True))
 
         if cfg.auto_difference:
@@ -629,6 +699,8 @@ class App(tk.Tk):
             topk_per_node=int(self.topk_per_node.get()),
         )
 
+        self._set_stage("Экспорт результатов", 0.98)
+
         # Экспорт «как данные»: матрицы/графы/edge-list в out_dir/data.
         # Ошибки экспорта не должны ломать основной HTML/Excel пайплайн.
         try:
@@ -653,6 +725,7 @@ class App(tk.Tk):
         do_excel = mode in ("both", "excel")
 
         if do_html:
+            self._set_stage("Формирование HTML отчёта", 0.99)
             tool.export_html_report(
                 html_path,
                 graph_threshold=cfg.graph_threshold,
@@ -663,7 +736,9 @@ class App(tk.Tk):
                 include_matrix_tables=bool(self.include_matrix_tables.get()),
             )
         if do_excel:
+            self._set_stage("Формирование Excel отчёта", 0.99)
             tool.export_big_excel(excel_path, threshold=cfg.graph_threshold, p_value_alpha=cfg.p_value_alpha)
+        self._set_stage("Готово", 1.0)
         return html_path if do_html else None
 
     def _run_single(self) -> None:
@@ -678,7 +753,18 @@ class App(tk.Tk):
                 preprocess=bool(self.preproc_enabled.get()),
                 log_transform=bool(self.preproc_log_transform.get()),
                 remove_outliers=bool(self.preproc_remove_outliers.get()),
+                outlier_rule=str(self.preproc_outlier_rule.get()),
+                outlier_action=str(self.preproc_outlier_action.get()),
+                outlier_z=float(self.preproc_outlier_z.get()),
+                outlier_k=float(self.preproc_outlier_k.get()),
+                outlier_p_low=float(self.preproc_outlier_p_low.get()),
+                outlier_p_high=float(self.preproc_outlier_p_high.get()),
+                outlier_hampel_window=int(self.preproc_outlier_hampel_window.get()),
+                outlier_jump_thr=(None if float(self.preproc_outlier_jump_thr.get())==0.0 else float(self.preproc_outlier_jump_thr.get())),
+                outlier_local_median_window=int(self.preproc_outlier_local_median_window.get()),
                 normalize=bool(self.preproc_normalize.get()),
+                normalize_mode=str(self.preproc_normalize_mode.get()),
+                rank_ties=str(self.preproc_rank_ties.get()),
                 fill_missing=bool(self.preproc_fill_missing.get()),
                 remove_ar1=bool(self.preproc_remove_ar1.get()),
                 remove_seasonality=bool(self.preproc_remove_seasonality.get()),
@@ -723,7 +809,18 @@ class App(tk.Tk):
                     preprocess=bool(self.preproc_enabled.get()),
                     log_transform=bool(self.preproc_log_transform.get()),
                     remove_outliers=bool(self.preproc_remove_outliers.get()),
+                    outlier_rule=str(self.preproc_outlier_rule.get()),
+                    outlier_action=str(self.preproc_outlier_action.get()),
+                    outlier_z=float(self.preproc_outlier_z.get()),
+                    outlier_k=float(self.preproc_outlier_k.get()),
+                    outlier_p_low=float(self.preproc_outlier_p_low.get()),
+                    outlier_p_high=float(self.preproc_outlier_p_high.get()),
+                    outlier_hampel_window=int(self.preproc_outlier_hampel_window.get()),
+                    outlier_jump_thr=(None if float(self.preproc_outlier_jump_thr.get())==0.0 else float(self.preproc_outlier_jump_thr.get())),
+                    outlier_local_median_window=int(self.preproc_outlier_local_median_window.get()),
                     normalize=bool(self.preproc_normalize.get()),
+                    normalize_mode=str(self.preproc_normalize_mode.get()),
+                    rank_ties=str(self.preproc_rank_ties.get()),
                     fill_missing=bool(self.preproc_fill_missing.get()),
                     remove_ar1=bool(self.preproc_remove_ar1.get()),
                     remove_seasonality=bool(self.preproc_remove_seasonality.get()),
