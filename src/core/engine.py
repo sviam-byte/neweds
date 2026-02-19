@@ -2297,6 +2297,36 @@ class BigMasterTool:
         self._stage("Готово: расчёты завершены", 1.0)
         return used_lags
 
+    def calculate_graph_metrics(self, threshold: float = 0.2) -> None:
+        """[PATCH] Рассчитать топологические метрики для уже посчитанных матриц.
+
+        Метод безопасен для повторного вызова: каждый запуск перезаписывает
+        ``self.graph_results`` и анализирует только непустые матрицы из ``self.results``.
+        """
+        from ..analysis.graph import analyze_graph_topology
+
+        self.graph_results = {}
+        names = list(self.data.columns)
+
+        for variant, mat in (self.results or {}).items():
+            if mat is None:
+                continue
+
+            is_directed = get_method_spec(variant).directed
+
+            # Для p-value матриц: строим "силу связи" как (1 - p),
+            # но только для статистически значимых пар p < threshold.
+            if is_pvalue_method(variant):
+                clean_mat = np.zeros_like(mat, dtype=float)
+                mask = (mat < float(threshold)) & (~np.eye(mat.shape[0], dtype=bool))
+                clean_mat[mask] = 1.0 - mat[mask]
+                analysis = analyze_graph_topology(clean_mat, names, threshold=0.01, directed=is_directed)
+            else:
+                analysis = analyze_graph_topology(mat, names, threshold=float(threshold), directed=is_directed)
+
+            self.graph_results[variant] = analysis
+            logging.info("[Graph] Analyzed topology for %s", variant)
+
     def _compute_variant_auto(self, variant: str, **kwargs) -> tuple[np.ndarray | None, dict]:
         """Единая точка расчёта: лаг (fixed/optimize) + окна (none/best/mean).
 

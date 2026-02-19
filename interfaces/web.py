@@ -154,48 +154,115 @@ def main() -> None:
                 except Exception as e:
                     st.error(f"Ошибка генерации: {e}")
 
-    with st.expander("Параметры запуска", expanded=True):
-        colA, colB, colC = st.columns(3)
-        with colA:
-            lag_selection = st.selectbox("Выбор лага (основной расчёт)", ["optimize", "fixed"], index=0)
-            if lag_selection == "fixed":
-                lag = st.number_input("lag (если fixed)", min_value=1, max_value=200, value=1)
-                max_lag = st.number_input("max_lag (для сканов/ограничений)", min_value=1, max_value=200, value=12)
-            else:
-                max_lag = st.number_input("max_lag (для optimize)", min_value=1, max_value=200, value=12)
-                lag = st.number_input("lag (не используется при optimize)", min_value=1, max_value=200, value=1)
+    # === БЛОК 1: ПРЕДОБРАБОТКА (с пояснениями) ===
+    with st.expander("🛠️ 1. Подготовка данных (Preprocessing & DimRed)", expanded=False):
+        st.info("Настройте, как очистить данные перед анализом.")
 
-            alpha = st.number_input("P-value alpha (для Granger/p-value)", 0.0001, 0.5, 0.05, format="%.4f")
-            threshold = st.number_input("Порог графа (Threshold)", 0.0, 1.0, 0.2, 0.05)
-
-        with colB:
-            normalize_mode_label = st.selectbox("Нормализация", ["нет", "z-score", "robust z (median/MAD)", "rank (dense: 1..K)", "rank (percentile: 0..1)"], index=1)
-            normalize = (normalize_mode_label != "нет")
-            normalize_mode = ("zscore" if normalize_mode_label.startswith("z-score") else ("robust_z" if normalize_mode_label.startswith("robust") else ("rank_dense" if "dense" in normalize_mode_label else ("rank_pct" if "percentile" in normalize_mode_label else "none"))))
-            rank_ties = st.selectbox("Rank ties (если rank)", ["average", "min", "max", "dense", "first"], index=0)
-            preprocess = st.checkbox("Предобработка (fill/outliers/log)", value=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Очистка сигналов**")
+            preprocess = st.checkbox("Включить очистку", value=True)
             fill_missing = st.checkbox("Заполнять пропуски (interp)", value=True)
-            remove_outliers = st.checkbox("Убирать выбросы", value=True)
-            outlier_rule = st.selectbox("Правило выбросов", ["robust_z", "zscore", "iqr", "percentile", "hampel", "jump"], index=0)
-            outlier_action = st.selectbox("Что делать с выбросами", ["mask (NaN)", "clip (winsorize)", "median (global)", "local_median"], index=0)
-            outlier_z = st.number_input("Порог z (для z/robust_z/hampel/jump)", min_value=0.5, max_value=50.0, value=5.0, step=0.5)
-            outlier_k = st.number_input("Параметр k (для IQR)", min_value=0.5, max_value=10.0, value=1.5, step=0.1)
-            outlier_p_low = st.number_input("Перцентиль low (для percentile/clip)", min_value=0.0, max_value=49.0, value=0.5, step=0.5)
-            outlier_p_high = st.number_input("Перцентиль high (для percentile/clip)", min_value=51.0, max_value=100.0, value=99.5, step=0.5)
-            outlier_hampel_window = st.number_input("Окно Hampel", min_value=3, max_value=501, value=7, step=2)
-            outlier_jump_thr = st.number_input("Порог jump (0=auto)", min_value=0.0, max_value=1e9, value=0.0, step=1.0)
-            outlier_local_median_window = st.number_input("Окно local_median", min_value=3, max_value=501, value=7, step=2)
-            _out_act = ("mask" if outlier_action.startswith("mask") else ("clip" if outlier_action.startswith("clip") else ("median" if outlier_action.startswith("median") else "local_median")))
+            if preprocess:
+                normalize_mode_label = st.selectbox(
+                    "Нормализация (приведение к одному масштабу)",
+                    ["z-score", "robust z (median/MAD)", "rank (dense: 1..K)", "rank (percentile: 0..1)", "нет"],
+                    index=0,
+                )
+                normalize = normalize_mode_label != "нет"
+                normalize_mode = (
+                    "zscore"
+                    if normalize_mode_label.startswith("z-score")
+                    else (
+                        "robust_z"
+                        if normalize_mode_label.startswith("robust")
+                        else (
+                            "rank_dense"
+                            if "dense" in normalize_mode_label
+                            else ("rank_pct" if "percentile" in normalize_mode_label else "none")
+                        )
+                    )
+                )
+                rank_ties = st.selectbox("Rank ties (если rank)", ["average", "min", "max", "dense", "first"], index=0)
+
+                remove_outliers = st.checkbox(
+                    "Удалять выбросы (сглаживание)",
+                    value=True,
+                    help="Заменяет резкие скачки на локальную медиану/маскирование по выбранному правилу.",
+                )
+                outlier_rule = st.selectbox("Правило выбросов", ["robust_z", "zscore", "iqr", "percentile", "hampel", "jump"], index=0)
+                outlier_action = st.selectbox("Что делать с выбросами", ["mask (NaN)", "clip (winsorize)", "median (global)", "local_median"], index=0)
+                outlier_z = st.slider("Сила фильтра (Z-score)", 3.0, 10.0, 5.0, help="Меньше = строже фильтр")
+                outlier_k = st.number_input("Параметр k (для IQR)", min_value=0.5, max_value=10.0, value=1.5, step=0.1)
+                outlier_p_low = st.number_input("Перцентиль low (для percentile/clip)", min_value=0.0, max_value=49.0, value=0.5, step=0.5)
+                outlier_p_high = st.number_input("Перцентиль high (для percentile/clip)", min_value=51.0, max_value=100.0, value=99.5, step=0.5)
+                outlier_hampel_window = st.number_input("Окно Hampel", min_value=3, max_value=501, value=7, step=2)
+                outlier_jump_thr = st.number_input("Порог jump (0=auto)", min_value=0.0, max_value=1e9, value=0.0, step=1.0)
+                outlier_local_median_window = st.number_input("Окно local_median", min_value=3, max_value=501, value=7, step=2)
+                check_stat = st.checkbox(
+                    "Авто-дифференцирование (если ряд нестационарен)",
+                    value=False,
+                    help="Если тренд меняется, берем разности (производную).",
+                )
+            else:
+                normalize = False
+                normalize_mode = "none"
+                rank_ties = "average"
+                remove_outliers = False
+                outlier_rule = "robust_z"
+                outlier_action = "mask (NaN)"
+                outlier_z = 5.0
+                outlier_k = 1.5
+                outlier_p_low = 0.5
+                outlier_p_high = 99.5
+                outlier_hampel_window = 7
+                outlier_jump_thr = 0.0
+                outlier_local_median_window = 7
+                check_stat = False
+
+            _out_act = (
+                "mask"
+                if str(outlier_action).startswith("mask")
+                else ("clip" if str(outlier_action).startswith("clip") else ("median" if str(outlier_action).startswith("median") else "local_median"))
+            )
             log_transform = st.checkbox("Лог-преобразование (только >0)", value=False)
             remove_ar1 = st.checkbox("Убрать AR(1) (прибл. prewhitening)", value=False)
             remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
             season_period = st.number_input("Период сезонности (0=авто)", min_value=0, max_value=1000000, value=0, step=1)
-
             qc_enabled = st.checkbox(
                 "QC по каждому ряду/вокселю (mean/std/дрейф/спайки/AR1)",
                 value=True,
                 help="Помогает быстро увидеть 'битые' ряды и причины ложной связности.",
             )
+
+        with c2:
+            st.markdown("**Снижение размерности (для больших данных)**")
+            dimred_enabled = st.checkbox("Включить DimRed", value=False)
+            dimred_method = "variance"
+            dimred_target = 50
+            if dimred_enabled:
+                st.caption("Если у вас 100+ каналов, анализ будет долгим. Выберите метод сжатия:")
+                dimred_method = st.selectbox(
+                    "Метод",
+                    [
+                        "variance (оставить самые меняющиеся)",
+                        "kmeans (объединить похожие в кластеры)",
+                        "spatial (усреднить по соседним вокселям)",
+                    ],
+                )
+                dimred_target = st.slider("Сколько каналов оставить?", 10, 500, 50)
+                if dimred_method.startswith("kmeans"):
+                    st.caption("K-Means: Группирует похожие временные ряды в один 'средний' ряд.")
+                elif dimred_method.startswith("spatial"):
+                    st.caption("Spatial: Требует координаты (x,y,z). Бьет пространство на кубики.")
+
+            st.markdown("**Дополнительные настройки**")
+            output_mode = st.selectbox("Режим вывода", ["both", "html", "excel"], index=0)
+            include_diagnostics = st.checkbox("HTML: показывать диагностику", value=True)
+            include_scans = st.toggle("Включить сканирование", value=True)
+            include_matrix_tables = st.checkbox("HTML: показывать таблицу матрицы (текстом)", value=False)
+            include_fft_plots = st.checkbox("HTML: FFT-графики", value=True)
+            harmonic_top_k = st.number_input("Гармоники: top_k", min_value=1, max_value=20, value=5)
             save_series_bundle = st.checkbox(
                 "Сохранять пакет рядов (raw+clean+QC+coords)",
                 value=True,
@@ -213,70 +280,87 @@ def main() -> None:
             if "PCA" in control_strategy:
                 control_pca_k = int(st.number_input("PCA k", min_value=1, max_value=50, value=3, step=1))
 
-        with colC:
-            output_mode = st.selectbox("Режим вывода", ["both", "html", "excel"], index=0)
-            include_diagnostics = st.checkbox("HTML: показывать диагностику", value=True)
-            include_scans = st.checkbox("HTML: показывать сканы (окна/лаги/куб)", value=True)
-            include_matrix_tables = st.checkbox("HTML: показывать таблицу матрицы (текстом)", value=False)
-            include_fft_plots = st.checkbox("HTML: FFT-графики", value=True)
-            harmonic_top_k = st.number_input("Гармоники: top_k", min_value=1, max_value=20, value=5)
+    # === БЛОК 2: ПАРАМЕТРЫ СВЯЗНОСТИ ===
+    with st.expander("⚙️ 2. Параметры связности (Lags & Windows)", expanded=True):
+        tabs = st.tabs(["Основное", "Сканирование (Advanced)", "Топология графа"])
 
-        st.markdown("---")
-        st.subheader("Основной расчёт (что вернётся как итоговая матрица)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            use_main_windows = st.checkbox("Использовать окна в основном расчёте", value=False)
-            window_policy = st.selectbox("Политика окон (main)", ["best", "mean"], index=0)
-            window_stride_main = st.number_input("stride (main, 0=auto)", min_value=0, max_value=100000, value=0, step=1)
-        with c2:
-            window_sizes_text = st.text_input("main window_sizes", value="256,512")
-            st.caption("Если выключено 'использовать окна' — будет считаться на полном интервале.")
-        with c3:
-            window_cube_level = st.selectbox("Main window×lag×position (legacy)", ["off", "basic", "full"], index=0)
-            window_cube_eval_limit = st.number_input("Main-cube eval_limit", min_value=20, max_value=5000, value=120, step=10)
+        with tabs[0]:
+            st.write("Базовые настройки для расчета одной итоговой матрицы.")
+            col_lag, col_thr = st.columns(2)
+            with col_lag:
+                lag_mode = st.radio("Подбор лага (задержки)", ["Автоматически (Optimize)", "Фиксированный"], horizontal=True)
+                if lag_mode.startswith("Фикс"):
+                    lag_selection = "fixed"
+                    lag = st.slider("Лаг (точек)", 1, 50, 1)
+                    max_lag = st.slider("max_lag (для сканов/ограничений)", 1, 200, 12)
+                else:
+                    lag_selection = "optimize"
+                    max_lag = st.slider("Максимальный лаг для поиска", 1, 20, 5, help="Проверим лаги от 1 до N и выберем лучший")
+                    lag = 1
 
-        st.markdown("---")
-        st.subheader("Сканы (отчёт/инспектор; не меняют итоговую матрицу)")
-        s1, s2, s3 = st.columns(3)
-        with s1:
-            scan_window_pos = st.checkbox("scan_window_pos", value=True, disabled=not include_scans)
-            scan_window_size = st.checkbox("scan_window_size", value=True, disabled=not include_scans)
-            scan_lag = st.checkbox("scan_lag", value=True, disabled=not include_scans)
-            scan_cube = st.checkbox("scan_cube", value=True, disabled=not include_scans)
+                use_main_windows = st.checkbox("Использовать окна в основном расчёте", value=False)
+                window_policy = st.selectbox("Политика окон (main)", ["best", "mean"], index=0)
+                window_sizes_text = st.text_input("main window_sizes", value="256,512")
+                window_stride_main = st.number_input("stride (main, 0=auto)", min_value=0, max_value=100000, value=0, step=1)
+                window_cube_level = st.selectbox("Main window×lag×position (legacy)", ["off", "basic", "full"], index=0)
+                window_cube_eval_limit = st.number_input("Main-cube eval_limit", min_value=20, max_value=5000, value=120, step=10)
 
-        with s2:
-            window_min = st.number_input("window_min", min_value=2, max_value=1000000, value=64, step=1, disabled=not include_scans)
-            window_max = st.number_input("window_max", min_value=2, max_value=1000000, value=192, step=1, disabled=not include_scans)
-            window_step = st.number_input("window_step", min_value=1, max_value=1000000, value=64, step=1, disabled=not include_scans)
-            window_size_default = st.number_input("window_size (для scan_window_pos)", min_value=2, max_value=1000000, value=128, step=1, disabled=not include_scans)
+            with col_thr:
+                graph_threshold = st.slider(
+                    "Порог значимости графа",
+                    0.0,
+                    1.0,
+                    0.25,
+                    0.05,
+                    help="Связи слабее этого значения будут считаться шумом",
+                )
+                alpha = st.number_input("P-value alpha (для стат. тестов)", 0.001, 0.1, 0.05, format="%.3f")
+                threshold = float(graph_threshold)
 
-        with s3:
-            window_start_min = st.number_input("window_start_min (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1, disabled=not include_scans)
-            window_start_max = st.number_input("window_start_max (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1, disabled=not include_scans)
-            window_stride_scan = st.number_input("window_stride (scan, 0=auto)", min_value=0, max_value=10_000_000, value=0, step=1, disabled=not include_scans)
-            window_max_windows = st.number_input("window_max_windows", min_value=1, max_value=5000, value=60, step=1, disabled=not include_scans)
+        with tabs[1]:
+            st.info("Сканирование строит графики того, как меняется связь в зависимости от параметров. Это долго, но полезно.")
+            if include_scans:
+                st.markdown("**1. Скользящее окно (динамика во времени)**")
+                win_range = st.slider("Диапазон размеров окна", 32, 512, (64, 192), step=32)
+                window_min, window_max = win_range
+                window_step = st.number_input("window_step", min_value=1, max_value=1000000, value=64, step=1)
+                window_size_default = st.number_input("window_size (для scan_window_pos)", min_value=2, max_value=1000000, value=128, step=1)
 
-        st.markdown("**Лаг-сетка (для scan_lag и cube)**")
-        l1, l2, l3 = st.columns(3)
-        with l1:
-            lag_min = st.number_input("lag_min", min_value=1, max_value=2000, value=1, step=1, disabled=not include_scans)
-        with l2:
-            lag_max = st.number_input("lag_max", min_value=1, max_value=2000, value=min(3, int(max_lag)), step=1, disabled=not include_scans)
-        with l3:
-            lag_step = st.number_input("lag_step", min_value=1, max_value=2000, value=1, step=1, disabled=not include_scans)
+                st.markdown("**2. Скан по лагам**")
+                scan_lag = st.checkbox("Проверить влияние лага (кривая качества)", value=True)
+                lag_min = st.number_input("lag_min", min_value=1, max_value=2000, value=1, step=1)
+                lag_max = st.number_input("lag_max", min_value=1, max_value=2000, value=min(3, int(max_lag)), step=1)
+                lag_step = st.number_input("lag_step", min_value=1, max_value=2000, value=1, step=1)
 
-        st.markdown("**Куб (window_size × lag × position)**")
-        k1, k2, k3 = st.columns(3)
-        with k1:
-            cube_combo_limit = st.number_input("cube_combo_limit (по парам w×lag)", min_value=1, max_value=200000, value=9, step=1, disabled=not include_scans)
-            cube_eval_limit = st.number_input("cube_eval_limit (общий лимит точек)", min_value=1, max_value=2_000_000, value=225, step=5, disabled=not include_scans)
-        with k2:
-            cube_matrix_mode = st.selectbox("cube_matrix_mode", ["all", "selected"], index=0, disabled=not include_scans)
-            cube_matrix_limit = st.number_input("cube_matrix_limit", min_value=1, max_value=2_000_000, value=225, step=5, disabled=not include_scans)
-        with k3:
-            cube_gallery_mode = st.selectbox("cube_gallery_mode", ["extremes", "topbottom", "quantiles"], index=0, disabled=not include_scans)
-            cube_gallery_k = st.number_input("cube_gallery_k", min_value=1, max_value=1000, value=1, step=1, disabled=not include_scans)
-            cube_gallery_limit = st.number_input("cube_gallery_limit", min_value=3, max_value=5000, value=60, step=5, disabled=not include_scans)
+                st.markdown("**3. 4D Куб (Window × Lag × Time)**")
+                scan_cube = st.checkbox("Построить 3D-карту устойчивости", value=False, help="Очень ресурсоемко!")
+                scan_window_pos = st.checkbox("scan_window_pos", value=True)
+                scan_window_size = st.checkbox("scan_window_size", value=True)
+                window_start_min = st.number_input("window_start_min (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
+                window_start_max = st.number_input("window_start_max (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
+                window_stride_scan = st.number_input("window_stride (scan, 0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
+                window_max_windows = st.number_input("window_max_windows", min_value=1, max_value=5000, value=60, step=1)
+                cube_combo_limit = st.number_input("cube_combo_limit", min_value=1, max_value=200000, value=9, step=1)
+                cube_eval_limit = st.number_input("cube_eval_limit", min_value=1, max_value=2_000_000, value=225, step=5)
+                cube_matrix_mode = st.selectbox("cube_matrix_mode", ["all", "selected"], index=0)
+                cube_matrix_limit = st.number_input("cube_matrix_limit", min_value=1, max_value=2_000_000, value=225, step=5)
+                cube_gallery_mode = st.selectbox("cube_gallery_mode", ["extremes", "topbottom", "quantiles"], index=0)
+                cube_gallery_k = st.number_input("cube_gallery_k", min_value=1, max_value=1000, value=1, step=1)
+                cube_gallery_limit = st.number_input("cube_gallery_limit", min_value=3, max_value=5000, value=60, step=5)
+            else:
+                window_min, window_max, window_step, window_size_default = 64, 192, 64, 128
+                scan_lag = scan_cube = scan_window_pos = scan_window_size = False
+                lag_min, lag_max, lag_step = 1, min(3, int(max_lag)), 1
+                window_start_min = window_start_max = window_stride_scan = 0
+                window_max_windows = 60
+                cube_combo_limit, cube_eval_limit, cube_matrix_limit = 9, 225, 225
+                cube_matrix_mode, cube_gallery_mode = "all", "extremes"
+                cube_gallery_k, cube_gallery_limit = 1, 60
+
+        with tabs[2]:
+            st.markdown("**Network Science**")
+            calc_topology = st.checkbox("Рассчитать метрики графа", value=True)
+            st.caption("Найдем Хабы (Centrality), Кластеры (Communities) и построим таблицу лидеров.")
 
         st.markdown("---")
         st.subheader("Метод-специфичные оверрайды (advanced)")
@@ -286,6 +370,10 @@ def main() -> None:
             placeholder='Напр.: {"te_directed": {"scan_cube": false, "cube_matrix_mode": "selected"}}',
             height=80,
         )
+
+    # === БЛОК 3: ВЫБОР МЕТОДОВ ===
+    st.subheader("3. Выбор методов")
+
 
     all_methods = STABLE_METHODS + EXPERIMENTAL_METHODS
     selected_methods = st.multiselect("Выберите методы", all_methods, default=STABLE_METHODS[:2])
@@ -431,7 +519,11 @@ def main() -> None:
                     control_strategy=(
                         "none"
                         if control_strategy == "нет"
-                        else ("global_mean" if control_strategy == "глобальный сигнал" else "global_mean_trend")
+                        else (
+                            "global_mean"
+                            if control_strategy == "глобальный сигнал"
+                            else ("global_mean_trend_pca" if "PCA" in control_strategy else "global_mean_trend")
+                        )
                     ),
                     control_pca_k=int(control_pca_k or 0),
                     window_sizes=window_sizes_main,
@@ -440,6 +532,9 @@ def main() -> None:
                     window_cube_level=window_cube_level,
                     window_cube_eval_limit=int(window_cube_eval_limit),
                     method_options=method_options,
+                    dimred_enabled=bool(dimred_enabled),
+                    dimred_method=("variance" if str(dimred_method).startswith("variance") else ("kmeans" if str(dimred_method).startswith("kmeans") else "spatial")),
+                    dimred_target=int(dimred_target),
                     # scans
                     scan_window_pos=(bool(scan_window_pos) if include_scans else False),
                     scan_window_size=(bool(scan_window_size) if include_scans else False),
@@ -464,6 +559,15 @@ def main() -> None:
                     cube_gallery_k=int(cube_gallery_k),
                     cube_gallery_limit=int(cube_gallery_limit),
                 )
+
+
+                if calc_topology:
+                    with st.spinner("Анализ топологии графов..."):
+                        try:
+                            tool.calculate_graph_metrics(threshold=float(graph_threshold))
+                            st.success("Топология рассчитана!")
+                        except Exception as e:
+                            st.warning(f"Ошибка анализа графов: {e}")
 
                 # Сохраняем ряды отдельным файлом рядом с отчётами (если не выключено).
                 series_path = run_dir / f"{stem}_series.xlsx"
@@ -527,6 +631,21 @@ def main() -> None:
                         st.dataframe(df_show.head(200), height=320)
                     except Exception:
                         pass
+
+
+                if calc_topology and hasattr(tool, "graph_results"):
+                    st.subheader("🏆 Лидеры сети (Top Nodes)")
+                    for variant, res in tool.graph_results.items():
+                        with st.expander(f"Топология: {variant}"):
+                            if isinstance(res, dict) and res.get("error"):
+                                st.warning(res["error"])
+                                continue
+                            c_graph1, c_graph2 = st.columns([2, 1])
+                            with c_graph1:
+                                st.dataframe(res["node_metrics"].head(10), use_container_width=True)
+                            with c_graph2:
+                                st.write("Глобальные метрики:")
+                                st.json(res["global_metrics"])
 
                 st.subheader("Предварительный просмотр матриц")
                 from src.visualization import plots
