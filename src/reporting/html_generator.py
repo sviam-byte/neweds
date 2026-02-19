@@ -290,7 +290,9 @@ class HTMLReportGenerator:
             )
         if not blocks:
             return ""
-        js = json.dumps(payload, ensure_ascii=False).replace("</", "<\/")
+        # Защита от преждевременного закрытия <script> в JSON: экранируем "</".
+        # В Python строке обратный слеш должен быть экранирован.
+        js = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
         return "".join(blocks) + f"<script type='application/json' id='scan_data_{prefix}'>{js}</script>"
 
     def _matrix_table(self, mat: np.ndarray, cols: list) -> str:

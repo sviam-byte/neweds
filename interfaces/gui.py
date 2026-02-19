@@ -10,6 +10,7 @@ import sys
 import traceback
 import webbrowser
 from pathlib import Path
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
@@ -141,6 +142,74 @@ class App(tk.Tk):
         self.status_bar.pack(side="bottom", fill="x")
         self.stage_progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", maximum=100)
         self.stage_progress.pack(side="bottom", fill="x")
+
+    # --- безопасные геттеры Tk-переменных ---
+    # В Tkinter IntVar/DoubleVar могут кидать TclError во время ввода ("", "0/", "0?9").
+    # Это ломало авто-обновление JSON-плана и запуск.
+    _FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:[\.,]\d*)?|[\.,]\d+)(?:[eE][-+]?\d+)?")
+    _INT_RE = re.compile(r"[-+]?\d+")
+
+    def _var_raw(self, var, default: object = "") -> object:
+        """Вернуть "сырой" value переменной, не падая на TclError."""
+        try:
+            return var.get()
+        except Exception:
+            try:
+                return self.getvar(getattr(var, "_name", ""))
+            except Exception:
+                return default
+
+    def _as_str(self, var, default: str = "") -> str:
+        v = self._var_raw(var, default)
+        try:
+            return str(v)
+        except Exception:
+            return default
+
+    def _as_bool(self, var, default: bool = False) -> bool:
+        try:
+            return bool(self._var_raw(var, default))
+        except Exception:
+            return bool(default)
+
+    def _as_float(self, var, default: float = 0.0) -> float:
+        v = self._var_raw(var, "")
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return float(default)
+        s = s.replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            m = self._FLOAT_RE.search(s)
+            if not m:
+                return float(default)
+            try:
+                return float(m.group(0).replace(",", "."))
+            except Exception:
+                return float(default)
+
+    def _as_int(self, var, default: int = 0) -> int:
+        v = self._var_raw(var, "")
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, int):
+            return int(v)
+        if isinstance(v, float):
+            return int(v)
+        s = str(v).strip()
+        if not s:
+            return int(default)
+        # допускаем "12.0" и мусорные суффиксы
+        m = self._FLOAT_RE.search(s) or self._INT_RE.search(s)
+        if not m:
+            return int(default)
+        try:
+            return int(float(m.group(0).replace(",", ".")))
+        except Exception:
+            return int(default)
 
 
     def _set_stage(self, stage: str, progress=None) -> None:
@@ -636,11 +705,11 @@ class App(tk.Tk):
 
     def _get_config(self) -> AnalysisConfig:
         return AnalysisConfig(
-            max_lag=self.max_lag.get(),
-            p_value_alpha=self.p_alpha.get(),
-            graph_threshold=self.graph_threshold.get(),
-            auto_difference=self.auto_diff.get(),
-            pvalue_correction=self.p_correction.get(),
+            max_lag=self._as_int(self.max_lag, 5),
+            p_value_alpha=self._as_float(self.p_alpha, 0.05),
+            graph_threshold=self._as_float(self.graph_threshold, 0.2),
+            auto_difference=self._as_bool(self.auto_diff),
+            pvalue_correction=self._as_str(self.p_correction, "none"),
         )
 
     def _get_selected_methods(self) -> list[str]:
@@ -725,9 +794,9 @@ class App(tk.Tk):
             cube_pairs = None
 
         # --- scan params ---
-        stride = int(self.window_stride.get())
+        stride = self._as_int(self.window_stride, 0)
         stride = None if stride <= 0 else stride
-        start_max = int(self.window_start_max.get())
+        start_max = self._as_int(self.window_start_max, 0)
         start_max = None if start_max <= 0 else start_max
 
         # Обновляем план перед запуском: пользователю видно финальный набор параметров.
@@ -735,57 +804,59 @@ class App(tk.Tk):
 
         tool.run_selected_methods(
             methods,
-            max_lag=cfg.max_lag,
-            preprocess_stage=str(self.preprocess_stage.get()).strip().lower(),
+            max_lag=int(cfg.max_lag),
+            preprocess_stage=str(self._as_str(self.preprocess_stage)).strip().lower(),
             post_preprocess={
-                "enabled": bool(self.post_preproc_enabled.get()),
-                "normalize": bool(self.post_preproc_normalize.get()),
-                "normalize_mode": str(self.post_preproc_normalize_mode.get()),
-                "rank_ties": str(self.post_preproc_rank_ties.get()),
-                "fill_missing": bool(self.post_preproc_fill_missing.get()),
+                "enabled": self._as_bool(self.post_preproc_enabled),
+                "normalize": self._as_bool(self.post_preproc_normalize),
+                "normalize_mode": str(self._as_str(self.post_preproc_normalize_mode)),
+                "rank_ties": str(self._as_str(self.post_preproc_rank_ties)),
+                "fill_missing": self._as_bool(self.post_preproc_fill_missing),
             },
-            dimred_enabled=bool(self.dimred_enabled.get()),
-            dimred_method=str(self.dimred_method.get()),
-            dimred_target=int(self.dimred_target.get()),
-            dimred_target_var=(None if float(self.dimred_target_var.get()) <= 0 else float(self.dimred_target_var.get())),
-            dimred_spatial_bin=int(self.dimred_spatial_bin.get()),
-            dimred_kmeans_batch=int(self.dimred_kmeans_batch.get()),
-            dimred_seed=int(self.dimred_seed.get()),
-            dimred_save_variants=bool(self.dimred_save_variants.get()),
-            dimred_variants=str(self.dimred_variants.get() or ""),
+            dimred_enabled=self._as_bool(self.dimred_enabled),
+            dimred_method=str(self._as_str(self.dimred_method)),
+            dimred_target=self._as_int(self.dimred_target, 500),
+            dimred_target_var=(
+                None if self._as_float(self.dimred_target_var, 0.0) <= 0 else self._as_float(self.dimred_target_var, 0.0)
+            ),
+            dimred_spatial_bin=self._as_int(self.dimred_spatial_bin, 2),
+            dimred_kmeans_batch=self._as_int(self.dimred_kmeans_batch, 2048),
+            dimred_seed=self._as_int(self.dimred_seed, 0),
+            dimred_save_variants=self._as_bool(self.dimred_save_variants),
+            dimred_variants=str(self._as_str(self.dimred_variants) or ""),
             window_sizes_grid=w_sizes,
-            window_min=int(self.window_min.get()),
-            window_max=int(self.window_max.get()),
-            window_step=int(self.window_step.get()),
-            window_size=int(self.window_size_default.get()),
+            window_min=self._as_int(self.window_min, 64),
+            window_max=self._as_int(self.window_max, 192),
+            window_step=self._as_int(self.window_step, 64),
+            window_size=self._as_int(self.window_size_default, 128),
             window_stride=stride,
-            window_start_min=int(self.window_start_min.get()),
+            window_start_min=self._as_int(self.window_start_min, 0),
             window_start_max=start_max,
-            window_max_windows=int(self.window_max_windows.get()),
-            scan_window_pos=bool(self.scan_window_pos.get()),
-            scan_window_size=bool(self.scan_window_size.get()),
-            scan_lag=bool(self.scan_lag.get()),
-            scan_cube=bool(self.scan_cube.get()),
-            lag_min=int(self.lag_min.get()),
-            lag_max=int(self.lag_max.get()),
-            lag_step=int(self.lag_step.get()),
-            cube_combo_limit=int(self.cube_combo_limit.get()),
-            cube_eval_limit=int(self.cube_eval_limit.get()),
-            cube_matrix_mode=str(self.cube_matrix_mode.get()),
-            cube_matrix_limit=int(self.cube_matrix_limit.get()),
-            cube_gallery_mode=str(self.cube_gallery_mode.get()),
-            cube_gallery_k=int(self.cube_gallery_k.get()),
-            cube_gallery_limit=int(self.cube_gallery_limit.get()),
+            window_max_windows=self._as_int(self.window_max_windows, 60),
+            scan_window_pos=self._as_bool(self.scan_window_pos),
+            scan_window_size=self._as_bool(self.scan_window_size),
+            scan_lag=self._as_bool(self.scan_lag),
+            scan_cube=self._as_bool(self.scan_cube),
+            lag_min=self._as_int(self.lag_min, 1),
+            lag_max=self._as_int(self.lag_max, 3),
+            lag_step=self._as_int(self.lag_step, 1),
+            cube_combo_limit=self._as_int(self.cube_combo_limit, 9),
+            cube_eval_limit=self._as_int(self.cube_eval_limit, 225),
+            cube_matrix_mode=str(self._as_str(self.cube_matrix_mode)),
+            cube_matrix_limit=self._as_int(self.cube_matrix_limit, 225),
+            cube_gallery_mode=str(self._as_str(self.cube_gallery_mode)),
+            cube_gallery_k=self._as_int(self.cube_gallery_k, 1),
+            cube_gallery_limit=self._as_int(self.cube_gallery_limit, 60),
             method_options=method_options,
             cube_pairs=cube_pairs,
-            pair_mode=str(self.pair_mode.get()),
-            pair_auto_threshold=int(self.pair_auto_threshold.get()),
-            pairs_text=str(self.pairs_text.get() or ""),
-            max_pairs=int(self.max_pairs.get()),
-            neighbor_kind=str(self.neighbor_kind.get()),
-            neighbor_radius=int(self.neighbor_radius.get()),
-            screen_metric=str(self.screen_metric.get()),
-            topk_per_node=int(self.topk_per_node.get()),
+            pair_mode=str(self._as_str(self.pair_mode)),
+            pair_auto_threshold=self._as_int(self.pair_auto_threshold, 600),
+            pairs_text=str(self._as_str(self.pairs_text) or ""),
+            max_pairs=self._as_int(self.max_pairs, 50000),
+            neighbor_kind=str(self._as_str(self.neighbor_kind)),
+            neighbor_radius=self._as_int(self.neighbor_radius, 1),
+            screen_metric=str(self._as_str(self.screen_metric)),
+            topk_per_node=self._as_int(self.topk_per_node, 10),
         )
 
         self._set_stage("Экспорт результатов", 0.98)
@@ -797,7 +868,7 @@ class App(tk.Tk):
                 out_dir=out_dir,
                 name_prefix=name_prefix,
                 dense_n_limit=2000,
-                topk_per_node=max(1, int(self.topk_per_node.get())),
+                topk_per_node=max(1, self._as_int(self.topk_per_node, 10)),
                 # Для edge-list используем graph_threshold как минимальный |weight|.
                 min_abs_weight=float(cfg.graph_threshold),
                 include_scan_matrices=True,
@@ -819,10 +890,10 @@ class App(tk.Tk):
                 html_path,
                 graph_threshold=cfg.graph_threshold,
                 p_alpha=cfg.p_value_alpha,
-                include_diagnostics=bool(self.include_diagnostics.get()),
-                include_fft_plots=bool(self.include_fft_plots.get()),
-                include_scans=bool(self.include_scans.get()),
-                include_matrix_tables=bool(self.include_matrix_tables.get()),
+                include_diagnostics=self._as_bool(self.include_diagnostics),
+                include_fft_plots=self._as_bool(self.include_fft_plots),
+                include_scans=self._as_bool(self.include_scans),
+                include_matrix_tables=self._as_bool(self.include_matrix_tables),
             )
         if do_excel:
             self._set_stage("Формирование Excel отчёта", 0.99)
@@ -839,26 +910,26 @@ class App(tk.Tk):
         try:
             df = data_loader.load_or_generate(
                 fp,
-                preprocess=(bool(self.preproc_enabled.get()) and str(self.preprocess_stage.get()).strip().lower() in ("pre", "both")),
-                log_transform=bool(self.preproc_log_transform.get()),
-                remove_outliers=bool(self.preproc_remove_outliers.get()),
-                outlier_rule=str(self.preproc_outlier_rule.get()),
-                outlier_action=str(self.preproc_outlier_action.get()),
-                outlier_z=float(self.preproc_outlier_z.get()),
-                outlier_k=float(self.preproc_outlier_k.get()),
-                outlier_p_low=float(self.preproc_outlier_p_low.get()),
-                outlier_p_high=float(self.preproc_outlier_p_high.get()),
-                outlier_hampel_window=int(self.preproc_outlier_hampel_window.get()),
-                outlier_jump_thr=(None if float(self.preproc_outlier_jump_thr.get())==0.0 else float(self.preproc_outlier_jump_thr.get())),
-                outlier_local_median_window=int(self.preproc_outlier_local_median_window.get()),
-                normalize=bool(self.preproc_normalize.get()),
-                normalize_mode=str(self.preproc_normalize_mode.get()),
-                rank_ties=str(self.preproc_rank_ties.get()),
-                fill_missing=bool(self.preproc_fill_missing.get()),
-                remove_ar1=bool(self.preproc_remove_ar1.get()),
-                remove_ar_order=int(self.preproc_ar_order.get() or 1),
-                remove_seasonality=bool(self.preproc_remove_seasonality.get()),
-                season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
+                preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
+                log_transform=self._as_bool(self.preproc_log_transform),
+                remove_outliers=self._as_bool(self.preproc_remove_outliers),
+                outlier_rule=str(self._as_str(self.preproc_outlier_rule)),
+                outlier_action=str(self._as_str(self.preproc_outlier_action)),
+                outlier_z=self._as_float(self.preproc_outlier_z, 5.0),
+                outlier_k=self._as_float(self.preproc_outlier_k, 1.5),
+                outlier_p_low=self._as_float(self.preproc_outlier_p_low, 0.5),
+                outlier_p_high=self._as_float(self.preproc_outlier_p_high, 99.5),
+                outlier_hampel_window=self._as_int(self.preproc_outlier_hampel_window, 7),
+                outlier_jump_thr=(None if self._as_float(self.preproc_outlier_jump_thr, 0.0) == 0.0 else self._as_float(self.preproc_outlier_jump_thr, 0.0)),
+                outlier_local_median_window=self._as_int(self.preproc_outlier_local_median_window, 7),
+                normalize=self._as_bool(self.preproc_normalize),
+                normalize_mode=str(self._as_str(self.preproc_normalize_mode)),
+                rank_ties=str(self._as_str(self.preproc_rank_ties)),
+                fill_missing=self._as_bool(self.preproc_fill_missing),
+                remove_ar1=self._as_bool(self.preproc_remove_ar1),
+                remove_ar_order=self._as_int(self.preproc_ar_order, 1) or 1,
+                remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
+                season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
             )
             # Аккуратная папка результатов рядом с исходным файлом.
             out_dir = os.path.join(os.path.dirname(fp), "time_series_analysis", Path(fp).stem)
@@ -896,26 +967,26 @@ class App(tk.Tk):
             try:
                 df = data_loader.load_or_generate(
                     fp,
-                    preprocess=(bool(self.preproc_enabled.get()) and str(self.preprocess_stage.get()).strip().lower() in ("pre", "both")),
-                    log_transform=bool(self.preproc_log_transform.get()),
-                    remove_outliers=bool(self.preproc_remove_outliers.get()),
-                    outlier_rule=str(self.preproc_outlier_rule.get()),
-                    outlier_action=str(self.preproc_outlier_action.get()),
-                    outlier_z=float(self.preproc_outlier_z.get()),
-                    outlier_k=float(self.preproc_outlier_k.get()),
-                    outlier_p_low=float(self.preproc_outlier_p_low.get()),
-                    outlier_p_high=float(self.preproc_outlier_p_high.get()),
-                    outlier_hampel_window=int(self.preproc_outlier_hampel_window.get()),
-                    outlier_jump_thr=(None if float(self.preproc_outlier_jump_thr.get())==0.0 else float(self.preproc_outlier_jump_thr.get())),
-                    outlier_local_median_window=int(self.preproc_outlier_local_median_window.get()),
-                    normalize=bool(self.preproc_normalize.get()),
-                    normalize_mode=str(self.preproc_normalize_mode.get()),
-                    rank_ties=str(self.preproc_rank_ties.get()),
-                    fill_missing=bool(self.preproc_fill_missing.get()),
-                    remove_ar1=bool(self.preproc_remove_ar1.get()),
-                    remove_ar_order=int(self.preproc_ar_order.get() or 1),
-                    remove_seasonality=bool(self.preproc_remove_seasonality.get()),
-                    season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
+                    preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
+                    log_transform=self._as_bool(self.preproc_log_transform),
+                    remove_outliers=self._as_bool(self.preproc_remove_outliers),
+                    outlier_rule=str(self._as_str(self.preproc_outlier_rule)),
+                    outlier_action=str(self._as_str(self.preproc_outlier_action)),
+                    outlier_z=self._as_float(self.preproc_outlier_z, 5.0),
+                    outlier_k=self._as_float(self.preproc_outlier_k, 1.5),
+                    outlier_p_low=self._as_float(self.preproc_outlier_p_low, 0.5),
+                    outlier_p_high=self._as_float(self.preproc_outlier_p_high, 99.5),
+                    outlier_hampel_window=self._as_int(self.preproc_outlier_hampel_window, 7),
+                    outlier_jump_thr=(None if self._as_float(self.preproc_outlier_jump_thr, 0.0) == 0.0 else self._as_float(self.preproc_outlier_jump_thr, 0.0)),
+                    outlier_local_median_window=self._as_int(self.preproc_outlier_local_median_window, 7),
+                    normalize=self._as_bool(self.preproc_normalize),
+                    normalize_mode=str(self._as_str(self.preproc_normalize_mode)),
+                    rank_ties=str(self._as_str(self.preproc_rank_ties)),
+                    fill_missing=self._as_bool(self.preproc_fill_missing),
+                    remove_ar1=self._as_bool(self.preproc_remove_ar1),
+                    remove_ar_order=self._as_int(self.preproc_ar_order, 1) or 1,
+                    remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
+                    season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
                 )
                 name = Path(f).stem
                 file_out_dir = os.path.join(out_root, name)
@@ -933,12 +1004,12 @@ class App(tk.Tk):
         """Диспетчер генератора пресетов для синтетических наборов данных."""
         try:
             preset = (self.gen_preset.get() or "").strip()
-            n = int(self.gen_samples.get())
-            coupling = float(self.gen_coupling.get())
-            noise = float(self.gen_noise.get())
-            phi = float(self.gen_ar_phi.get())
-            per = int(self.gen_season_period.get())
-            nvars = int(self.gen_nvars.get())
+            n = self._as_int(self.gen_samples, 600)
+            coupling = self._as_float(self.gen_coupling, 0.7)
+            noise = self._as_float(self.gen_noise, 0.2)
+            phi = self._as_float(self.gen_ar_phi, 0.8)
+            per = self._as_int(self.gen_season_period, 50)
+            nvars = self._as_int(self.gen_nvars, 3)
 
             if preset.startswith("Система"):
                 df = generator.generate_coupled_system(
@@ -1105,8 +1176,12 @@ class App(tk.Tk):
             self._plan_refresh_after = self.after(150, lambda: self._refresh_plan_json(force=True))
             return
 
-        plan = self._build_plan_dict()
-        txt = json.dumps(plan, ensure_ascii=False, indent=2)
+        try:
+            plan = self._build_plan_dict()
+            txt = json.dumps(plan, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # Ни один ввод в поле не должен валить Tk callback.
+            txt = json.dumps({"error": f"plan build failed: {e}"}, ensure_ascii=False, indent=2)
         try:
             self.method_options_text.delete("1.0", "end")
             self.method_options_text.insert("1.0", txt)
@@ -1117,76 +1192,88 @@ class App(tk.Tk):
         """Формирует структуру плана расчёта для отображения в GUI."""
         methods = self._get_selected_methods()
         preproc = {
-            "enabled": bool(self.preproc_enabled.get()),
+            "enabled": self._as_bool(self.preproc_enabled),
             "outliers": {
-                "enabled": bool(self.preproc_remove_outliers.get()),
-                "rule": self.preproc_outlier_rule.get(),
-                "action": self.preproc_outlier_action.get(),
-                "z": float(self.preproc_outlier_z.get()),
-                "k": float(self.preproc_outlier_k.get()),
-                "p_low": float(self.preproc_outlier_p_low.get()),
-                "p_high": float(self.preproc_outlier_p_high.get()),
-                "hampel_window": int(self.preproc_outlier_hampel_window.get()),
-                "jump_thr": float(self.preproc_outlier_jump_thr.get()),
-                "local_median_window": int(self.preproc_outlier_local_median_window.get()),
+                "enabled": self._as_bool(self.preproc_remove_outliers),
+                "rule": self._as_str(self.preproc_outlier_rule),
+                "action": self._as_str(self.preproc_outlier_action),
+                "z": self._as_float(self.preproc_outlier_z, 5.0),
+                "k": self._as_float(self.preproc_outlier_k, 1.5),
+                "p_low": self._as_float(self.preproc_outlier_p_low, 0.5),
+                "p_high": self._as_float(self.preproc_outlier_p_high, 99.5),
+                "hampel_window": self._as_int(self.preproc_outlier_hampel_window, 7),
+                "jump_thr": self._as_float(self.preproc_outlier_jump_thr, 0.0),
+                "local_median_window": self._as_int(self.preproc_outlier_local_median_window, 7),
             },
-            "remove_ar1": bool(self.preproc_remove_ar1.get()),
-            "remove_ar_order": int(self.preproc_ar_order.get()),
+            "remove_ar1": self._as_bool(self.preproc_remove_ar1),
+            "remove_ar_order": self._as_int(self.preproc_ar_order, 1),
             "remove_seasonality": {
-                "enabled": bool(self.preproc_remove_seasonality.get()),
-                "period": int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else "auto",
+                "enabled": self._as_bool(self.preproc_remove_seasonality),
+                "period": (
+                    self._as_int(self.preproc_season_period, 0)
+                    if self._as_int(self.preproc_season_period, 0) > 0
+                    else "auto"
+                ),
             },
-            "log_transform": bool(self.preproc_log_transform.get()),
-            "normalize": {"enabled": bool(self.preproc_normalize.get()), "mode": self.preproc_normalize_mode.get()},
-            "fill_missing": bool(self.preproc_fill_missing.get()),
-            "rank_ties": self.preproc_rank_ties.get(),
+            "log_transform": self._as_bool(self.preproc_log_transform),
+            "normalize": {"enabled": self._as_bool(self.preproc_normalize), "mode": self._as_str(self.preproc_normalize_mode)},
+            "fill_missing": self._as_bool(self.preproc_fill_missing),
+            "rank_ties": self._as_str(self.preproc_rank_ties),
         }
         scans = {
-            "window_pos": bool(self.scan_window_pos.get()),
-            "window_size": bool(self.scan_window_size.get()),
-            "lag": bool(self.scan_lag.get()),
-            "cube": bool(self.scan_cube.get()),
-            "window_sizes_text": self.window_sizes_text.get(),
-            "window_minmaxstep": [int(self.window_min.get()), int(self.window_max.get()), int(self.window_step.get())],
-            "window_default": int(self.window_size_default.get()),
-            "window_stride": int(self.window_stride.get()),
-            "window_start_min": int(self.window_start_min.get()),
-            "window_start_max": int(self.window_start_max.get()),
-            "window_max_windows": int(self.window_max_windows.get()),
-            "lag_minmaxstep": [int(self.lag_min.get()), int(self.lag_max.get()), int(self.lag_step.get())],
-            "cube_combo_limit": int(self.cube_combo_limit.get()),
-            "cube_eval_limit": int(self.cube_eval_limit.get()),
-            "cube_matrix": {"mode": self.cube_matrix_mode.get(), "limit": int(self.cube_matrix_limit.get())},
-            "cube_pairs_all": bool(self.cube_pairs_all.get()),
-            "cube_pairs": self.cube_pairs_text.get(),
+            "window_pos": self._as_bool(self.scan_window_pos),
+            "window_size": self._as_bool(self.scan_window_size),
+            "lag": self._as_bool(self.scan_lag),
+            "cube": self._as_bool(self.scan_cube),
+            "window_sizes_text": self._as_str(self.window_sizes_text),
+            "window_minmaxstep": [
+                self._as_int(self.window_min, 64),
+                self._as_int(self.window_max, 192),
+                self._as_int(self.window_step, 64),
+            ],
+            "window_default": self._as_int(self.window_size_default, 128),
+            "window_stride": self._as_int(self.window_stride, 0),
+            "window_start_min": self._as_int(self.window_start_min, 0),
+            "window_start_max": self._as_int(self.window_start_max, 0),
+            "window_max_windows": self._as_int(self.window_max_windows, 60),
+            "lag_minmaxstep": [
+                self._as_int(self.lag_min, 1),
+                self._as_int(self.lag_max, 3),
+                self._as_int(self.lag_step, 1),
+            ],
+            "cube_combo_limit": self._as_int(self.cube_combo_limit, 9),
+            "cube_eval_limit": self._as_int(self.cube_eval_limit, 225),
+            "cube_matrix": {"mode": self._as_str(self.cube_matrix_mode), "limit": self._as_int(self.cube_matrix_limit, 225)},
+            "cube_pairs_all": self._as_bool(self.cube_pairs_all),
+            "cube_pairs": self._as_str(self.cube_pairs_text),
             "cube_gallery": {
-                "mode": self.cube_gallery_mode.get(),
-                "k": int(self.cube_gallery_k.get()),
-                "limit": int(self.cube_gallery_limit.get()),
+                "mode": self._as_str(self.cube_gallery_mode),
+                "k": self._as_int(self.cube_gallery_k, 1),
+                "limit": self._as_int(self.cube_gallery_limit, 60),
             },
         }
         dimred = {
-            "enabled": bool(self.dimred_enabled.get()),
-            "method": self.dimred_method.get(),
-            "target": int(self.dimred_target.get()),
-            "target_var": float(self.dimred_target_var.get()),
-            "spatial_bin": int(self.dimred_spatial_bin.get()),
-            "kmeans_batch": int(self.dimred_kmeans_batch.get()),
-            "seed": int(self.dimred_seed.get()),
-            "save_variants": bool(self.dimred_save_variants.get()),
-            "variants": self.dimred_variants.get(),
+            "enabled": self._as_bool(self.dimred_enabled),
+            "method": self._as_str(self.dimred_method),
+            "target": self._as_int(self.dimred_target, 500),
+            "target_var": self._as_float(self.dimred_target_var, 0.0),
+            "spatial_bin": self._as_int(self.dimred_spatial_bin, 2),
+            "kmeans_batch": self._as_int(self.dimred_kmeans_batch, 2048),
+            "seed": self._as_int(self.dimred_seed, 0),
+            "save_variants": self._as_bool(self.dimred_save_variants),
+            "variants": self._as_str(self.dimred_variants),
         }
         common = {
-            "max_lag": int(self.max_lag.get()),
-            "graph_threshold": float(self.graph_threshold.get()),
-            "auto_difference": bool(self.auto_diff.get()),
-            "pvalue_correction": self.p_correction.get(),
-            "output_mode": self.output_mode.get(),
+            "max_lag": self._as_int(self.max_lag, 5),
+            "graph_threshold": self._as_float(self.graph_threshold, 0.2),
+            "auto_difference": self._as_bool(self.auto_diff),
+            "pvalue_correction": self._as_str(self.p_correction),
+            "output_mode": self._as_str(self.output_mode),
             "report_flags": {
-                "diagnostics": bool(self.include_diagnostics.get()),
-                "fft_plots": bool(self.include_fft_plots.get()),
-                "scans": bool(self.include_scans.get()),
-                "matrix_tables": bool(self.include_matrix_tables.get()),
+                "diagnostics": self._as_bool(self.include_diagnostics),
+                "fft_plots": self._as_bool(self.include_fft_plots),
+                "scans": self._as_bool(self.include_scans),
+                "matrix_tables": self._as_bool(self.include_matrix_tables),
             },
         }
 
@@ -1196,23 +1283,23 @@ class App(tk.Tk):
             "preprocessing": preproc,
             "preprocess_stage": self.preprocess_stage.get(),
             "post_preprocessing": {
-                "enabled": bool(self.post_preproc_enabled.get()),
-                "normalize": bool(self.post_preproc_normalize.get()),
-                "normalize_mode": self.post_preproc_normalize_mode.get(),
-                "rank_ties": self.post_preproc_rank_ties.get(),
-                "fill_missing": bool(self.post_preproc_fill_missing.get()),
+                "enabled": self._as_bool(self.post_preproc_enabled),
+                "normalize": self._as_bool(self.post_preproc_normalize),
+                "normalize_mode": self._as_str(self.post_preproc_normalize_mode),
+                "rank_ties": self._as_str(self.post_preproc_rank_ties),
+                "fill_missing": self._as_bool(self.post_preproc_fill_missing),
             },
             "dim_reduction": dimred,
             "scans": scans,
             "pairing": {
-                "pair_mode": self.pair_mode.get(),
-                "pair_auto_threshold": int(self.pair_auto_threshold.get()),
-                "pairs_text": self.pairs_text.get(),
-                "max_pairs": int(self.max_pairs.get()),
-                "neighbor_kind": self.neighbor_kind.get(),
-                "neighbor_radius": int(self.neighbor_radius.get()),
-                "screen_metric": self.screen_metric.get(),
-                "topk_per_node": int(self.topk_per_node.get()),
+                "pair_mode": self._as_str(self.pair_mode),
+                "pair_auto_threshold": self._as_int(self.pair_auto_threshold, 600),
+                "pairs_text": self._as_str(self.pairs_text),
+                "max_pairs": self._as_int(self.max_pairs, 50000),
+                "neighbor_kind": self._as_str(self.neighbor_kind),
+                "neighbor_radius": self._as_int(self.neighbor_radius, 1),
+                "screen_metric": self._as_str(self.screen_metric),
+                "topk_per_node": self._as_int(self.topk_per_node, 10),
             },
             "method_overrides": "(ручной режим: выключи авто-режим и впиши JSON overrides)",
         }
