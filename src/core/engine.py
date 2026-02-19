@@ -92,7 +92,7 @@ from ..visualization import plots
 # Reuse pyplot from visualization module to keep plotting backend centralized.
 plt = plots.plt
 
-from .data_loader import load_or_generate
+from .data_loader import load_or_generate, preprocess_timeseries
 from .preprocessing import configure_warnings
 
 
@@ -2178,6 +2178,7 @@ class BigMasterTool:
         self._stage("Подготовка: dimred/нормализация", 0.72)
         # Опционально уменьшаем размерность до нормализации/оценки связности.
         self._maybe_apply_dimred(**kwargs)
+        self._maybe_post_preprocess(**kwargs)
         self.normalize_data()
         if self.data_normalized.empty:
             return
@@ -2228,6 +2229,7 @@ class BigMasterTool:
         self._stage("Подготовка: dimred/нормализация", 0.72)
         # Опционально уменьшаем размерность до нормализации/оценки связности.
         self._maybe_apply_dimred(**kwargs)
+        self._maybe_post_preprocess(**kwargs)
         self.normalize_data()
         prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
         self.results = {}
@@ -3070,6 +3072,11 @@ class BigMasterTool:
         enabled = bool(kwargs.get("dimred_enabled", False))
         method = str(kwargs.get("dimred_method") or "none").strip().lower()
         target_n = int(kwargs.get("dimred_target", 0) or 0)
+        target_var = kwargs.get("dimred_target_var", None)
+        try:
+            target_var = float(target_var) if target_var is not None and str(target_var).strip() != "" else None
+        except Exception:
+            target_var = None
         save_variants = bool(kwargs.get("dimred_save_variants", False))
         variants_text = str(kwargs.get("dimred_variants") or "").strip()
         seed = int(kwargs.get("dimred_seed", 0) or 0)
@@ -3096,13 +3103,14 @@ class BigMasterTool:
             self.data = base.copy()
             return
 
-        if target_n <= 0:
+        if (target_n <= 0) and (target_var is None or not (0.0 < target_var <= 1.0)):
             target_n = int(min(500, n0))
 
         res = apply_dimred(
             base,
             method=method,
-            target_n=int(min(target_n, n0)),
+            target_n=(int(min(target_n, n0)) if target_n and target_n > 0 else None),
+            target_var=target_var,
             seed=seed,
             coords_df=getattr(self, "coords_df", None),
             kmeans_batch=kmeans_batch,
@@ -3191,6 +3199,48 @@ class BigMasterTool:
             pass
 
         return paths
+
+    def _maybe_post_preprocess(self, **kwargs) -> None:
+        """Опциональная предобработка после dimred (для stage=post|both)."""
+        stage = str(kwargs.get("preprocess_stage", "pre")).strip().lower()
+        if stage not in ("post", "both"):
+            return
+
+        post = kwargs.get("post_preprocess", {}) or {}
+        if not bool(post.get("enabled", False)):
+            return
+
+        try:
+            self.data = preprocess_timeseries(
+                self.data,
+                enabled=True,
+                log_transform=bool(post.get("log_transform", False)),
+                remove_outliers=bool(post.get("remove_outliers", False)),
+                outlier_rule=str(post.get("outlier_rule", "robust_z")),
+                outlier_action=str(post.get("outlier_action", "mask")),
+                outlier_z=float(post.get("outlier_z", 5.0)),
+                outlier_k=float(post.get("outlier_k", 1.5)),
+                outlier_abs=post.get("outlier_abs", None),
+                outlier_p_low=float(post.get("outlier_p_low", 0.5)),
+                outlier_p_high=float(post.get("outlier_p_high", 99.5)),
+                outlier_hampel_window=int(post.get("outlier_hampel_window", 7)),
+                outlier_jump_thr=post.get("outlier_jump_thr", None),
+                outlier_local_median_window=int(post.get("outlier_local_median_window", 7)),
+                normalize=bool(post.get("normalize", True)),
+                normalize_mode=str(post.get("normalize_mode", "zscore")),
+                rank_mode=str(post.get("rank_mode", "dense")),
+                rank_ties=str(post.get("rank_ties", "average")),
+                fill_missing=bool(post.get("fill_missing", True)),
+                remove_ar1=bool(post.get("remove_ar1", False)),
+                remove_ar_order=int(post.get("remove_ar_order", 1) or 1),
+                remove_seasonality=bool(post.get("remove_seasonality", False)),
+                season_period=post.get("season_period", None),
+                check_stationarity=False,
+                return_report=False,
+            )
+            self.log.add("Post-preprocess: applied")
+        except Exception as e:
+            self.log.add(f"Post-preprocess failed: {e}")
 
 
     def export_connectivity_bundle(

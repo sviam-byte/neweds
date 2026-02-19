@@ -54,11 +54,12 @@ class App(tk.Tk):
         self.preproc_enabled = tk.BooleanVar(value=True)
         self.preproc_remove_outliers = tk.BooleanVar(value=True)
         self.preproc_remove_ar1 = tk.BooleanVar(value=False)
+        self.preproc_ar_order = tk.IntVar(value=1)
         self.preproc_remove_seasonality = tk.BooleanVar(value=False)
         self.preproc_season_period = tk.IntVar(value=0)  # 0 => auto
         self.preproc_log_transform = tk.BooleanVar(value=False)
         self.preproc_normalize = tk.BooleanVar(value=True)
-        self.preproc_normalize_mode = tk.StringVar(value="zscore")  # zscore|robust_z|rank_dense|rank_pct|none
+        self.preproc_normalize_mode = tk.StringVar(value="zscore")  # zscore|minmax|robust_z|rank|rank_dense|rank_pct
         self.preproc_rank_ties = tk.StringVar(value="average")
         self.preproc_outlier_rule = tk.StringVar(value="robust_z")  # robust_z|zscore|iqr|percentile|hampel|jump
         self.preproc_outlier_action = tk.StringVar(value="mask")  # mask|clip|median|local_median
@@ -70,11 +71,19 @@ class App(tk.Tk):
         self.preproc_outlier_jump_thr = tk.DoubleVar(value=0.0)  # 0 => auto
         self.preproc_outlier_local_median_window = tk.IntVar(value=7)
         self.preproc_fill_missing = tk.BooleanVar(value=True)
+        self.preprocess_stage = tk.StringVar(value="pre")  # pre|post|both
+        # Пост-обработка после dimred (по умолчанию выключена для обратной совместимости).
+        self.post_preproc_enabled = tk.BooleanVar(value=False)
+        self.post_preproc_normalize = tk.BooleanVar(value=True)
+        self.post_preproc_normalize_mode = tk.StringVar(value="zscore")
+        self.post_preproc_rank_ties = tk.StringVar(value="average")
+        self.post_preproc_fill_missing = tk.BooleanVar(value=True)
 
         # Уменьшение размерности (очень большие N): опционально до анализа.
         self.dimred_enabled = tk.BooleanVar(value=False)
         self.dimred_method = tk.StringVar(value="variance")
         self.dimred_target = tk.IntVar(value=500)
+        self.dimred_target_var = tk.DoubleVar(value=0.0)  # 0 => ignore, else (0, 1]
         self.dimred_spatial_bin = tk.IntVar(value=2)
         self.dimred_kmeans_batch = tk.IntVar(value=2048)
         self.dimred_seed = tk.IntVar(value=0)
@@ -359,8 +368,12 @@ class App(tk.Tk):
         pr0 = ttk.Frame(pre)
         pr0.pack(fill="x", pady=2)
         ttk.Checkbutton(pr0, text="Включить предобработку", variable=self.preproc_enabled).pack(side="left")
+        ttk.Label(pr0, text="Когда:").pack(side="left", padx=(20, 5))
+        ttk.Combobox(pr0, textvariable=self.preprocess_stage, values=["pre", "post", "both"], state="readonly", width=6).pack(side="left")
         ttk.Checkbutton(pr0, text="Убирать выбросы", variable=self.preproc_remove_outliers).pack(side="left", padx=10)
-        ttk.Checkbutton(pr0, text="Убирать AR(1)", variable=self.preproc_remove_ar1).pack(side="left", padx=10)
+        ttk.Checkbutton(pr0, text="Убирать AR(p)", variable=self.preproc_remove_ar1).pack(side="left", padx=10)
+        ttk.Label(pr0, text="p:").pack(side="left", padx=(5, 2))
+        ttk.Spinbox(pr0, from_=1, to=50, textvariable=self.preproc_ar_order, width=4).pack(side="left")
         ttk.Checkbutton(pr0, text="Убирать сезонность (STL)", variable=self.preproc_remove_seasonality).pack(side="left", padx=10)
         ttk.Label(pr0, text="Период сезонности (0=авто):").pack(side="left", padx=(10, 5))
         ttk.Entry(pr0, textvariable=self.preproc_season_period, width=6).pack(side="left")
@@ -368,8 +381,14 @@ class App(tk.Tk):
         pr1.pack(fill="x", pady=2)
         ttk.Checkbutton(pr1, text="Лог-преобразование (+)", variable=self.preproc_log_transform).pack(side="left")
         ttk.Checkbutton(pr1, text="Нормализация", variable=self.preproc_normalize).pack(side="left", padx=10)
-        ttk.Label(pr1, text="режим:").pack(side="left", padx=(0,5))
-        ttk.Combobox(pr1, textvariable=self.preproc_normalize_mode, values=["zscore","robust_z","rank_dense","rank_pct","none"], state="readonly", width=10).pack(side="left")
+        ttk.Label(pr1, text="режим:").pack(side="left", padx=(0, 5))
+        ttk.Combobox(
+            pr1,
+            textvariable=self.preproc_normalize_mode,
+            values=["zscore", "minmax", "robust_z", "rank", "rank_dense", "rank_pct"],
+            state="readonly",
+            width=10,
+        ).pack(side="left")
         ttk.Label(pr1, text="ties:").pack(side="left", padx=(10,5))
         ttk.Combobox(pr1, textvariable=self.preproc_rank_ties, values=["average","min","max","dense","first"], state="readonly", width=8).pack(side="left")
         ttk.Checkbutton(pr1, text="Заполнять пропуски", variable=self.preproc_fill_missing).pack(side="left", padx=10)
@@ -404,14 +423,34 @@ class App(tk.Tk):
         ttk.Combobox(
             d0,
             textvariable=self.dimred_method,
-            values=["variance", "kmeans", "spatial", "random"],
+            values=["variance", "kmeans", "spatial", "random", "pca"],
             state="readonly",
             width=10,
         ).pack(side="left")
         ttk.Label(d0, text="Цель N (сколько рядов оставить/получить):").pack(side="left", padx=(10, 5))
         ttk.Entry(d0, textvariable=self.dimred_target, width=8).pack(side="left")
+        ttk.Label(d0, text="или доля объясн. дисперсии (0..1):").pack(side="left", padx=(10, 5))
+        ttk.Entry(d0, textvariable=self.dimred_target_var, width=8).pack(side="left")
         ttk.Label(d0, text="Seed:").pack(side="left", padx=(10, 5))
         ttk.Entry(d0, textvariable=self.dimred_seed, width=6).pack(side="left")
+
+        post = ttk.LabelFrame(frame, text="Пост-предобработка (после dimred)", padding=6)
+        post.pack(fill="x", pady=6)
+        post0 = ttk.Frame(post)
+        post0.pack(fill="x", pady=2)
+        ttk.Checkbutton(post0, text="Включить", variable=self.post_preproc_enabled).pack(side="left")
+        ttk.Checkbutton(post0, text="Нормализация", variable=self.post_preproc_normalize).pack(side="left", padx=10)
+        ttk.Label(post0, text="режим:").pack(side="left", padx=(0, 5))
+        ttk.Combobox(
+            post0,
+            textvariable=self.post_preproc_normalize_mode,
+            values=["zscore", "minmax", "robust_z", "rank", "rank_dense", "rank_pct"],
+            state="readonly",
+            width=10,
+        ).pack(side="left")
+        ttk.Label(post0, text="ties:").pack(side="left", padx=(10, 5))
+        ttk.Combobox(post0, textvariable=self.post_preproc_rank_ties, values=["average", "min", "max", "dense", "first"], state="readonly", width=8).pack(side="left")
+        ttk.Checkbutton(post0, text="Заполнять пропуски", variable=self.post_preproc_fill_missing).pack(side="left", padx=10)
 
         d1 = ttk.Frame(dr)
         d1.pack(fill="x", pady=2)
@@ -697,9 +736,18 @@ class App(tk.Tk):
         tool.run_selected_methods(
             methods,
             max_lag=cfg.max_lag,
+            preprocess_stage=str(self.preprocess_stage.get()).strip().lower(),
+            post_preprocess={
+                "enabled": bool(self.post_preproc_enabled.get()),
+                "normalize": bool(self.post_preproc_normalize.get()),
+                "normalize_mode": str(self.post_preproc_normalize_mode.get()),
+                "rank_ties": str(self.post_preproc_rank_ties.get()),
+                "fill_missing": bool(self.post_preproc_fill_missing.get()),
+            },
             dimred_enabled=bool(self.dimred_enabled.get()),
             dimred_method=str(self.dimred_method.get()),
             dimred_target=int(self.dimred_target.get()),
+            dimred_target_var=(None if float(self.dimred_target_var.get()) <= 0 else float(self.dimred_target_var.get())),
             dimred_spatial_bin=int(self.dimred_spatial_bin.get()),
             dimred_kmeans_batch=int(self.dimred_kmeans_batch.get()),
             dimred_seed=int(self.dimred_seed.get()),
@@ -791,7 +839,7 @@ class App(tk.Tk):
         try:
             df = data_loader.load_or_generate(
                 fp,
-                preprocess=bool(self.preproc_enabled.get()),
+                preprocess=(bool(self.preproc_enabled.get()) and str(self.preprocess_stage.get()).strip().lower() in ("pre", "both")),
                 log_transform=bool(self.preproc_log_transform.get()),
                 remove_outliers=bool(self.preproc_remove_outliers.get()),
                 outlier_rule=str(self.preproc_outlier_rule.get()),
@@ -808,6 +856,7 @@ class App(tk.Tk):
                 rank_ties=str(self.preproc_rank_ties.get()),
                 fill_missing=bool(self.preproc_fill_missing.get()),
                 remove_ar1=bool(self.preproc_remove_ar1.get()),
+                remove_ar_order=int(self.preproc_ar_order.get() or 1),
                 remove_seasonality=bool(self.preproc_remove_seasonality.get()),
                 season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
             )
@@ -847,7 +896,7 @@ class App(tk.Tk):
             try:
                 df = data_loader.load_or_generate(
                     fp,
-                    preprocess=bool(self.preproc_enabled.get()),
+                    preprocess=(bool(self.preproc_enabled.get()) and str(self.preprocess_stage.get()).strip().lower() in ("pre", "both")),
                     log_transform=bool(self.preproc_log_transform.get()),
                     remove_outliers=bool(self.preproc_remove_outliers.get()),
                     outlier_rule=str(self.preproc_outlier_rule.get()),
@@ -864,6 +913,7 @@ class App(tk.Tk):
                     rank_ties=str(self.preproc_rank_ties.get()),
                     fill_missing=bool(self.preproc_fill_missing.get()),
                     remove_ar1=bool(self.preproc_remove_ar1.get()),
+                    remove_ar_order=int(self.preproc_ar_order.get() or 1),
                     remove_seasonality=bool(self.preproc_remove_seasonality.get()),
                     season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
                 )
@@ -959,6 +1009,7 @@ class App(tk.Tk):
             self.preproc_enabled,
             self.preproc_remove_outliers,
             self.preproc_remove_ar1,
+            self.preproc_ar_order,
             self.preproc_remove_seasonality,
             self.preproc_season_period,
             self.preproc_log_transform,
@@ -975,6 +1026,12 @@ class App(tk.Tk):
             self.preproc_outlier_jump_thr,
             self.preproc_outlier_local_median_window,
             self.preproc_fill_missing,
+            self.preprocess_stage,
+            self.post_preproc_enabled,
+            self.post_preproc_normalize,
+            self.post_preproc_normalize_mode,
+            self.post_preproc_rank_ties,
+            self.post_preproc_fill_missing,
             # Сканирование.
             self.scan_window_pos,
             self.scan_window_size,
@@ -1014,6 +1071,7 @@ class App(tk.Tk):
             self.dimred_enabled,
             self.dimred_method,
             self.dimred_target,
+            self.dimred_target_var,
             self.dimred_spatial_bin,
             self.dimred_kmeans_batch,
             self.dimred_seed,
@@ -1073,6 +1131,7 @@ class App(tk.Tk):
                 "local_median_window": int(self.preproc_outlier_local_median_window.get()),
             },
             "remove_ar1": bool(self.preproc_remove_ar1.get()),
+            "remove_ar_order": int(self.preproc_ar_order.get()),
             "remove_seasonality": {
                 "enabled": bool(self.preproc_remove_seasonality.get()),
                 "period": int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else "auto",
@@ -1110,6 +1169,7 @@ class App(tk.Tk):
             "enabled": bool(self.dimred_enabled.get()),
             "method": self.dimred_method.get(),
             "target": int(self.dimred_target.get()),
+            "target_var": float(self.dimred_target_var.get()),
             "spatial_bin": int(self.dimred_spatial_bin.get()),
             "kmeans_batch": int(self.dimred_kmeans_batch.get()),
             "seed": int(self.dimred_seed.get()),
@@ -1134,6 +1194,14 @@ class App(tk.Tk):
             "selected_methods": methods,
             "common": common,
             "preprocessing": preproc,
+            "preprocess_stage": self.preprocess_stage.get(),
+            "post_preprocessing": {
+                "enabled": bool(self.post_preproc_enabled.get()),
+                "normalize": bool(self.post_preproc_normalize.get()),
+                "normalize_mode": self.post_preproc_normalize_mode.get(),
+                "rank_ties": self.post_preproc_rank_ties.get(),
+                "fill_missing": bool(self.post_preproc_fill_missing.get()),
+            },
             "dim_reduction": dimred,
             "scans": scans,
             "pairing": {
