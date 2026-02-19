@@ -524,6 +524,7 @@ def preprocess_timeseries(
     # пропуски/структурные шаги
     fill_missing: bool = True,
     remove_ar1: bool = False,
+    remove_ar_order: int = 1,
     remove_seasonality: bool = False,
     season_period: int | None = None,
     check_stationarity: bool = False,
@@ -587,23 +588,45 @@ def preprocess_timeseries(
         out = out.interpolate(method="linear", limit_direction="both", axis=0).bfill().ffill().fillna(0)
 
     if remove_ar1:
-        report.add("[Preprocess] remove AR(1): y[t] <- y[t] - phi*y[t-1] (phi=lag1 corr)")
+        p_order = int(max(1, int(remove_ar_order or 1)))
+        report.add(f"[Preprocess] remove AR(p): p={p_order} (OLS on lags)")
         for col in out.columns:
             if not pd.api.types.is_numeric_dtype(out[col]):
                 continue
             x = out[col].astype(float).to_numpy(copy=True)
-            if x.size < 5:
+            if x.size < (p_order + 4):
                 continue
-            x0, x1 = x[:-1], x[1:]
-            denom = (np.std(x0) * np.std(x1))
-            phi = float(np.corrcoef(x0, x1)[0, 1]) if denom > 1e-12 else 0.0
-            if not np.isfinite(phi):
-                phi = 0.0
-            y = np.empty_like(x)
-            y[0] = 0.0
-            y[1:] = x1 - phi * x0
+            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if p_order == 1:
+                x0, x1 = x[:-1], x[1:]
+                denom = (np.std(x0) * np.std(x1))
+                phi = float(np.corrcoef(x0, x1)[0, 1]) if denom > 1e-12 else 0.0
+                if not np.isfinite(phi):
+                    phi = 0.0
+                y = np.empty_like(x)
+                y[0] = 0.0
+                y[1:] = x1 - phi * x0
+                out[col] = y
+                report.add(f"[Preprocess] AR(1) phi≈{phi:.3f}", col=col)
+                continue
+
+            # OLS: x[t] ~ sum_{i=1..p} phi_i * x[t-i]
+            t_size = int(x.size)
+            y_target = x[p_order:]
+            x_lags = np.column_stack([x[p_order - i : t_size - i] for i in range(1, p_order + 1)])
+            try:
+                phi, *_ = np.linalg.lstsq(x_lags, y_target, rcond=None)
+            except Exception:
+                phi = np.zeros((p_order,), dtype=float)
+            phi = np.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
+
+            y = np.zeros_like(x)
+            y[p_order:] = y_target - (x_lags @ phi)
             out[col] = y
-            report.add(f"[Preprocess] AR(1) phi≈{phi:.3f}", col=col)
+            coeffs = [float(v) for v in phi[: min(5, p_order)]]
+            suffix = "..." if p_order > 5 else ""
+            report.add(f"[Preprocess] AR(p) coeffs≈{coeffs}{suffix}", col=col)
 
     if remove_seasonality:
         # STL сезонность: либо заданный период, либо пробуем оценить.
@@ -721,6 +744,7 @@ def load_or_generate(
     rank_ties: str = "average",
     fill_missing: bool = True,
     remove_ar1: bool = False,
+    remove_ar_order: int = 1,
     remove_seasonality: bool = False,
     season_period: int | None = None,
     check_stationarity: bool = False,
@@ -787,6 +811,7 @@ def load_or_generate(
             rank_ties=rank_ties,
             fill_missing=fill_missing,
             remove_ar1=remove_ar1,
+            remove_ar_order=remove_ar_order,
             remove_seasonality=remove_seasonality,
             season_period=season_period,
             check_stationarity=check_stationarity,
