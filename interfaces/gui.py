@@ -112,17 +112,51 @@ class App(tk.Tk):
         self.tab_single = ttk.Frame(tab_control)
         self.tab_batch = ttk.Frame(tab_control)
         self.tab_gen = ttk.Frame(tab_control)
+        self.tab_settings = ttk.Frame(tab_control)
 
         tab_control.add(self.tab_single, text="Один файл")
         tab_control.add(self.tab_batch, text="Пакетная обработка (Папка)")
         tab_control.add(self.tab_gen, text="Генератор тестов")
+        tab_control.add(self.tab_settings, text="Настройки")
 
         tab_control.pack(expand=1, fill="both")
 
         self._build_single_tab(self.tab_single)
         self._build_batch_tab(self.tab_batch)
         self._build_gen_tab(self.tab_gen)
-        self._build_settings_panel()
+        self._build_settings_panel(self.tab_settings)
+
+    def _make_scrollable(self, parent: ttk.Frame) -> ttk.Frame:
+        """Создаёт прокручиваемый контейнер и возвращает внутренний Frame."""
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(win_id, width=event.width)
+
+        inner.bind("<Configure>", _on_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else 0
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        return inner
 
     def _build_single_tab(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Анализ одного файла", padding=10)
@@ -154,7 +188,7 @@ class App(tk.Tk):
         ttk.Button(frame, text="Обработать все файлы в папке", command=self._run_batch).pack(pady=5)
         ttk.Label(
             frame,
-            text="* Результаты будут сохранены в подпапке 'analysis_results' внутри выбранной папки",
+            text="* Результаты будут сохранены в подпапке 'time_series_analysis' внутри выбранной папки",
             foreground="gray",
         ).pack()
 
@@ -217,9 +251,10 @@ class App(tk.Tk):
             foreground="gray",
         ).pack(anchor="w")
 
-    def _build_settings_panel(self) -> None:
-        frame = ttk.LabelFrame(self, text="Настройки методов анализа", padding=10)
-        frame.pack(fill="both", expand=True, padx=10, pady=5)
+    def _build_settings_panel(self, parent: ttk.Frame) -> None:
+        inner = self._make_scrollable(parent)
+        frame = ttk.LabelFrame(inner, text="Настройки методов анализа", padding=10)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         p_frame = ttk.Frame(frame)
         p_frame.pack(fill="x")
@@ -546,6 +581,21 @@ class App(tk.Tk):
             topk_per_node=int(self.topk_per_node.get()),
         )
 
+        # Экспорт «как данные»: матрицы/графы/edge-list в out_dir/data.
+        # Ошибки экспорта не должны ломать основной HTML/Excel пайплайн.
+        try:
+            tool.export_connectivity_bundle(
+                out_dir=out_dir,
+                name_prefix=name_prefix,
+                dense_n_limit=2000,
+                topk_per_node=max(1, int(self.topk_per_node.get())),
+                # Для edge-list используем graph_threshold как минимальный |weight|.
+                min_abs_weight=float(cfg.graph_threshold),
+                include_scan_matrices=True,
+            )
+        except Exception as e:
+            print(f"[WARN] export_connectivity_bundle failed: {e}")
+
         os.makedirs(out_dir, exist_ok=True)
         html_path = os.path.join(out_dir, f"{name_prefix}_report.html")
         excel_path = os.path.join(out_dir, f"{name_prefix}_full.xlsx")
@@ -586,8 +636,10 @@ class App(tk.Tk):
                 remove_seasonality=bool(self.preproc_remove_seasonality.get()),
                 season_period=(int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else None),
             )
-            out_dir = os.path.dirname(fp)
+            # Аккуратная папка результатов рядом с исходным файлом.
+            out_dir = os.path.join(os.path.dirname(fp), "time_series_analysis", Path(fp).stem)
             name = Path(fp).stem
+            os.makedirs(out_dir, exist_ok=True)
 
             report = self._run_tool(df, out_dir, name)
             if report and messagebox.askyesno("Готово", "Открыть отчет?"):
@@ -607,7 +659,7 @@ class App(tk.Tk):
             messagebox.showinfo("Info", "В папке нет файлов данных.")
             return
 
-        out_root = os.path.join(folder, "analysis_results")
+        out_root = os.path.join(folder, "time_series_analysis")
         os.makedirs(out_root, exist_ok=True)
 
         self.batch_progress["maximum"] = len(files)

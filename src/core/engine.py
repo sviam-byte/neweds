@@ -2963,6 +2963,138 @@ class BigMasterTool:
             pass
         return save_path
 
+
+    def export_connectivity_bundle(
+        self,
+        out_dir: str,
+        name_prefix: str = "run",
+        dense_n_limit: int = 2000,
+        topk_per_node: int = 50,
+        min_abs_weight: float = 0.0,
+        include_scan_matrices: bool = True,
+    ) -> str:
+        """Экспортирует матрицы связности и графы как данные для внешних пайплайнов.
+
+        Записывает в ``out_dir/data``:
+        - ``nodes.csv`` с узлами и (опционально) координатами,
+        - для каждой матрицы: ``edges.csv.gz``, ``sparse.npz`` и ``dense.npy`` (только для малых N),
+        - ``manifest.json`` со сводной метаинформацией.
+
+        Для больших размерностей плотная NxN-матрица может быть тяжёлой,
+        поэтому sparse-представление сохраняется всегда.
+        """
+        from pathlib import Path
+
+        import numpy as np
+
+        from src.reporting.connectivity_export import ExportPolicy, export_connectivity_matrix, save_manifest, save_nodes_csv
+
+        data_dir = str(Path(out_dir) / "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        # Имена узлов из доступных источников.
+        try:
+            names = list(getattr(self, "node_names", None) or getattr(self, "columns", None) or [])
+        except Exception:
+            names = []
+        if not names:
+            try:
+                names = list(getattr(self, "data", None).columns)
+            except Exception:
+                names = []
+
+        # Координаты (если загружались вместе с данными).
+        coords_map = None
+        try:
+            coords_df = getattr(self, "coords_df", None)
+            if coords_df is not None and not getattr(coords_df, "empty", True):
+                ccols = [c.lower() for c in coords_df.columns]
+                name_col = "name" if "name" in ccols else ("node" if "node" in ccols else None)
+                if name_col:
+                    coords_map = {}
+                    for _, row in coords_df.iterrows():
+                        nm = str(row[name_col])
+                        x = row.get("x", row.get("X", None))
+                        y = row.get("y", row.get("Y", None))
+                        z = row.get("z", row.get("Z", None))
+                        coords_map[nm] = (x, y, z)
+        except Exception:
+            coords_map = None
+
+        policy = ExportPolicy(
+            dense_n_limit=int(dense_n_limit),
+            topk_per_node=int(topk_per_node),
+            min_abs_weight=float(min_abs_weight),
+        )
+
+        manifest: dict = {
+            "name_prefix": str(name_prefix),
+            "policy": {
+                "dense_n_limit": int(dense_n_limit),
+                "topk_per_node": int(topk_per_node),
+                "min_abs_weight": float(min_abs_weight),
+            },
+            "variants": {},
+            "scan_matrices": {},
+        }
+
+        if names:
+            save_nodes_csv(data_dir, names, coords=coords_map)
+            manifest["nodes_file"] = "nodes.csv"
+
+        # Основные матрицы по выбранным методам.
+        results = getattr(self, "results", {}) or {}
+        for variant, mat in results.items():
+            try:
+                arr = np.asarray(mat)
+                if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+                    continue
+                if names and arr.shape[0] != len(names):
+                    # Размер не совпал: используем локальные имена по индексу.
+                    local_names = [f"v{i:04d}" for i in range(arr.shape[0])]
+                else:
+                    local_names = names or [f"v{i:04d}" for i in range(arr.shape[0])]
+                extra = None
+                try:
+                    extra = (getattr(self, "results_meta", {}) or {}).get(variant)
+                except Exception:
+                    extra = None
+                m = export_connectivity_matrix(data_dir, str(name_prefix), str(variant), arr, local_names, policy, extra_meta=extra)
+                manifest["variants"][variant] = m
+            except Exception as e:
+                manifest["variants"][variant] = {"error": str(e)}
+
+        # Матрицы из сканов (если доступны в results_meta).
+        if include_scan_matrices:
+            try:
+                scans = (getattr(self, "results_meta", {}) or {}).get("scans", {})
+            except Exception:
+                scans = {}
+            if isinstance(scans, dict):
+                for scan_name, payload in scans.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    for key in ("best", "median", "worst"):
+                        item = payload.get(key)
+                        if not isinstance(item, dict):
+                            continue
+                        mat = item.get("matrix")
+                        if mat is None:
+                            continue
+                        try:
+                            arr = np.asarray(mat)
+                            if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+                                continue
+                            local_names = names or [f"v{i:04d}" for i in range(arr.shape[0])]
+                            vname = f"scan_{scan_name}_{key}"
+                            m = export_connectivity_matrix(data_dir, str(name_prefix), vname, arr, local_names, policy, extra_meta=item)
+                            manifest["scan_matrices"].setdefault(scan_name, {})[key] = m
+                        except Exception as e:
+                            manifest["scan_matrices"].setdefault(scan_name, {})[key] = {"error": str(e)}
+
+        manifest_path = save_manifest(data_dir, str(name_prefix), manifest)
+        return str(manifest_path)
+
     def test_stationarity(self, series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
         """Проверяет стационарность ряда через ADF-тест."""
         return analysis_stats.test_stationarity(series)
