@@ -184,9 +184,12 @@ class App(tk.Tk):
 
         canvas = tk.Canvas(outer, highlightthickness=0)
         vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        hbar = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
         canvas.configure(yscrollcommand=vbar.set)
+        canvas.configure(xscrollcommand=hbar.set)
 
         vbar.pack(side="right", fill="y")
+        hbar.pack(side="bottom", fill="x")
         canvas.pack(side="left", fill="both", expand=True)
 
         inner = ttk.Frame(canvas)
@@ -196,7 +199,10 @@ class App(tk.Tk):
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def _on_canvas_configure(event):
-            canvas.itemconfig(win_id, width=event.width)
+            # Не зажимаем внутренний фрейм по ширине: если он шире окна,
+            # горизонтальная прокрутка остаётся доступной.
+            req = inner.winfo_reqwidth()
+            canvas.itemconfig(win_id, width=max(event.width, req))
 
         inner.bind("<Configure>", _on_configure)
         canvas.bind("<Configure>", _on_canvas_configure)
@@ -207,6 +213,14 @@ class App(tk.Tk):
                 canvas.yview_scroll(delta, "units")
 
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Горизонтальная прокрутка: Shift + колесо мыши.
+        def _on_shift_mousewheel(event):
+            delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else 0
+            if delta:
+                canvas.xview_scroll(delta, "units")
+
+        canvas.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel)
         return inner
 
     def _build_single_tab(self, parent: ttk.Frame) -> None:
@@ -542,14 +556,34 @@ class App(tk.Tk):
                 row=row, column=col, sticky="w", padx=10, pady=2
             )
 
-        adv = ttk.LabelFrame(frame, text="Доп. опции по методам (JSON, необязательно)", padding=6)
+        # План операций (JSON): в авто-режиме отражает то, что реально пойдёт
+        # в run_selected_methods на основе текущих флагов GUI.
+        adv = ttk.LabelFrame(frame, text="План операций (JSON): что именно будет сделано", padding=6)
         adv.pack(fill="both", expand=False, pady=6)
-        self.method_options_text = tk.Text(adv, height=4)
-        self.method_options_text.pack(fill="both", expand=True)
-        self.method_options_text.insert(
-            "1.0",
-            '{\n  "correlation_full": {"scan_cube": true},\n  "granger_full": {"scan_lag": true, "lag_min": 1, "lag_max": 10}\n}',
+
+        top_row = ttk.Frame(adv)
+        top_row.pack(fill="x")
+        self.auto_plan_json = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top_row,
+            text="Авто-режим (обновлять при выборе опций)",
+            variable=self.auto_plan_json,
+            command=lambda: self._refresh_plan_json(force=True),
+        ).pack(side="left")
+        ttk.Label(top_row, text="(сними галку, если хочешь вручную дописать/переопределить)").pack(
+            side="left", padx=8
         )
+
+        self.method_options_text = tk.Text(adv, height=10, wrap="none")
+        self.method_options_text.pack(fill="both", expand=True, pady=(6, 0))
+        self.method_options_text.insert("1.0", "{}")
+
+        xsb = ttk.Scrollbar(adv, orient="horizontal", command=self.method_options_text.xview)
+        xsb.pack(fill="x", pady=(2, 0))
+        self.method_options_text.configure(xscrollcommand=xsb.set)
+
+        self._wire_plan_auto_refresh()
+        self._refresh_plan_json(force=True)
 
     def _browse_file(self) -> None:
         f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
@@ -619,13 +653,17 @@ class App(tk.Tk):
                 pass
 
         # --- per-method overrides ---
+        # В авто-режиме JSON-поле — это план и не используется как overrides.
         method_options = {}
-        try:
-            raw = (self.method_options_text.get("1.0", "end") or "").strip()
-            if raw:
-                method_options = json.loads(raw)
-        except Exception:
+        if getattr(self, "auto_plan_json", None) is not None and bool(self.auto_plan_json.get()):
             method_options = {}
+        else:
+            try:
+                raw = (self.method_options_text.get("1.0", "end") or "").strip()
+                if raw:
+                    method_options = json.loads(raw)
+            except Exception:
+                method_options = {}
 
         # --- cube pairs (для 3–4 переменных) ---
         cube_pairs = None
@@ -652,6 +690,9 @@ class App(tk.Tk):
         stride = None if stride <= 0 else stride
         start_max = int(self.window_start_max.get())
         start_max = None if start_max <= 0 else start_max
+
+        # Обновляем план перед запуском: пользователю видно финальный набор параметров.
+        self._refresh_plan_json(force=True)
 
         tool.run_selected_methods(
             methods,
@@ -899,6 +940,214 @@ class App(tk.Tk):
             df.to_csv(f, index=False)
             if messagebox.askyesno("Генерация", "Файл сохранен. Открыть его для анализа в первой вкладке?"):
                 self.file_path.set(f)
+
+    # -------------------- План (JSON) --------------------
+    def _wire_plan_auto_refresh(self) -> None:
+        """Подписывается на ключевые переменные GUI, влияющие на план расчёта."""
+        vars_to_watch = [
+            # Базовые параметры/вывод.
+            self.max_lag,
+            self.graph_threshold,
+            self.auto_diff,
+            self.p_correction,
+            self.output_mode,
+            self.include_diagnostics,
+            self.include_fft_plots,
+            self.include_scans,
+            self.include_matrix_tables,
+            # Предобработка.
+            self.preproc_enabled,
+            self.preproc_remove_outliers,
+            self.preproc_remove_ar1,
+            self.preproc_remove_seasonality,
+            self.preproc_season_period,
+            self.preproc_log_transform,
+            self.preproc_normalize,
+            self.preproc_normalize_mode,
+            self.preproc_rank_ties,
+            self.preproc_outlier_rule,
+            self.preproc_outlier_action,
+            self.preproc_outlier_z,
+            self.preproc_outlier_k,
+            self.preproc_outlier_p_low,
+            self.preproc_outlier_p_high,
+            self.preproc_outlier_hampel_window,
+            self.preproc_outlier_jump_thr,
+            self.preproc_outlier_local_median_window,
+            self.preproc_fill_missing,
+            # Сканирование.
+            self.scan_window_pos,
+            self.scan_window_size,
+            self.scan_lag,
+            self.scan_cube,
+            self.window_sizes_text,
+            self.window_min,
+            self.window_max,
+            self.window_step,
+            self.window_size_default,
+            self.window_stride,
+            self.window_start_min,
+            self.window_start_max,
+            self.window_max_windows,
+            self.lag_min,
+            self.lag_max,
+            self.lag_step,
+            self.cube_combo_limit,
+            self.cube_eval_limit,
+            self.cube_matrix_mode,
+            self.cube_matrix_limit,
+            self.cube_pairs_all,
+            self.cube_pairs_text,
+            self.cube_gallery_mode,
+            self.cube_gallery_k,
+            self.cube_gallery_limit,
+            # Работа с большими N.
+            self.pair_mode,
+            self.pair_auto_threshold,
+            self.pairs_text,
+            self.max_pairs,
+            self.neighbor_kind,
+            self.neighbor_radius,
+            self.screen_metric,
+            self.topk_per_node,
+            # Dimred.
+            self.dimred_enabled,
+            self.dimred_method,
+            self.dimred_target,
+            self.dimred_spatial_bin,
+            self.dimred_kmeans_batch,
+            self.dimred_seed,
+            self.dimred_save_variants,
+            self.dimred_variants,
+        ]
+        vars_to_watch.extend(self.method_vars.values())
+
+        def _cb(*_):
+            self._refresh_plan_json()
+
+        for var in vars_to_watch:
+            try:
+                var.trace_add("write", _cb)
+            except Exception:
+                pass
+
+    def _refresh_plan_json(self, force: bool = False) -> None:
+        """Обновляет JSON-план. При auto-режиме использует debounce для отзывчивости UI."""
+        if getattr(self, "auto_plan_json", None) is None:
+            return
+        if not force and not bool(self.auto_plan_json.get()):
+            return
+
+        if not force:
+            if getattr(self, "_plan_refresh_after", None):
+                try:
+                    self.after_cancel(self._plan_refresh_after)
+                except Exception:
+                    pass
+            self._plan_refresh_after = self.after(150, lambda: self._refresh_plan_json(force=True))
+            return
+
+        plan = self._build_plan_dict()
+        txt = json.dumps(plan, ensure_ascii=False, indent=2)
+        try:
+            self.method_options_text.delete("1.0", "end")
+            self.method_options_text.insert("1.0", txt)
+        except Exception:
+            pass
+
+    def _build_plan_dict(self) -> dict:
+        """Формирует структуру плана расчёта для отображения в GUI."""
+        methods = self._get_selected_methods()
+        preproc = {
+            "enabled": bool(self.preproc_enabled.get()),
+            "outliers": {
+                "enabled": bool(self.preproc_remove_outliers.get()),
+                "rule": self.preproc_outlier_rule.get(),
+                "action": self.preproc_outlier_action.get(),
+                "z": float(self.preproc_outlier_z.get()),
+                "k": float(self.preproc_outlier_k.get()),
+                "p_low": float(self.preproc_outlier_p_low.get()),
+                "p_high": float(self.preproc_outlier_p_high.get()),
+                "hampel_window": int(self.preproc_outlier_hampel_window.get()),
+                "jump_thr": float(self.preproc_outlier_jump_thr.get()),
+                "local_median_window": int(self.preproc_outlier_local_median_window.get()),
+            },
+            "remove_ar1": bool(self.preproc_remove_ar1.get()),
+            "remove_seasonality": {
+                "enabled": bool(self.preproc_remove_seasonality.get()),
+                "period": int(self.preproc_season_period.get()) if int(self.preproc_season_period.get()) > 0 else "auto",
+            },
+            "log_transform": bool(self.preproc_log_transform.get()),
+            "normalize": {"enabled": bool(self.preproc_normalize.get()), "mode": self.preproc_normalize_mode.get()},
+            "fill_missing": bool(self.preproc_fill_missing.get()),
+            "rank_ties": self.preproc_rank_ties.get(),
+        }
+        scans = {
+            "window_pos": bool(self.scan_window_pos.get()),
+            "window_size": bool(self.scan_window_size.get()),
+            "lag": bool(self.scan_lag.get()),
+            "cube": bool(self.scan_cube.get()),
+            "window_sizes_text": self.window_sizes_text.get(),
+            "window_minmaxstep": [int(self.window_min.get()), int(self.window_max.get()), int(self.window_step.get())],
+            "window_default": int(self.window_size_default.get()),
+            "window_stride": int(self.window_stride.get()),
+            "window_start_min": int(self.window_start_min.get()),
+            "window_start_max": int(self.window_start_max.get()),
+            "window_max_windows": int(self.window_max_windows.get()),
+            "lag_minmaxstep": [int(self.lag_min.get()), int(self.lag_max.get()), int(self.lag_step.get())],
+            "cube_combo_limit": int(self.cube_combo_limit.get()),
+            "cube_eval_limit": int(self.cube_eval_limit.get()),
+            "cube_matrix": {"mode": self.cube_matrix_mode.get(), "limit": int(self.cube_matrix_limit.get())},
+            "cube_pairs_all": bool(self.cube_pairs_all.get()),
+            "cube_pairs": self.cube_pairs_text.get(),
+            "cube_gallery": {
+                "mode": self.cube_gallery_mode.get(),
+                "k": int(self.cube_gallery_k.get()),
+                "limit": int(self.cube_gallery_limit.get()),
+            },
+        }
+        dimred = {
+            "enabled": bool(self.dimred_enabled.get()),
+            "method": self.dimred_method.get(),
+            "target": int(self.dimred_target.get()),
+            "spatial_bin": int(self.dimred_spatial_bin.get()),
+            "kmeans_batch": int(self.dimred_kmeans_batch.get()),
+            "seed": int(self.dimred_seed.get()),
+            "save_variants": bool(self.dimred_save_variants.get()),
+            "variants": self.dimred_variants.get(),
+        }
+        common = {
+            "max_lag": int(self.max_lag.get()),
+            "graph_threshold": float(self.graph_threshold.get()),
+            "auto_difference": bool(self.auto_diff.get()),
+            "pvalue_correction": self.p_correction.get(),
+            "output_mode": self.output_mode.get(),
+            "report_flags": {
+                "diagnostics": bool(self.include_diagnostics.get()),
+                "fft_plots": bool(self.include_fft_plots.get()),
+                "scans": bool(self.include_scans.get()),
+                "matrix_tables": bool(self.include_matrix_tables.get()),
+            },
+        }
+
+        return {
+            "selected_methods": methods,
+            "common": common,
+            "preprocessing": preproc,
+            "dim_reduction": dimred,
+            "scans": scans,
+            "pairing": {
+                "pair_mode": self.pair_mode.get(),
+                "pair_auto_threshold": int(self.pair_auto_threshold.get()),
+                "pairs_text": self.pairs_text.get(),
+                "max_pairs": int(self.max_pairs.get()),
+                "neighbor_kind": self.neighbor_kind.get(),
+                "neighbor_radius": int(self.neighbor_radius.get()),
+                "screen_metric": self.screen_metric.get(),
+                "topk_per_node": int(self.topk_per_node.get()),
+            },
+            "method_overrides": "(ручной режим: выключи авто-режим и впиши JSON overrides)",
+        }
 
 
 if __name__ == "__main__":
