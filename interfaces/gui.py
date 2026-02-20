@@ -17,7 +17,6 @@ import json
 
 import pandas as pd
 
-# Добавляем путь к src
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.engine import BigMasterTool, method_mapping
@@ -25,7 +24,6 @@ from src.core import data_loader, generator
 from src.config import AnalysisConfig, PYINFORM_AVAILABLE
 from src.core.preprocessing import configure_warnings
 
-# Подавляем FutureWarning от statsmodels (verbose deprecated)
 configure_warnings()
 
 
@@ -44,14 +42,12 @@ class App(tk.Tk):
         self.p_correction = tk.StringVar(value="none")
         self.method_vars: dict[str, tk.BooleanVar] = {}
 
-        # Вывод/отчёт
         self.output_mode = tk.StringVar(value="both")  # both|html|excel
         self.include_diagnostics = tk.BooleanVar(value=True)
         self.include_fft_plots = tk.BooleanVar(value=False)
         self.include_scans = tk.BooleanVar(value=True)
         self.include_matrix_tables = tk.BooleanVar(value=False)
 
-        # Предобработка (до анализа)
         self.preproc_enabled = tk.BooleanVar(value=True)
         self.preproc_remove_outliers = tk.BooleanVar(value=True)
         self.preproc_remove_ar1 = tk.BooleanVar(value=False)
@@ -143,9 +139,6 @@ class App(tk.Tk):
         self.stage_progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", maximum=100)
         self.stage_progress.pack(side="bottom", fill="x")
 
-    # --- безопасные геттеры Tk-переменных ---
-    # В Tkinter IntVar/DoubleVar могут кидать TclError во время ввода ("", "0/", "0?9").
-    # Это ломало авто-обновление JSON-плана и запуск.
     _FLOAT_RE = re.compile(r"[-+]?(?:\d+(?:[\.,]\d*)?|[\.,]\d+)(?:[eE][-+]?\d+)?")
     _INT_RE = re.compile(r"[-+]?\d+")
 
@@ -213,7 +206,6 @@ class App(tk.Tk):
 
 
     def _set_stage(self, stage: str, progress=None) -> None:
-        """Обновляет строку статуса и прогресс-бар безопасно для Tk main-loop."""
         def _apply() -> None:
             try:
                 self.status_var.set(stage)
@@ -235,7 +227,6 @@ class App(tk.Tk):
             _apply()
 
     def _init_ui(self) -> None:
-        """Инициализирует структуру вкладок и общую панель настроек."""
         tab_control = ttk.Notebook(self)
 
         self.tab_single = ttk.Frame(tab_control)
@@ -256,7 +247,6 @@ class App(tk.Tk):
         self._build_settings_panel(self.tab_settings)
 
     def _make_scrollable(self, parent: ttk.Frame) -> ttk.Frame:
-        """Создаёт прокручиваемый контейнер и возвращает внутренний Frame."""
         outer = ttk.Frame(parent)
         outer.pack(fill="both", expand=True)
 
@@ -277,8 +267,6 @@ class App(tk.Tk):
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def _on_canvas_configure(event):
-            # Не зажимаем внутренний фрейм по ширине: если он шире окна,
-            # горизонтальная прокрутка остаётся доступной.
             req = inner.winfo_reqwidth()
             canvas.itemconfig(win_id, width=max(event.width, req))
 
@@ -336,7 +324,6 @@ class App(tk.Tk):
         ).pack()
 
     def _build_gen_tab(self, parent: ttk.Frame) -> None:
-        """Строит вкладку генерации синтетических данных по пресетам."""
         frame = ttk.LabelFrame(parent, text="Создание синтетических данных", padding=10)
         frame.pack(fill="x", padx=10, pady=10)
 
@@ -601,14 +588,9 @@ class App(tk.Tk):
         ttk.Label(r3, text="limit:").pack(side="left", padx=(10, 0))
         ttk.Entry(r3, textvariable=self.cube_gallery_limit, width=6).pack(side="left", padx=5)
 
-        # --- Методы анализа (обязательно) ---
-        # Вынесены выше JSON-опций, чтобы пользователь сначала выбрал *что*
         # считать, а уже затем при необходимости настраивал тонкие параметры.
         m_frame = ttk.LabelFrame(frame, text="Методы анализа (выбери, что считать)", padding=6)
         m_frame.pack(fill="both", expand=False, pady=6)
-
-        # Кнопки быстрого выбора: помогают быстро включать/сбрасывать наборы
-        # без ручного прокликивания длинного списка.
         m_btns = ttk.Frame(m_frame)
         m_btns.pack(fill="x", pady=(0, 4))
 
@@ -627,8 +609,6 @@ class App(tk.Tk):
         ttk.Button(m_btns, text="Снять все", command=lambda: _set_all_methods(False)).pack(side="left", padx=6)
         ttk.Button(m_btns, text="Дефолт (быстро)", command=_set_default_methods).pack(side="left")
 
-        # Список методов может быть длинным, поэтому используется скроллируемый
-        # контейнер на Canvas, чтобы не растягивать окно GUI по высоте.
         canvas = tk.Canvas(m_frame, height=220)
         vsb = ttk.Scrollbar(m_frame, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
@@ -645,7 +625,6 @@ class App(tk.Tk):
 
         methods = sorted(method_mapping.keys())
 
-        # Дефолт включения при первом открытии вкладки.
         default_on = {"correlation_full", "mutinf_full", "granger_full"}
 
         for i, m in enumerate(methods):
@@ -664,8 +643,6 @@ class App(tk.Tk):
                 row=row, column=col, sticky="w", padx=10, pady=2
             )
 
-        # План операций (JSON): в авто-режиме отражает то, что реально пойдёт
-        # в run_selected_methods на основе текущих флагов GUI.
         adv = ttk.LabelFrame(frame, text="План операций (JSON): что именно будет сделано", padding=6)
         adv.pack(fill="both", expand=False, pady=6)
 
@@ -716,7 +693,6 @@ class App(tk.Tk):
         return [m for m, var in self.method_vars.items() if var.get()]
 
     def _run_tool(self, df: pd.DataFrame, out_dir: str, name_prefix: str) -> str | None:
-        """Запуск движка для одного датафрейма."""
         cfg = self._get_config()
         methods = self._get_selected_methods()
 
@@ -725,7 +701,6 @@ class App(tk.Tk):
             return None
 
         def _stage_cb(stage: str, progress, meta: dict):
-            """Проксирует этапы движка в статус-бар GUI."""
             self._set_stage(stage, progress)
 
         self._set_stage("Старт анализа", 0.0)
@@ -741,7 +716,6 @@ class App(tk.Tk):
                     if p is not None and p > 0.05:
                         tool.data[c] = tool.data[c].diff().fillna(0)
 
-        # --- parse window sizes grid ---
         w_sizes = None
         txt = (self.window_sizes_text.get() or "").strip()
         if txt:
@@ -793,13 +767,11 @@ class App(tk.Tk):
         except Exception:
             cube_pairs = None
 
-        # --- scan params ---
         stride = self._as_int(self.window_stride, 0)
         stride = None if stride <= 0 else stride
         start_max = self._as_int(self.window_start_max, 0)
         start_max = None if start_max <= 0 else start_max
 
-        # Обновляем план перед запуском: пользователю видно финальный набор параметров.
         self._refresh_plan_json(force=True)
 
         tool.run_selected_methods(
@@ -861,8 +833,6 @@ class App(tk.Tk):
 
         self._set_stage("Экспорт результатов", 0.98)
 
-        # Экспорт «как данные»: матрицы/графы/edge-list в out_dir/data.
-        # Ошибки экспорта не должны ломать основной HTML/Excel пайплайн.
         try:
             tool.export_connectivity_bundle(
                 out_dir=out_dir,
@@ -931,7 +901,6 @@ class App(tk.Tk):
                 remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
                 season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
             )
-            # Аккуратная папка результатов рядом с исходным файлом.
             out_dir = os.path.join(os.path.dirname(fp), "time_series_analysis", Path(fp).stem)
             name = Path(fp).stem
             os.makedirs(out_dir, exist_ok=True)
@@ -1001,7 +970,6 @@ class App(tk.Tk):
         messagebox.showinfo("Готово", f"Обработано {success_count} из {len(files)} файлов.\nРезультаты в: {out_root}")
 
     def _run_gen(self) -> None:
-        """Диспетчер генератора пресетов для синтетических наборов данных."""
         try:
             preset = (self.gen_preset.get() or "").strip()
             n = self._as_int(self.gen_samples, 600)
@@ -1180,7 +1148,6 @@ class App(tk.Tk):
             plan = self._build_plan_dict()
             txt = json.dumps(plan, ensure_ascii=False, indent=2)
         except Exception as e:
-            # Ни один ввод в поле не должен валить Tk callback.
             txt = json.dumps({"error": f"plan build failed: {e}"}, ensure_ascii=False, indent=2)
         try:
             self.method_options_text.delete("1.0", "end")
