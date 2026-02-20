@@ -2035,6 +2035,15 @@ class BigMasterTool:
             # Чистка константных колонок
             data = data.loc[:, (data != data.iloc[0]).any()]
             self.data = data.copy()
+            # ВАЖНО: матрица рядов не должна таскать тяжелые attrs (coords и пр.).
+            # Иначе при self.data[col] pandas может сделать deepcopy(attrs) и резко увеличить память.
+            try:
+                self.data.attrs = {}
+            except Exception:
+                try:
+                    self.data.attrs.clear()
+                except Exception:
+                    pass
             # Приведение к числам
             for c in list(self.data.columns):
                 self.data[c] = pd.to_numeric(self.data[c], errors="coerce")
