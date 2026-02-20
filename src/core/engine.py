@@ -5,7 +5,7 @@
 Главный движок анализа временных рядов.
 Содержит класс BigMasterTool и все функции расчета метрик.
 
-TODO: Этот файл требует дальнейшего рефакторинга - разнести метрики по отдельным модулям.
+
 """
 
 import argparse
@@ -68,11 +68,11 @@ class RunLog:
     def as_text(self) -> str:
         return "\n".join(self.items)
 
-# --- Optional dependency: nolds ---
-# nolds==0.5.2 imports pkg_resources, which is removed in setuptools>=81.
-# On fresh Python 3.13 installs this often breaks with:
+# Опциональная зависимость: nolds (для части метрик)
+# На Python 3.13 часто ломается из-за pkg_resources (setuptools>=81).
+# Типичный симптом:
 #   ModuleNotFoundError: No module named 'pkg_resources'
-# We keep the tool usable (other metrics still work) and provide a clear message.
+# Если nolds недоступен, возвращаем NaN и логируем причину один раз.
 _NOLDS_IMPORT_ERROR: Optional[str] = None
 try:
     import nolds  # type: ignore
@@ -109,21 +109,14 @@ from ..metrics.registry import METRICS_REGISTRY, get_metric_func, register_metri
 from ..reporting import ExcelReportWriter, HTMLReportGenerator
 from ..visualization import plots
 
-# Reuse pyplot from visualization module to keep plotting backend centralized.
+# plt берём из visualization.plots, чтобы единообразно управлять бэкендом графиков.
 plt = plots.plt
 
 from .data_loader import load_or_generate, preprocess_timeseries
 from .preprocessing import configure_warnings
 
 
-# Используем константы из config.py
-# Сохраняем только те, которых нет в config
-# Функции загрузки данных перенесены в data_loader.py
-# Используем load_or_generate из импортов
-
-##############################################
-# Функции-метрики
-##############################################
+# Метрики
 def correlation_matrix(data: pd.DataFrame, **kwargs) -> np.ndarray:
     return data.corr().values
 
@@ -1244,11 +1237,11 @@ class MethodSpec:
     supports_lag: bool
     description: str = ""
 
-# -----------------------------
+
 # Метод-метаданные и логика
 # (PVAL_METHODS, DIRECTED_METHODS, METHOD_INFO импортированы из config.py
 #  через `from ..config import *` выше)
-# -----------------------------
+
 
 # is_pvalue_method, is_directed_method, is_control_sensitive_method
 # уже импортированы из config.py через `from ..config import *`
@@ -2397,7 +2390,7 @@ class BigMasterTool:
         if df is None or df.empty:
             return None, {"error": "empty data"}
 
-        # --- partial controls description ---
+        # Описание control-переменных для partial-вариантов
         meta: dict = {"variant": variant}
         if is_control_sensitive_method(variant):
             # В текущей реализации (pairwise_policy='others' по умолчанию) это значит:
@@ -2411,7 +2404,7 @@ class BigMasterTool:
                 "explain": "Для каждой пары (Xi, Xj) исключено линейное влияние набора control.",
             }
 
-        # --- large-N simplification: full matrix vs pairs vs spatial neighbors ---
+        # Упрощение для большого N: полная матрица / пары / соседства по координатам
         n_cols = int(df.shape[1])
         pair_mode = str(kwargs.get("pair_mode") or "auto").lower()
         auto_thr = int(kwargs.get("pair_auto_threshold") or 0)
@@ -2426,7 +2419,7 @@ class BigMasterTool:
             text = (text or "").strip()
             if not text:
                 return []
-            # normalize separators
+            # Нормализация разделителей
             raw_items: list[str] = []
             for token in text.replace("—", "-").replace(",", ";").split(";"):
                 tt = token.strip()
@@ -2463,9 +2456,9 @@ class BigMasterTool:
             coords = self.coords_df
             if coords.empty:
                 return []
-            # map voxel_id -> column index
+            # Карта voxel_id -> индекс колонки
             col_to_idx = {str(c): i for i, c in enumerate(df.columns)}
-            # build coord -> index
+            # Словарь coord -> индекс
             coord_to_idx: dict[tuple[int, int, int], int] = {}
             for _, r in coords.iterrows():
                 vid = str(r.get("voxel_id"))
@@ -2484,7 +2477,7 @@ class BigMasterTool:
             kind = str(kind or "26")
             radius = int(max(1, radius))
             pairs_out: list[tuple[int, int]] = []
-            # neighbor offsets
+            # Смещения соседей
             offsets: list[tuple[int, int, int]] = []
             for dx in range(-radius, radius + 1):
                 for dy in range(-radius, radius + 1):
@@ -2495,7 +2488,7 @@ class BigMasterTool:
                             if abs(dx) + abs(dy) + abs(dz) == 1:
                                 offsets.append((dx, dy, dz))
                         else:
-                            # 26-neighborhood (chebyshev)
+                            # 26-соседство (метрика Чебышёва)
                             if max(abs(dx), abs(dy), abs(dz)) <= radius:
                                 offsets.append((dx, dy, dz))
 
@@ -2513,7 +2506,7 @@ class BigMasterTool:
                     pairs_out.append((a, b))
             return pairs_out
 
-        # resolve effective pairs list
+        # Определяем итоговый список пар
         pairs_idx: Optional[list[tuple[int, int]]] = None
         if pair_mode == "auto":
             pair_mode = "neighbors" if n_cols >= auto_thr else "full"
@@ -2522,10 +2515,10 @@ class BigMasterTool:
         elif pair_mode == "neighbors":
             pairs_idx = _build_neighbor_pairs(str(kwargs.get("neighbor_kind") or "26"), int(kwargs.get("neighbor_radius") or 1))
         elif pair_mode == "random":
-            # random undirected pairs (fallback when no coords). Deterministic seed.
+            # Случайные неориентированные пары (если нет coords), с фиксированным seed.
             max_pairs = int(max(1, kwargs.get("max_pairs") or 50000))
             rng = np.random.default_rng(12345)
-            # sample indices in upper triangle
+            # Выбор индексов в верхнем треугольнике
             m = min(max_pairs, max(1, n_cols * 5))
             pairs_out = set()
             while len(pairs_out) < m:
@@ -2546,7 +2539,7 @@ class BigMasterTool:
                 "Матрица считается упрощённо: только по выбранным парам (остальные пары заполняются дефолтом метода)."
             )
 
-        # --- lag selection ---
+        # Выбор лага
         supports_lag = is_directed_method(variant) or variant.startswith("granger") or variant.startswith("te_") or variant.startswith("ah_")
         lag_sel = (kwargs.get("lag_selection") or self.config.lag_selection or "optimize").lower()
         max_lag = int(kwargs.get("max_lag") or self.config.max_lag or 1)
@@ -2572,7 +2565,7 @@ class BigMasterTool:
         elif lag_sel == "fixed":
             chosen_lag = int(max(1, kwargs.get("lag", 1)))
         else:
-            # optimize
+            # Оптимизация
             best_score = float("-inf")
             best_lag = 1
             for lag in range(1, max_lag + 1):
@@ -2925,7 +2918,7 @@ class BigMasterTool:
                 if cube_matrix_mode == "all":
                     scan_meta["cube"]["selectable_ids"] = [p.get("id") for p in points if p.get("matrix") is not None]
 
-                # --- дополнительные "кубики" по парам (только если ровно 3 переменные
+                # Доп. «кубики» по парам (когда переменных ровно 3)
                 # или пользователь явно передал список пар через kwargs).
                 # Идея: один и тот же набор точек (w,lag,start) визуализируем разными метриками
                 # для пар (X–Y, X–Z, Y–Z).
@@ -2937,7 +2930,7 @@ class BigMasterTool:
                 pair_specs: list[tuple[int, int, str]] = []
                 cols0 = list(getattr(df, "columns", []))
                 if cube_pairs:
-                    # ожидаем список вида [(0,1), ("X","Y"), "X-Y", ...]
+                    # Ожидаем список вида [(0,1), ("X","Y"), "X-Y", ...]
                     for item in (cube_pairs or []):
                         try:
                             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -3003,7 +2996,7 @@ class BigMasterTool:
 
             meta["window_scans"] = scan_meta
 
-        # --- windowing ---
+        # Оконный режим (скользящие окна)
         window_sizes = kwargs.get("window_sizes") or self.config.window_sizes
         if not window_sizes:
             mat = _compute_at_lag(df, chosen_lag)
@@ -3075,7 +3068,7 @@ class BigMasterTool:
             w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag, pairs=pairs_idx)
             if not w_info:
                 continue
-            # best window for this w
+            # Лучшее окно для данного w
             bw = w_info.get("best_window")
             if bw and bw.get("matrix") is not None:
                 mats.append(np.asarray(bw["matrix"]))
@@ -3097,7 +3090,7 @@ class BigMasterTool:
             # усредняем по матрицам лучших окон каждого размера
             mat = np.nanmean(np.stack(mats, axis=0), axis=0)
         else:
-            # best
+            # Лучший вариант
             mat = np.asarray(best["best_window"]["matrix"]) if best else np.asarray(mats[0])
 
         meta["window"] = {
