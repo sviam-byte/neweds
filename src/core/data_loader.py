@@ -568,10 +568,26 @@ def preprocess_timeseries(
     return_report: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, PreprocessReport]:
     """Предобработка матрицы (можно полностью отключить enabled=False)."""
+    # ВАЖНО: df может содержать тяжёлые метаданные в attrs (например coords для вокселей).
+    # Pandas при доступе к df[col] может делать deepcopy attrs, что взрывает память.
+    # Поэтому на время предобработки очищаем attrs и восстанавливаем в конце.
+    _saved_attrs = dict(getattr(df, "attrs", {}) or {})
     out = df.copy()
+    try:
+        out.attrs = {}
+    except Exception:
+        try:
+            out.attrs.clear()
+        except Exception:
+            pass
     report = PreprocessReport(enabled=bool(enabled))
     if not enabled:
         report.add("[Preprocess] disabled: using raw numeric matrix as-is.")
+        try:
+            if _saved_attrs:
+                out.attrs.update(_saved_attrs)
+        except Exception:
+            pass
         return (out, report) if return_report else out
 
     report.add("[Preprocess] enabled")
@@ -748,6 +764,11 @@ def preprocess_timeseries(
                     logging.info(
                         f"Ряд '{col}' {'стационарен' if pvalue <= 0.05 else 'вероятно нестационарен'} (p-value ADF={pvalue:.3f})."
                     )
+    try:
+        if _saved_attrs:
+            out.attrs.update(_saved_attrs)
+    except Exception:
+        pass
     return (out, report) if return_report else out
 
 
@@ -881,7 +902,9 @@ def load_or_generate(
         else:
             df, report = df_out, None
 
-        # Прокидываем метаданные (например, координаты вокселей) в report.notes
+        # Прокидываем метаданные (например, координаты вокселей) в report.notes.
+        # Далее очищаем attrs у итогового DataFrame: тяжелые объекты уже сериализованы в report,
+        # и их повторное хранение повышает риск deepcopy(attrs) при df[col].
         if report is not None and coords_df is not None:
             try:
                 report.notes["format"] = "voxel_wide"
@@ -889,6 +912,15 @@ def load_or_generate(
                 report.notes["coords"] = coords_df.to_dict(orient="records")
             except Exception:
                 pass
+
+        try:
+            if hasattr(df, "attrs"):
+                df.attrs.pop("coords", None)
+                df.attrs.pop("voxel_time_cols", None)
+                if len(df.attrs) == 0:
+                    df.attrs = {}
+        except Exception:
+            pass
         logging.info(
             f"[Load] OK shape={df.shape} header={header} time_col={time_col} transpose={transpose} preprocess={preprocess}"
         )
