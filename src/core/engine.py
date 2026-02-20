@@ -1617,6 +1617,8 @@ def analyze_sliding_windows_with_metric(
     start_max: int | None = None,
     max_windows: int = 400,
     return_matrices: bool = False,
+    n_jobs: int | None = None,
+    parallel_backend: str | None = None,
 ) -> dict:
     """Анализ скользящих окон для заданного window_size.
 
@@ -1662,36 +1664,60 @@ def analyze_sliding_windows_with_metric(
         idx = np.linspace(0, len(starts) - 1, max_windows).round().astype(int)
         starts = [starts[i] for i in idx]
 
-    for start in starts:
+    # Параллелизация только внутри прохода по стартам окна.
+    # По умолчанию работаем в 1 потоке ради предсказуемого поведения UI.
+    try:
+        nj = int(n_jobs) if n_jobs is not None else 1
+    except Exception:
+        nj = 1
+    nj = int(max(1, nj))
+
+    def _compute_one_start(start: int) -> tuple[int, int, float, Optional[np.ndarray]]:
         end = start + w
         if end > n:
-            break
+            return int(start), int(end), float("nan"), None
         chunk = data.iloc[start:end]
         try:
             mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)), pairs=pairs)
             score = _lag_quality(variant, mat)
+            score_f = float(score) if np.isfinite(score) else float("nan")
+            return int(start), int(end), score_f, (mat if return_matrices else None)
         except Exception as ex:
             logging.error(f"[SlidingWindow] {variant} win={w} start={start}: {ex}")
-            mat = None
-            score = float("nan")
+            return int(start), int(end), float("nan"), None
 
+    if nj == 1 or len(starts) <= 1:
+        computed = [_compute_one_start(st) for st in starts]
+    else:
+        try:
+            from joblib import Parallel, delayed
+        except Exception:
+            Parallel = None  # type: ignore
+            delayed = None  # type: ignore
+
+        if Parallel is None:
+            computed = [_compute_one_start(st) for st in starts]
+        else:
+            backend = str(parallel_backend or "loky")
+            computed = Parallel(n_jobs=nj, backend=backend)(delayed(_compute_one_start)(st) for st in starts)
+
+    for start, end, score_f, mat in computed:
         xs.append(int(start))
-        ys.append(float(score) if np.isfinite(score) else float("nan"))
-
+        ys.append(float(score_f) if np.isfinite(score_f) else float("nan"))
         ticks.append(
             {
                 "start": int(start),
                 "end": int(end),
-                "metric": float(score) if np.isfinite(score) else float("nan"),
+                "metric": float(score_f) if np.isfinite(score_f) else float("nan"),
                 "matrix": mat if return_matrices else None,
             }
         )
 
-        if np.isfinite(score) and float(score) > float(best["metric"]):
+        if np.isfinite(score_f) and float(score_f) > float(best["metric"]):
             best = {
                 "start": int(start),
                 "end": int(end),
-                "metric": float(score),
+                "metric": float(score_f),
                 "matrix": mat,
             }
 
@@ -2570,6 +2596,20 @@ class BigMasterTool:
             "cube": bool(kwargs.get("scan_cube", False)),
         }
 
+        # Параллель диагностических сканов по окнам и 3D-кубу по умолчанию выключаем.
+        # Это безопаснее для Streamlit/UI и не ломает порядок этапов через stage_callback.
+        try:
+            scan_n_jobs = int(kwargs.get("scan_n_jobs") or kwargs.get("n_jobs") or 1)
+        except Exception:
+            scan_n_jobs = 1
+        scan_n_jobs = int(max(1, scan_n_jobs))
+        scan_backend = str(kwargs.get("scan_backend") or "loky")
+        try:
+            cube_n_jobs = int(kwargs.get("cube_n_jobs") or 1)
+        except Exception:
+            cube_n_jobs = 1
+        cube_n_jobs = int(max(1, cube_n_jobs))
+
         w_start_min = kwargs.get("window_start_min")
         w_start_max = kwargs.get("window_start_max")
         w_stride = kwargs.get("window_stride")
@@ -2625,6 +2665,8 @@ class BigMasterTool:
                     start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                     return_matrices=True,
                     pairs=pairs_idx,
+                    n_jobs=scan_n_jobs,
+                    parallel_backend=scan_backend,
                 )
                 ticks = []
                 for i, t in enumerate((info or {}).get("ticks") or []):
@@ -2654,6 +2696,8 @@ class BigMasterTool:
                         start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                         return_matrices=False,
                         pairs=pairs_idx,
+                        n_jobs=scan_n_jobs,
+                        parallel_backend=scan_backend,
                     )
                     bw = (info or {}).get("best_window") or {}
                     q = bw.get("metric", float("nan"))
@@ -2716,15 +2760,24 @@ class BigMasterTool:
                     per_combo_max_windows = max(1, min(int(w_max_windows), int(cube_eval_limit) // int(len(combos))))
                 saved_mats = 0
 
-                for w, lg in combos:
+                def _compute_combo(w: int, lg: int) -> list[dict]:
                     stride = int(w_stride) if w_stride is not None else int(max(1, int(w) // 5))
                     info = analyze_sliding_windows_with_metric(
-                        df, variant, window_size=w, stride=stride, lag=lg,
-                        start_min=w_start_min, start_max=w_start_max,
-                        max_windows=per_combo_max_windows,
+                        df,
+                        variant,
+                        window_size=int(w),
+                        stride=int(stride),
+                        lag=int(lg),
+                        start_min=w_start_min,
+                        start_max=w_start_max,
+                        max_windows=int(per_combo_max_windows),
                         return_matrices=(cube_matrix_mode == "all"),
                         pairs=pairs_idx,
+                        # Избегаем nested-parallel: здесь параллелим по combos,
+                        # а внутри прохода по окнам работаем последовательно.
+                        n_jobs=1,
                     )
+                    out_pts: list[dict] = []
                     for t in (info or {}).get("ticks") or []:
                         try:
                             fq = float(t.get("metric", float("nan")))
@@ -2735,18 +2788,43 @@ class BigMasterTool:
                         st0 = int(t.get("start", 0))
                         tid = f"cube_w{int(w)}_l{int(lg)}_s{st0}"
                         mat0 = t.get("matrix")
+                        out_pts.append(
+                            {
+                                "id": tid,
+                                "window_size": int(w),
+                                "lag": int(lg),
+                                "start": st0,
+                                "end": int(t.get("end", st0 + int(w))),
+                                "metric": fq,
+                                "matrix": mat0,
+                            }
+                        )
+                    return out_pts
+
+                if cube_n_jobs == 1 or len(combos) <= 1:
+                    all_pts = [_compute_combo(w, lg) for (w, lg) in combos]
+                else:
+                    try:
+                        from joblib import Parallel, delayed
+                    except Exception:
+                        Parallel = None  # type: ignore
+                        delayed = None  # type: ignore
+                    if Parallel is None:
+                        all_pts = [_compute_combo(w, lg) for (w, lg) in combos]
+                    else:
+                        all_pts = Parallel(n_jobs=int(cube_n_jobs), backend=str(scan_backend))(
+                            delayed(_compute_combo)(w, lg) for (w, lg) in combos
+                        )
+
+                for pts in all_pts:
+                    for p in pts:
+                        mat0 = p.get("matrix")
                         if cube_matrix_mode == "all":
                             if mat0 is not None and saved_mats < cube_matrix_limit:
                                 saved_mats += 1
                             else:
-                                mat0 = None
-                        points.append({
-                            "id": tid,
-                            "window_size": int(w), "lag": int(lg),
-                            "start": st0, "end": int(t.get("end", st0 + int(w))),
-                            "metric": fq,
-                            "matrix": mat0,
-                        })
+                                p["matrix"] = None
+                        points.append(p)
 
                 scan_meta["cube"] = {
                     "points": points, "combos": combos,
