@@ -216,7 +216,9 @@ def read_input_table(
         return df0
 
     if low.endswith(".csv"):
-        kw: Dict[str, Any] = {"header": None}
+        # Важно: low_memory=False выключает покусковую догадку типов в pandas
+        # и снижает риск нестабильной типизации на mixed-type CSV.
+        kw: Dict[str, Any] = {"header": None, "low_memory": False}
         if csv_engine in {"pyarrow", "c", "python"}:
             kw["engine"] = csv_engine
         df0 = pd.read_csv(fp, **kw)
@@ -267,9 +269,22 @@ def tidy_timeseries_table(
     except Exception:
         pass
 
+    # Важно: voxel_wide_to_timeseries кладёт в out.attrs['coords'] DataFrame координат.
+    # Pandas при многих операциях (например, Series.notna()) делает deepcopy attrs,
+    # что на больших данных взрывает память (deepcopy координат ДЛЯ КАЖДОЙ колонки).
+    # Поэтому: временно выносим attrs наружу и очищаем их на время чистки таблицы.
+    _saved_attrs: Dict[str, Any] = dict(getattr(out, "attrs", {}) or {})
+    try:
+        out.attrs = {}
+    except Exception:
+        try:
+            out.attrs.clear()
+        except Exception:
+            pass
+
     # Если есть coords — это уже time×voxel. Авто-транспонирование запрещаем,
     # иначе можно случайно перевернуть огромные данные и убить память.
-    has_coords = bool(getattr(out, "attrs", {}) and out.attrs.get("coords") is not None)
+    has_coords = bool(_saved_attrs.get("coords") is not None)
 
     if time_col not in {"auto", "none"} and time_col not in out.columns:
         raise ValueError(f"time_col '{time_col}' not found in columns")
@@ -280,8 +295,13 @@ def tidy_timeseries_table(
         out = out.drop(columns=[time_col])
 
     out = out.apply(pd.to_numeric, errors="coerce")
-    good = [c for c in out.columns if out[c].notna().mean() >= 0.2]
-    out = out[good]
+    # Vectorized: не трогаем Series.notna() поштучно (оно тащит attrs/deepcopy в некоторых версиях pandas).
+    try:
+        col_frac = out.notna().mean(axis=0)
+        out = out.loc[:, col_frac >= 0.2]
+    except Exception:
+        good = [c for c in out.columns if pd.notna(out[c].to_numpy()).mean() >= 0.2]
+        out = out[good]
 
     if transpose not in {"auto", "yes", "no"}:
         raise ValueError("transpose must be one of: auto|yes|no")
@@ -338,6 +358,23 @@ def tidy_timeseries_table(
             out = out.astype(np.float64)
 
     out = out.dropna(axis=0, how="all")
+
+    # Восстановление attrs (coords и прочее) ПОСЛЕ всех операций,
+    # чтобы избежать гигантских deepcopy во время обработки.
+    try:
+        if _saved_attrs:
+            coords = _saved_attrs.get("coords")
+            if isinstance(coords, pd.DataFrame) and "voxel_id" in coords.columns:
+                # синхронизируем coords с текущими колонками (после фильтрации/feature_limit)
+                try:
+                    idx = coords.set_index("voxel_id", drop=False)
+                    idx = idx.loc[[c for c in out.columns if c in idx.index]]
+                    _saved_attrs["coords"] = idx.reset_index(drop=True)
+                except Exception:
+                    pass
+            out.attrs.update(_saved_attrs)
+    except Exception:
+        pass
     return out
 
 
@@ -722,6 +759,9 @@ def load_or_generate(
     transpose: str = "auto",
     # big data / performance
     dtype: str | None = None,
+    # Если dtype=None, то для очень широких/больших таблиц автоматически
+    # понижаем тип до float32, чтобы снизить пик памяти при загрузке/clean-up.
+    auto_float32: bool = True,
     time_start: int | None = None,
     time_end: int | None = None,
     time_stride: int | None = None,
@@ -763,6 +803,7 @@ def load_or_generate(
         header: Режим заголовка ('auto', 'yes', 'no')
         time_col: Колонка времени ('auto', 'none', или название)
         transpose: Транспонирование ('auto', 'yes', 'no')
+        auto_float32: Автопонижение к float32 для очень больших таблиц при dtype=None
         preprocess: Включить предобработку
         log_transform: Применить логарифм
         remove_outliers: Удалить выбросы
@@ -777,11 +818,24 @@ def load_or_generate(
     """
     try:
         raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
+
+        # Автопонижение типа: лучше осознанно перейти в float32,
+        # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
+        dtype_eff = dtype
+        if dtype_eff is None and auto_float32:
+            try:
+                n_rows, n_cols = int(raw.shape[0]), int(raw.shape[1])
+                n_cells = n_rows * n_cols
+                if n_cols >= 128 or n_cells >= 2_000_000:
+                    dtype_eff = "float32"
+            except Exception:
+                pass
+
         df = tidy_timeseries_table(
             raw,
             time_col=time_col,
             transpose=transpose,
-            dtype=dtype,
+            dtype=dtype_eff,
             time_start=time_start,
             time_end=time_end,
             time_stride=time_stride,
