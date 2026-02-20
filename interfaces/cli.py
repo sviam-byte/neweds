@@ -21,7 +21,6 @@ from src.io.user_input import build_run_spec, parse_user_input
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Собирает parser CLI-аргументов."""
     p = argparse.ArgumentParser(description="Compute connectivity measures for multivariate time series.")
     p.add_argument("input_file", nargs="?", default="demo.csv", help="Path to input CSV/Excel file or directory")
     p.add_argument("--lags", type=int, default=5, help="Max lag/model order")
@@ -49,7 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) -> None:
-    """Обрабатывает один файл данных и сохраняет отчеты."""
     cfg = AnalysisConfig(
         max_lag=int(args.lags),
         p_value_alpha=float(args.p_alpha),
@@ -60,7 +58,6 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
     )
 
     def _stage_cb(stage: str, progress, meta: dict):
-        """Печатает этапы выполнения в CLI (без падения на форматировании)."""
         try:
             if progress is None:
                 print(f"[Stage] {stage}")
@@ -73,10 +70,6 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
     tool = BigMasterTool(config=cfg, stage_callback=_stage_cb)
 
     spec = None
-
-    # Важно для совместимости:
-    # - если пользовательский конфиг НЕ задан, оставляем старое поведение run_all_methods().
-    # - если конфиг задан, запускаем выборочные варианты с пресетами/тюнингом.
     user_text = (args.user_config or "").strip()
     if args.interactive_config:
         print("\n[Input] Примеры:")
@@ -148,7 +141,6 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
                 load_kwargs[key] = opts[key]
         tool.load_data_excel(filepath, **load_kwargs)
 
-        # grids for scans
         if spec.window_sizes_grid:
             w_grid = [int(w) for w in spec.window_sizes_grid if int(w) >= 2]
         else:
@@ -212,7 +204,6 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
     excel_path = args.output or os.path.join(out_dir, f"{name}_full.xlsx")
     html_path = args.report_html or os.path.join(out_dir, f"{name}_report.html")
 
-    # Сохраняем сами ряды (raw+clean+QC+coords) рядом с отчётами, если не выключено.
     series_path = os.path.join(out_dir, f"{name}_series.xlsx")
     if (spec.save_series_bundle if spec else True):
         try:
@@ -246,7 +237,6 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
     except Exception:
         pass
 
-    # Явное русское пояснение того, что сделано.
     try:
         from src.reporting.run_summary import build_run_summary_ru
 
