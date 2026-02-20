@@ -18,7 +18,6 @@ except ImportError:  # pragma: no cover - optional dependency path
 
 
 def _coerce_1d_numeric(series_like) -> np.ndarray:
-    """Convert input to a finite 1D float64 array."""
     try:
         s = pd.to_numeric(series_like, errors="coerce")
         if isinstance(s, pd.DataFrame):
@@ -35,7 +34,6 @@ def _coerce_1d_numeric(series_like) -> np.ndarray:
 
 
 def test_stationarity(series: pd.Series) -> tuple[float | None, float | None]:
-    """Run the Augmented Dickey-Fuller test and return (statistic, p-value)."""
     clean_series = series.dropna()
     if len(clean_series) < 5:
         return None, None
@@ -48,7 +46,6 @@ def test_stationarity(series: pd.Series) -> tuple[float | None, float | None]:
 
 
 def compute_hurst_rs(series: pd.Series) -> float:
-    """Calculate the Hurst exponent using R/S analysis."""
     try:
         arr = _coerce_1d_numeric(series)
         if arr.size < 20:
@@ -66,7 +63,6 @@ def compute_hurst_rs(series: pd.Series) -> float:
 
 
 def compute_hurst_dfa(series: pd.Series) -> float:
-    """Calculate the Hurst exponent using detrended fluctuation analysis."""
     try:
         arr = _coerce_1d_numeric(series)
         if arr.size < 20 or nolds is None:
@@ -78,7 +74,6 @@ def compute_hurst_dfa(series: pd.Series) -> float:
 
 
 def compute_hurst_aggvar(series: pd.Series, max_n: int = 100) -> float:
-    """Calculate the Hurst exponent via the aggregated variance method."""
     try:
         arr = _coerce_1d_numeric(series)
         n = int(arr.size)
@@ -107,7 +102,6 @@ def compute_hurst_aggvar(series: pd.Series, max_n: int = 100) -> float:
 
 
 def compute_hurst_wavelet(series: pd.Series) -> float:
-    """Estimate a wavelet-like Hurst proxy from log-log PSD slope."""
     try:
         arr = _coerce_1d_numeric(series)
         n = int(arr.size)
@@ -130,7 +124,6 @@ def compute_hurst_wavelet(series: pd.Series) -> float:
 
 
 def compute_sample_entropy(series: pd.Series) -> float:
-    """Compute sample entropy for a 1D series."""
     try:
         arr = _coerce_1d_numeric(series)
         if arr.size < 20 or np.std(arr) < 1e-10 or nolds is None:
@@ -144,9 +137,6 @@ def compute_sample_entropy(series: pd.Series) -> float:
 
 def shannon_entropy(series: pd.Series, bins: int = 32) -> float:
     """Шенноновская энтропия распределения значений (гистограмма).
-
-    Это *не* энтропия последовательности, а энтропия эмпирического распределения.
-    Удобна как «базовая» характеристика разнообразия значений.
     """
     arr = _coerce_1d_numeric(series)
     if arr.size < 10:
@@ -241,7 +231,6 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         except Exception:
             robust_std = np.nan
 
-        # Доля выбросов: |x - median| / robust_σ > 3
         outlier_frac = np.nan
         try:
             xf = x[np.isfinite(x)]
@@ -252,7 +241,6 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         except Exception:
             outlier_frac = np.nan
 
-        # drift: slope в линейной регрессии x ~ t
         slope = np.nan
         try:
             mask = np.isfinite(x)
