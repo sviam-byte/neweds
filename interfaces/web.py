@@ -24,7 +24,6 @@ configure_warnings()
 
 
 def _parse_int_list_text(text: str) -> list[int] | None:
-    """Парсит строку формата `1,2,3` в список целых значений."""
     text = (text or "").strip()
     if not text:
         return None
@@ -416,7 +415,6 @@ def main() -> None:
                 input_path = run_dir / uploaded_file.name
                 input_path.write_bytes(uploaded_file.getbuffer())
             else:
-                # генерируем синтетику прямо сейчас (без отдельного клика)
                 if source.startswith("Синтетика (пресеты)"):
                     preset = st.session_state.get("preset", "Coupled system (X→Y, Z noise, S season)")
                     n_samples = int(st.session_state.get("preset_n_samples", 800) or 800)
@@ -603,7 +601,6 @@ def main() -> None:
                 except Exception:
                     pass
 
-                # Явное русское пояснение
                 try:
                     from src.reporting.run_summary import build_run_summary_ru
 
