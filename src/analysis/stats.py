@@ -230,7 +230,7 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         mean = float(np.nanmean(x)) if np.isfinite(np.nanmean(x)) else np.nan
         std = float(np.nanstd(x)) if np.isfinite(np.nanstd(x)) else np.nan
 
-        # --- Robust std (MAD * 1.4826) ---
+        # Робастное σ: MAD · 1.4826 (для нормального распределения)
         robust_std = np.nan
         try:
             xf = x[np.isfinite(x)]
@@ -241,7 +241,7 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         except Exception:
             robust_std = np.nan
 
-        # --- Outlier fraction (robust z > 3) ---
+        # Доля выбросов: |x - median| / robust_σ > 3
         outlier_frac = np.nan
         try:
             xf = x[np.isfinite(x)]
@@ -287,7 +287,7 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         except Exception:
             ar1 = np.nan
 
-        # --- Stationarity hint (ADF p-value) ---
+        # Подсказка по стационности: p-value ADF (не доказательство)
         stationarity_pval = np.nan
         try:
             xf = x[np.isfinite(x)]

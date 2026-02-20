@@ -19,9 +19,7 @@ import pandas as pd
 from scipy import stats
 
 
-# ---------------------------------------------------------------------------
-#  6.1  Нормализация масштаба
-# ---------------------------------------------------------------------------
+# 6.1 Нормализация масштаба
 
 def normalize_zscore(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     """Классический z-score по каждому каналу (mean=0, std=1)."""
@@ -47,9 +45,7 @@ def normalize_robust_zscore(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     return df, "robust z-score (median/MAD)"
 
 
-# ---------------------------------------------------------------------------
-#  6.2  Детрендинг / удаление дрейфа
-# ---------------------------------------------------------------------------
+# 6.2 Детрендинг / удаление дрейфа
 
 def detrend_linear(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     """Линейный детрендинг каждого канала (OLS x ~ t)."""
@@ -87,9 +83,7 @@ def detrend_highpass(df: pd.DataFrame, window: int = 50) -> Tuple[pd.DataFrame, 
     return df, f"highpass (window={window})"
 
 
-# ---------------------------------------------------------------------------
-#  6.3  Обработка выбросов
-# ---------------------------------------------------------------------------
+# 6.3 Обработка выбросов
 
 def clip_outliers_robust(df: pd.DataFrame, z_threshold: float = 5.0) -> Tuple[pd.DataFrame, str]:
     """Клиппинг по robust z-score: значения с |robust_z| > threshold → порог."""
@@ -134,9 +128,7 @@ def replace_spikes_median(df: pd.DataFrame, z_threshold: float = 5.0, window: in
     return df, f"spike_replace (Δx>{z_threshold}*MAD): {total_replaced} pts"
 
 
-# ---------------------------------------------------------------------------
-#  6.4  Работа с автокорреляцией
-# ---------------------------------------------------------------------------
+# 6.4 Работа с автокорреляцией
 
 def remove_ar1(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     """Prewhitening: удаление AR(1) компоненты для каждого канала.
@@ -164,9 +156,7 @@ def remove_ar1(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     return df, "remove_ar1 (prewhitening)"
 
 
-# ---------------------------------------------------------------------------
-#  Существующие функции (сохраняем обратную совместимость)
-# ---------------------------------------------------------------------------
+# Существующие функции (сохраняем обратную совместимость)
 
 def additional_preprocessing(df: pd.DataFrame, unique_thresh: float = 0.05) -> pd.DataFrame:
     """

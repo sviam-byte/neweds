@@ -171,33 +171,33 @@ def parse_user_input(text: str) -> Dict[str, Any]:
 class RunSpec:
     """Нормализованная спецификация запуска анализа."""
 
-    # what to compute
+    # Что считаем
     preset: str
     variants: List[str]
     max_lag: int
     lag_selection: str
     lag: int
 
-    # main windowing (affects the returned matrix)
+    # Основное оконное сканирование (влияет на итоговую матрицу)
     window_sizes: Optional[List[int]]
     window_stride: Optional[int]
     window_policy: str
     window_cube_level: str
     window_cube_eval_limit: int
 
-    # partial
+    # Частичные варианты
     partial_mode: str
     pairwise_policy: str
     custom_controls: Optional[List[str]]
 
-    # per-variant overrides (advanced)
+    # Переопределения по методам
     method_options: Optional[Dict[str, Any]]
 
-    # preprocessing
+    # Предобработка
     preprocess: bool
     preprocess_options: Dict[str, Any]
 
-    # scans (independent of main windowing)
+    # Диагностические сканы (независимо от основного окна)
     include_scans: bool
     scan_window_pos: bool
     scan_window_size: bool
@@ -227,7 +227,7 @@ class RunSpec:
     cube_gallery_k: int
     cube_gallery_limit: int
 
-    # report/output
+    # Отчёты и вывод
     output_mode: str
     include_diagnostics: bool
     include_matrix_tables: bool
@@ -313,7 +313,7 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
         lag_selection = "optimize"
     lag = _parse_int(user_cfg.get("lag", 1), 1, min_v=1)
 
-    # --- main windowing ---
+    # Настройки основного сканирования по окнам
     window_sizes = _parse_int_list(user_cfg.get("window_sizes"))
     window_stride_raw = user_cfg.get("window_stride")
     window_stride = int(window_stride_raw) if window_stride_raw is not None and str(window_stride_raw).strip() else None
@@ -322,18 +322,18 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     if window_policy not in {"best", "mean", "none", "off"}:
         window_policy = "best"
 
-    # --- partial ---
+    # Частичные варианты (control-переменные)
     partial_mode = str(user_cfg.get("partial_mode", "pairwise")).strip().lower()
     pairwise_policy = str(user_cfg.get("pairwise_policy", "others")).strip().lower()
     custom_controls = _parse_list(user_cfg.get("custom_controls")) or None
 
-    # --- preprocessing ---
+    # Предобработка
     preprocess = _parse_bool(user_cfg.get("preprocess", True), True)
     preprocess_options = user_cfg.get("preprocess_options") or {}
     if not isinstance(preprocess_options, dict):
         preprocess_options = {}
 
-    # --- legacy: main-window cube search (affects chosen lag / best window) ---
+    # Совместный перебор лаг/окно (режим кубика)
     window_cube_level = str(user_cfg.get("window_cube", user_cfg.get("window_cube_level", "off"))).strip().lower()
     if window_cube_level not in {"off", "basic", "full"}:
         window_cube_level = "off"
@@ -344,7 +344,7 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
         max_v=2000,
     )
 
-    # --- report/output ---
+    # Отчёты и вывод
     output_mode = str(user_cfg.get("output_mode", "both")).strip().lower()
     if output_mode not in {"html", "excel", "both"}:
         output_mode = "both"
@@ -356,11 +356,11 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     include_fft_plots = _parse_bool(user_cfg.get("include_fft_plots", False), False)
     harmonic_top_k = _parse_int(user_cfg.get("harmonic_top_k", 5), 5, min_v=1, max_v=20)
 
-    # --- QC / сохранение ---
+    # QC и сохранение
     qc_enabled = _parse_bool(user_cfg.get("qc_enabled", True), True)
     save_series_bundle = _parse_bool(user_cfg.get("save_series_bundle", True), True)
 
-    # --- scans flags ---
+    # Включение диагностических сканов
     scan_window_pos = _parse_bool(user_cfg.get("scan_window_pos", True), True)
     scan_window_size = _parse_bool(user_cfg.get("scan_window_size", True), True)
     scan_lag = _parse_bool(user_cfg.get("scan_lag", True), True)
@@ -368,7 +368,7 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     if not include_scans:
         scan_window_pos = scan_window_size = scan_lag = scan_cube = False
 
-    # window grids
+    # Сетки окон
     window_sizes_grid = _parse_int_list(user_cfg.get("window_sizes_grid"))
     window_min = _parse_int(user_cfg.get("window_min", 64), 64, min_v=2)
     window_max = _parse_int(user_cfg.get("window_max", 192), 192, min_v=2)
@@ -382,14 +382,14 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     window_start_max = _parse_int(user_cfg.get("window_start_max", 0), 0, min_v=0)
     window_max_windows = _parse_int(user_cfg.get("window_max_windows", 60), 60, min_v=1, max_v=5000)
 
-    # lag grid
+    # Сетка лагов
     lag_grid = _parse_int_list(user_cfg.get("lag_grid"))
     lag_min = _parse_int(user_cfg.get("lag_min", 1), 1, min_v=1)
     lag_max_default = min(max_lag, 3) if max_lag >= 1 else 3
     lag_max = _parse_int(user_cfg.get("lag_max", lag_max_default), lag_max_default, min_v=lag_min)
     lag_step = _parse_int(user_cfg.get("lag_step", 1), 1, min_v=1)
 
-    # cube controls
+    # Параметры кубика
     cube_combo_limit = _parse_int(user_cfg.get("cube_combo_limit", 9), 9, min_v=1, max_v=100000)
     cube_eval_limit = _parse_int(user_cfg.get("cube_eval_limit", 225), 225, min_v=1, max_v=10000000)
     cube_matrix_mode = str(user_cfg.get("cube_matrix_mode", "all")).strip().lower()
@@ -403,7 +403,7 @@ def build_run_spec(user_cfg: Dict[str, Any], *, default_max_lag: int = 12) -> Ru
     cube_gallery_k = _parse_int(user_cfg.get("cube_gallery_k", 1), 1, min_v=1, max_v=1000)
     cube_gallery_limit = _parse_int(user_cfg.get("cube_gallery_limit", 60), 60, min_v=3, max_v=5000)
 
-    # per-method overrides (advanced)
+    # Переопределения по методам
     method_options = user_cfg.get("method_options")
     if not isinstance(method_options, dict):
         method_options = None

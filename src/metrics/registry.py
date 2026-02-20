@@ -37,11 +37,11 @@ METRICS_REGISTRY: dict[str, MetricFunc] = {
     "te_full": connectivity.transfer_entropy_matrix,
     "te_partial": connectivity.transfer_entropy_matrix_partial,
     "te_directed": connectivity.transfer_entropy_matrix,
-    # --- spec metric #6: Distance correlation ---
+    # Спец-метрика: distance correlation
     "dcor_full": connectivity.dcor_matrix,
     "dcor_partial": connectivity.dcor_matrix_partial,
     "dcor_directed": connectivity.dcor_matrix_directed,
-    # --- spec metric #7: Ordinal / Permutation dependence ---
+    # Спец-метрика: порядковая/пермутационная зависимость
     "ordinal_full": connectivity.ordinal_matrix,
     "ordinal_directed": connectivity.ordinal_matrix_directed,
 }

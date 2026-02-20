@@ -229,7 +229,7 @@ def read_input_table(
         try:
             df0 = pd.read_excel(fp, header=None, usecols=xl_usecols)
         except Exception:
-            # fallback: читаем целиком
+            # Запасной вариант: читаем целиком
             df0 = pd.read_excel(fp, header=None)
     df0 = _maybe_split_single_column(df0)
 
@@ -313,8 +313,8 @@ def tidy_timeseries_table(
         out = out.T
         out.columns = [f"c{i+1}" for i in range(out.shape[1])]
 
-    # --- Big-data friendly slicing (до предобработки) ---
-    # time slicing
+    # Обрезка больших данных (до предобработки)
+    # Обрезка по времени
     try:
         t0 = int(time_start) if time_start is not None else None
         t1 = int(time_end) if time_end is not None else None
@@ -326,7 +326,7 @@ def tidy_timeseries_table(
     except Exception:
         pass
 
-    # feature downselect
+    # Ограничение числа признаков
     try:
         if feature_limit is not None and int(feature_limit) > 0 and out.shape[1] > int(feature_limit):
             mode = str(feature_sampling or "first").strip().lower()
@@ -349,7 +349,7 @@ def tidy_timeseries_table(
     except Exception:
         pass
 
-    # dtype cast (последним, чтобы не плодить копии)
+    # Приведение типа (последним, чтобы не плодить копии)
     if dtype:
         dt = str(dtype).strip().lower()
         if dt in {"float32", "f4"}:
@@ -378,9 +378,7 @@ def tidy_timeseries_table(
     return out
 
 
-# ---------------------------------------------------------------------------
-#  Доп. утилиты предобработки: выбросы и ранговая нормализация
-# ---------------------------------------------------------------------------
+# Утилиты предобработки: выбросы и ранговая нормализация
 
 def _rank_normalize_1d(x: np.ndarray, *, mode: str = "dense", ties: str = "average") -> np.ndarray:
     """Ранговая нормализация (структурная): значения -> ранги.
@@ -778,7 +776,7 @@ def load_or_generate(
     header: str = "auto",
     time_col: str = "auto",
     transpose: str = "auto",
-    # big data / performance
+    # Параметры для больших данных и производительности
     dtype: str | None = None,
     # Если dtype=None, то для очень широких/больших таблиц автоматически
     # понижаем тип до float32, чтобы снизить пик памяти при загрузке/clean-up.

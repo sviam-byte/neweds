@@ -268,7 +268,7 @@ class AnalysisConfig:
     # Поправка на множественные сравнения: 'none' | 'fdr_bh'.
     pvalue_correction: str = "none"
 
-    # --- Connectivity tuning ---
+    # Настройки окон/лагов для связности
     # Если задано, расчёты могут выполняться на скользящих окнах.
     # В результирующую матрицу по методу попадёт "лучшая" матрица (см. window_policy).
     window_sizes: list[int] | None = None
