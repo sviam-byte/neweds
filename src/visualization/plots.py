@@ -241,6 +241,134 @@ def plot_fft_spectrum(
     return buf
 
 
+def plot_timeseries_before_after(
+    before,
+    after,
+    title: str,
+    *,
+    max_points: int = 2000,
+) -> BytesIO:
+    """Сравнение рядов: до/после предобработки.
+
+    Рисуем два графика друг под другом (before, after) с общим диапазоном Y.
+    """
+    import pandas as pd
+
+    b = pd.to_numeric(pd.Series(before), errors="coerce")
+    a = pd.to_numeric(pd.Series(after), errors="coerce")
+    bv = np.asarray(b.to_numpy(), dtype=float)
+    av = np.asarray(a.to_numpy(), dtype=float)
+
+    n = int(min(bv.size, av.size))
+    if n <= 3:
+        buf = BytesIO()
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, "Too short", ha="center", va="center")
+        ax.axis("off")
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    bv = bv[:n]
+    av = av[:n]
+    if n > max_points:
+        idx = np.linspace(0, n - 1, max_points).round().astype(int)
+        bv = bv[idx]
+        av = av[idx]
+
+    vals = np.concatenate([bv[np.isfinite(bv)], av[np.isfinite(av)]])
+    if vals.size == 0:
+        vmin, vmax = -1.0, 1.0
+    else:
+        vmin = float(np.nanmin(vals))
+        vmax = float(np.nanmax(vals))
+        if vmin == vmax:
+            vmin -= 1.0
+            vmax += 1.0
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 3.2), sharex=True)
+    axes[0].plot(bv)
+    axes[0].set_title("До", fontsize=9)
+    axes[0].set_ylim(vmin, vmax)
+    axes[0].grid(True, alpha=0.2)
+
+    axes[1].plot(av)
+    axes[1].set_title("После", fontsize=9)
+    axes[1].set_ylim(vmin, vmax)
+    axes[1].grid(True, alpha=0.2)
+    axes[1].set_xlabel("t (index)")
+
+    fig.suptitle(title, fontsize=10)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def plot_acf_before_after(
+    before,
+    after,
+    title: str,
+    *,
+    lags: int = 40,
+) -> BytesIO:
+    """ACF до/после (2 панели), чтобы было видно, ушёл ли лаг-1 и лаг-p."""
+    import pandas as pd
+
+    try:
+        from statsmodels.tsa.stattools import acf
+    except Exception:
+        acf = None
+
+    b = pd.to_numeric(pd.Series(before), errors="coerce")
+    a = pd.to_numeric(pd.Series(after), errors="coerce")
+    bv = np.asarray(b.to_numpy(), dtype=float)
+    av = np.asarray(a.to_numpy(), dtype=float)
+    bv = bv[np.isfinite(bv)]
+    av = av[np.isfinite(av)]
+    if bv.size < 10 or av.size < 10 or acf is None:
+        buf = BytesIO()
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, "ACF unavailable", ha="center", va="center")
+        ax.axis("off")
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    L = int(max(5, min(int(lags), int(min(bv.size, av.size) // 2))))
+    try:
+        acf_b = acf(bv, nlags=L, fft=True)
+        acf_a = acf(av, nlags=L, fft=True)
+    except Exception:
+        acf_b = np.full((L + 1,), np.nan)
+        acf_a = np.full((L + 1,), np.nan)
+
+    xs = np.arange(L + 1)
+    fig, axes = plt.subplots(2, 1, figsize=(8, 3.2), sharex=True)
+    axes[0].bar(xs, acf_b)
+    axes[0].set_title("ACF до", fontsize=9)
+    axes[0].set_ylim(-1.0, 1.0)
+    axes[0].grid(True, alpha=0.2)
+
+    axes[1].bar(xs, acf_a)
+    axes[1].set_title("ACF после", fontsize=9)
+    axes[1].set_ylim(-1.0, 1.0)
+    axes[1].grid(True, alpha=0.2)
+    axes[1].set_xlabel("lag")
+
+    fig.suptitle(title, fontsize=10)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def plot_window_cube_3d(points: list[dict], title: str) -> BytesIO:
     """3D scatter: window_size × lag × start_pos, цвет/размер по metric."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401

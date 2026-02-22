@@ -560,6 +560,7 @@ def preprocess_timeseries(
     fill_missing: bool = True,
     remove_ar1: bool = False,
     remove_ar_order: int = 1,
+    ar_diagnostics: bool = True,
     remove_seasonality: bool = False,
     season_period: int | None = None,
     check_stationarity: bool = False,
@@ -645,6 +646,146 @@ def preprocess_timeseries(
 
     if remove_ar1:
         p_order = int(max(1, int(remove_ar_order or 1)))
+
+        # --- Диагностика автокорреляции (до очистки) ---
+        # Явный акцент на лаг 1 + (при необходимости) лаг p.
+        # Важно: это нужно не для красоты, а чтобы понимать, не убиваем ли мы сигнал.
+        ac_note: dict = {
+            "enabled": True,
+            "order": int(p_order),
+            "sampled": False,
+            "n_series": int(out.shape[1]),
+        }
+
+        def _safe_corr_at_lag(x: np.ndarray, lag: int) -> float:
+            lag = int(max(1, lag))
+            if x.size <= lag + 2:
+                return float("nan")
+            a = x[:-lag]
+            b = x[lag:]
+            m = np.isfinite(a) & np.isfinite(b)
+            if int(m.sum()) < 5:
+                return float("nan")
+            aa = a[m]
+            bb = b[m]
+            sa = float(np.std(aa))
+            sb = float(np.std(bb))
+            if not np.isfinite(sa) or not np.isfinite(sb) or sa * sb < 1e-12:
+                return float("nan")
+            return float(np.corrcoef(aa, bb)[0, 1])
+
+        def _phi1_ols(x: np.ndarray) -> float:
+            # OLS оценка AR(1): phi = <x[t-1], x[t]> / <x[t-1], x[t-1]>
+            if x.size < 6:
+                return float("nan")
+            x0 = x[:-1]
+            x1 = x[1:]
+            m = np.isfinite(x0) & np.isfinite(x1)
+            if int(m.sum()) < 5:
+                return float("nan")
+            a = x0[m]
+            b = x1[m]
+            den = float(np.dot(a, a))
+            if not np.isfinite(den) or den < 1e-12:
+                return float("nan")
+            return float(np.dot(a, b) / den)
+
+        def _ljung_box_p(x: np.ndarray, lag: int) -> float:
+            # Ljung–Box p-value на заданном числе лагов.
+            try:
+                from statsmodels.stats.diagnostic import acorr_ljungbox
+            except Exception:
+                return float("nan")
+            lag = int(max(1, lag))
+            xx = np.asarray(x, dtype=float)
+            xx = xx[np.isfinite(xx)]
+            if xx.size < max(12, 3 * lag):
+                return float("nan")
+            try:
+                res = acorr_ljungbox(xx, lags=[lag], return_df=True)
+                pv = float(res["lb_pvalue"].iloc[0])
+                return pv if np.isfinite(pv) else float("nan")
+            except Exception:
+                return float("nan")
+
+        # Для очень больших матриц диагностику ограничиваем сэмплом колонок.
+        cols_all = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+        max_diag_cols = 2000
+        cols_diag = cols_all
+        if len(cols_all) > max_diag_cols:
+            cols_diag = list(cols_all[:max_diag_cols])
+            ac_note["sampled"] = True
+            ac_note["n_series_sampled"] = int(len(cols_diag))
+        else:
+            ac_note["n_series_sampled"] = int(len(cols_diag))
+
+        if bool(ar_diagnostics):
+            phi1_list = []
+            r1_list = []
+            rp_list = []
+            lb1_list = []
+            lbp_list = []
+
+            # Сохраним 3 примера: максимальная |phi1| (до очистки).
+            top = []  # list[tuple[abs_phi, col, phi1]]
+            for col in cols_diag:
+                x = out[col].astype(float).to_numpy(copy=False)
+                x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                phi1 = _phi1_ols(x)
+                r1 = _safe_corr_at_lag(x, 1)
+                rp = _safe_corr_at_lag(x, p_order)
+                lb1 = _ljung_box_p(x, 1)
+                lbp = _ljung_box_p(x, p_order)
+
+                if np.isfinite(phi1):
+                    phi1_list.append(float(phi1))
+                    top.append((abs(float(phi1)), col, float(phi1)))
+                if np.isfinite(r1):
+                    r1_list.append(float(r1))
+                if np.isfinite(rp):
+                    rp_list.append(float(rp))
+                if np.isfinite(lb1):
+                    lb1_list.append(float(lb1))
+                if np.isfinite(lbp):
+                    lbp_list.append(float(lbp))
+
+            top.sort(reverse=True, key=lambda t: t[0])
+            top = top[:3]
+            ac_note["examples_cols"] = [t[1] for t in top]
+
+            def _summary(vals: list[float]) -> dict:
+                if not vals:
+                    return {"n": 0}
+                a = np.asarray(vals, dtype=float)
+                return {
+                    "n": int(a.size),
+                    "median": float(np.nanmedian(a)),
+                    "mean": float(np.nanmean(a)),
+                    "p25": float(np.nanpercentile(a, 25)),
+                    "p75": float(np.nanpercentile(a, 75)),
+                }
+
+            ac_note["before"] = {
+                "phi1": _summary(phi1_list),
+                "corr_lag1": _summary(r1_list),
+                "corr_lagp": _summary(rp_list),
+                "ljungbox_p_lag1": _summary(lb1_list),
+                "ljungbox_p_lagp": _summary(lbp_list),
+                "frac_lb_p_lt_0_05_lag1": float(np.mean(np.asarray(lb1_list) < 0.05)) if lb1_list else float("nan"),
+                "frac_lb_p_lt_0_05_lagp": float(np.mean(np.asarray(lbp_list) < 0.05)) if lbp_list else float("nan"),
+            }
+
+            # Сохраним сами ряды для примеров (до очистки).
+            ex = {}
+            for _, col, phi1 in top:
+                try:
+                    ex[str(col)] = {
+                        "phi1": float(phi1),
+                        "before": out[col].astype(float).to_numpy(copy=True).tolist(),
+                    }
+                except Exception:
+                    pass
+            ac_note["examples"] = ex
         report.add(f"[Preprocess] remove AR(p): p={p_order} (OLS on lags)")
         for col in out.columns:
             if not pd.api.types.is_numeric_dtype(out[col]):
@@ -655,9 +796,10 @@ def preprocess_timeseries(
             x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
             if p_order == 1:
+                # OLS-оценка AR(1) коэффициента (не corr!).
                 x0, x1 = x[:-1], x[1:]
-                denom = (np.std(x0) * np.std(x1))
-                phi = float(np.corrcoef(x0, x1)[0, 1]) if denom > 1e-12 else 0.0
+                den = float(np.dot(x0, x0))
+                phi = float(np.dot(x0, x1) / den) if np.isfinite(den) and den > 1e-12 else 0.0
                 if not np.isfinite(phi):
                     phi = 0.0
                 y = np.empty_like(x)
@@ -683,6 +825,85 @@ def preprocess_timeseries(
             coeffs = [float(v) for v in phi[: min(5, p_order)]]
             suffix = "..." if p_order > 5 else ""
             report.add(f"[Preprocess] AR(p) coeffs≈{coeffs}{suffix}", col=col)
+
+        # --- Диагностика автокорреляции (после очистки) + примеры рядов ---
+        if bool(ar_diagnostics):
+            cols_diag2 = cols_diag
+            phi1_list = []
+            r1_list = []
+            rp_list = []
+            lb1_list = []
+            lbp_list = []
+
+            for col in cols_diag2:
+                x = out[col].astype(float).to_numpy(copy=False)
+                x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                phi1 = _phi1_ols(x)
+                r1 = _safe_corr_at_lag(x, 1)
+                rp = _safe_corr_at_lag(x, p_order)
+                lb1 = _ljung_box_p(x, 1)
+                lbp = _ljung_box_p(x, p_order)
+                if np.isfinite(phi1):
+                    phi1_list.append(float(phi1))
+                if np.isfinite(r1):
+                    r1_list.append(float(r1))
+                if np.isfinite(rp):
+                    rp_list.append(float(rp))
+                if np.isfinite(lb1):
+                    lb1_list.append(float(lb1))
+                if np.isfinite(lbp):
+                    lbp_list.append(float(lbp))
+
+            def _summary(vals: list[float]) -> dict:
+                if not vals:
+                    return {"n": 0}
+                a = np.asarray(vals, dtype=float)
+                return {
+                    "n": int(a.size),
+                    "median": float(np.nanmedian(a)),
+                    "mean": float(np.nanmean(a)),
+                    "p25": float(np.nanpercentile(a, 25)),
+                    "p75": float(np.nanpercentile(a, 75)),
+                }
+
+            ac_note["after"] = {
+                "phi1": _summary(phi1_list),
+                "corr_lag1": _summary(r1_list),
+                "corr_lagp": _summary(rp_list),
+                "ljungbox_p_lag1": _summary(lb1_list),
+                "ljungbox_p_lagp": _summary(lbp_list),
+                "frac_lb_p_lt_0_05_lag1": float(np.mean(np.asarray(lb1_list) < 0.05)) if lb1_list else float("nan"),
+                "frac_lb_p_lt_0_05_lagp": float(np.mean(np.asarray(lbp_list) < 0.05)) if lbp_list else float("nan"),
+            }
+
+            # допишем примеры "после"
+            ex = ac_note.get("examples") or {}
+            if isinstance(ex, dict):
+                for col, item in list(ex.items()):
+                    try:
+                        if isinstance(item, dict):
+                            item["after"] = out[col].astype(float).to_numpy(copy=True).tolist()
+                            # остаточная автокорреляция на лаг 1 / lag p
+                            xa = out[col].astype(float).to_numpy(copy=False)
+                            xa = np.nan_to_num(xa, nan=0.0, posinf=0.0, neginf=0.0)
+                            item["after_corr_lag1"] = _safe_corr_at_lag(xa, 1)
+                            item["after_corr_lagp"] = _safe_corr_at_lag(xa, p_order)
+                    except Exception:
+                        pass
+            ac_note["examples"] = ex
+
+            # краткая метрика «насколько упала автокор на лаг1» по медиане
+            try:
+                b = (ac_note.get("before") or {}).get("corr_lag1") or {}
+                a = (ac_note.get("after") or {}).get("corr_lag1") or {}
+                bmed = float(b.get("median")) if b.get("median") is not None else float("nan")
+                amed = float(a.get("median")) if a.get("median") is not None else float("nan")
+                if np.isfinite(bmed) and np.isfinite(amed):
+                    ac_note["lag1_reduction_median"] = float(1.0 - (abs(amed) / max(1e-12, abs(bmed))))
+            except Exception:
+                pass
+
+            report.notes["autocorr"] = ac_note
 
     if remove_seasonality:
         # STL сезонность: либо заданный период, либо пробуем оценить.
@@ -809,6 +1030,7 @@ def load_or_generate(
     fill_missing: bool = True,
     remove_ar1: bool = False,
     remove_ar_order: int = 1,
+    ar_diagnostics: bool = True,
     remove_seasonality: bool = False,
     season_period: int | None = None,
     check_stationarity: bool = False,
@@ -890,6 +1112,7 @@ def load_or_generate(
             fill_missing=fill_missing,
             remove_ar1=remove_ar1,
             remove_ar_order=remove_ar_order,
+            ar_diagnostics=ar_diagnostics,
             remove_seasonality=remove_seasonality,
             season_period=season_period,
             check_stationarity=check_stationarity,
