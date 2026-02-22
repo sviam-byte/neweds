@@ -54,6 +54,99 @@ class HTMLReportGenerator:
         return self._b64_png(plots.plot_window_cube_3d(points, title))
 
 
+    def _render_autocorr_section(self) -> str:
+        """HTML-блок про автокорреляцию (акцент на лаг-1 и лаг-p).
+
+        Источник: tool.preprocessing_report.notes['autocorr'].
+        """
+        rep = getattr(self.tool, "preprocessing_report", None)
+        notes = getattr(rep, "notes", None) if rep is not None else None
+        notes = notes or {}
+        ac = notes.get("autocorr") if isinstance(notes, dict) else None
+        if not isinstance(ac, dict):
+            return ""
+
+        order = ac.get("order")
+        before = ac.get("before") if isinstance(ac.get("before"), dict) else {}
+        after = ac.get("after") if isinstance(ac.get("after"), dict) else {}
+        sampled = bool(ac.get("sampled"))
+        n_series = ac.get("n_series")
+        n_s = ac.get("n_series_sampled")
+
+        def _fmt_num(x) -> str:
+            try:
+                if x is None:
+                    return "—"
+                v = float(x)
+                return f"{v:.3g}" if np.isfinite(v) else "—"
+            except Exception:
+                return "—"
+
+        def _fmt_frac(x) -> str:
+            try:
+                v = float(x)
+                return f"{100.0*v:.1f}%" if np.isfinite(v) else "—"
+            except Exception:
+                return "—"
+
+        b1 = (before.get("corr_lag1") or {}).get("median")
+        a1 = (after.get("corr_lag1") or {}).get("median")
+        bp1 = before.get("frac_lb_p_lt_0_05_lag1")
+        ap1 = after.get("frac_lb_p_lt_0_05_lag1")
+        bpp = before.get("frac_lb_p_lt_0_05_lagp")
+        app = after.get("frac_lb_p_lt_0_05_lagp")
+        red = ac.get("lag1_reduction_median")
+
+        hdr = [
+            "<h2>Автокорреляция и очистка AR(p)</h2>",
+            "<div class='muted'>",
+            "Акцент: лаг&nbsp;1 (первая автокорреляция) и лаг&nbsp;p (если включено AR(p)).",
+            "</div>",
+        ]
+
+        meta = (
+            f"<div class='kv'><b>p</b>: {html.escape(str(order))} &nbsp;"
+            f"<b>рядов</b>: {html.escape(str(n_series))} &nbsp;"
+            f"<b>диагностика</b>: {html.escape(str(n_s))}{' (сэмпл)' if sampled else ''}"
+            f"</div>"
+        )
+
+        summary = (
+            "<ul>"
+            f"<li><b>lag=1</b>: median corr до={_fmt_num(b1)}, после={_fmt_num(a1)}; "
+            f"Ljung–Box p&lt;0.05 до={_fmt_frac(bp1)}, после={_fmt_frac(ap1)}</li>"
+            f"<li><b>lag=p</b>: Ljung–Box p&lt;0.05 до={_fmt_frac(bpp)}, после={_fmt_frac(app)}</li>"
+            f"<li><b>снижение lag=1 (медиана)</b>: {_fmt_frac(red)}</li>"
+            "</ul>"
+        )
+
+        # Примеры рядов: до/после + ACF до/после
+        ex = ac.get("examples")
+        examples_html: list[str] = []
+        if isinstance(ex, dict) and ex:
+            examples_html.append("<h3>Примеры рядов (наиболее сильная AR(1) до очистки)</h3>")
+            for col, item in list(ex.items())[:3]:
+                if not isinstance(item, dict):
+                    continue
+                before_ts = item.get("before")
+                after_ts = item.get("after")
+                if not isinstance(before_ts, list) or not isinstance(after_ts, list):
+                    continue
+                phi1 = item.get("phi1")
+                r1a = item.get("after_corr_lag1")
+                title = f"{col} | phi1≈{_fmt_num(phi1)} | after corr(lag1)≈{_fmt_num(r1a)}"
+                img_ts = self._b64_png(plots.plot_timeseries_before_after(before_ts, after_ts, title))
+                img_acf = self._b64_png(plots.plot_acf_before_after(before_ts, after_ts, f"ACF: {col}"))
+                examples_html.append(
+                    "<div class='grid2'>"
+                    f"<div><img class='img' src='data:image/png;base64,{img_ts}'/></div>"
+                    f"<div><img class='img' src='data:image/png;base64,{img_acf}'/></div>"
+                    "</div>"
+                )
+
+        return "\n".join(hdr + [meta, summary] + examples_html)
+
+
     def _jsonable_matrix(self, mat) -> list | None:
         """Переводит матрицу в JSON-friendly list[list[float|None]]."""
         if mat is None:
@@ -364,6 +457,15 @@ class HTMLReportGenerator:
             sections.append(
                 "<h2 id='what_done'>Что сделано</h2>" + f"<pre>{html.escape(run_summary)}</pre>"
             )
+
+        # Явный блок про автокорреляцию/AR-очистку (если она включалась).
+        try:
+            ac_html = self._render_autocorr_section()
+        except Exception:
+            ac_html = ""
+        if ac_html:
+            toc.append("<li><a href='#autocorr'>Автокорреляция</a></li>")
+            sections.append(f"<div id='autocorr'>{ac_html}</div>")
 
         # Главный экран: raw/proc в едином масштабе + отчёт предобработки + гармоники.
         try:

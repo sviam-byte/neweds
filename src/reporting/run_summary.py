@@ -57,6 +57,32 @@ def build_run_summary_ru(tool, *, run_dir: Optional[str] = None) -> str:
         if dropped:
             lines.append(f"- удалены константные/плохие колонки: {len(dropped)}")
 
+        # Явная подсказка про автокорреляцию, если она диагностировалась.
+        try:
+            notes = getattr(rep, "notes", {}) or {}
+            ac = notes.get("autocorr") if isinstance(notes, dict) else None
+            if isinstance(ac, dict):
+                order = ac.get("order")
+                b = (ac.get("before") or {}).get("corr_lag1") or {}
+                a = (ac.get("after") or {}).get("corr_lag1") or {}
+                bmed = b.get("median")
+                amed = a.get("median")
+                red = ac.get("lag1_reduction_median")
+                lines.append("Автокорреляция")
+                lines.append(f"- AR(p): p={order}")
+                if bmed is not None and amed is not None:
+                    try:
+                        lines.append(f"- lag=1 corr (медиана): до={float(bmed):.3g}, после={float(amed):.3g}")
+                    except Exception:
+                        pass
+                if red is not None:
+                    try:
+                        lines.append(f"- снижение lag=1 (медиана): {100.0*float(red):.1f}%")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     # 3) QC
     qc_enabled = True
     try:
