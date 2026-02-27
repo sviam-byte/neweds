@@ -546,6 +546,7 @@ class HTMLReportGenerator:
                 n_before = dr.get("n_before")
                 n_after = dr.get("n_after")
                 priority = html.escape(str(dr.get("priority") or "—"))
+                solver = html.escape(str(dr.get("solver") or "—"))
                 explained = dr.get("explained_var")
                 ev_txt = ""
                 try:
@@ -553,7 +554,7 @@ class HTMLReportGenerator:
                 except Exception:
                     ev_txt = ""
                 prep_lines.append(
-                    f"<b>DimRed</b>: {method} ({n_before} → {n_after}), приоритет={priority}{ev_txt}"
+                    f"<b>DimRed</b>: {method} ({n_before} → {n_after}), solver={solver}, приоритет={priority}{ev_txt}"
                 )
 
             prep_html = "<div class='meta'>" + "<br/>".join(prep_lines) + "</div>" if prep_lines else ""
