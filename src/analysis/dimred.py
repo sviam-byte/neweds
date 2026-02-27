@@ -93,17 +93,25 @@ def _spatial_bin(data: pd.DataFrame, coords_df: pd.DataFrame | None, target_n: i
 def _pca_reduce(data: pd.DataFrame, target_n: int | None, target_var: float | None, seed: int) -> DimRedResult:
     """Снижает размерность с помощью PCA по оси колонок (рядам)."""
     from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
 
+    # PCA чувствительна к масштабу признаков, поэтому сначала стандартизируем.
     x = data.to_numpy(dtype=float)
-    x = x - np.nanmean(x, axis=0, keepdims=True)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        x = StandardScaler(with_mean=True, with_std=True).fit_transform(x)
+    except Exception:
+        # Фолбэк для совместимости: минимум — центрирование.
+        x = x - np.nanmean(x, axis=0, keepdims=True)
 
     n_features = int(x.shape[1])
     if target_var is not None and 0.0 < float(target_var) <= 1.0:
         n_components: int | float = float(target_var)
+        priority = "explained_variance"
     else:
         k = int(target_n or 0)
         n_components = int(max(1, min(k, n_features)))
+        priority = "n_components"
 
     pca = PCA(n_components=n_components, random_state=int(seed), svd_solver="full")
     scores = pca.fit_transform(x)
@@ -119,13 +127,22 @@ def _pca_reduce(data: pd.DataFrame, target_n: int | None, target_var: float | No
             for source, weight in zip(sources, pca.components_[ci].tolist()):
                 mapping_rows.append({"source": source, "target": cname, "weight": float(weight)})
 
+    evr_list = []
+    if hasattr(pca, "explained_variance_ratio_") and pca.explained_variance_ratio_ is not None:
+        try:
+            evr_list = [float(v) for v in pca.explained_variance_ratio_.tolist()]
+        except Exception:
+            evr_list = []
+
     meta = {
         "method": "pca",
         "k": k_out,
         "seed": int(seed),
         "target_n": (int(target_n) if target_n is not None else None),
         "target_var": (float(target_var) if target_var is not None else None),
-        "explained_var": float(pca.explained_variance_ratio_.sum()) if hasattr(pca, "explained_variance_ratio_") else None,
+        "priority": priority,
+        "explained_var": float(sum(evr_list)) if evr_list else None,
+        "explained_var_top": evr_list,
     }
     return DimRedResult(reduced=reduced, mapping=pd.DataFrame(mapping_rows), meta=meta)
 
