@@ -81,6 +81,8 @@ class App(tk.Tk):
         self.dimred_method = tk.StringVar(value="variance")
         self.dimred_target = tk.IntVar(value=500)
         self.dimred_target_var = tk.DoubleVar(value=0.0)  # 0 => ignore, else (0, 1]
+        self.dimred_priority = tk.StringVar(value="explained_variance")  # explained_variance|n_components|auto
+        self.dimred_pca_solver = tk.StringVar(value="full")  # full|randomized|gram
         self.dimred_spatial_bin = tk.IntVar(value=2)
         self.dimred_kmeans_batch = tk.IntVar(value=2048)
         self.dimred_seed = tk.IntVar(value=0)
@@ -479,7 +481,7 @@ class App(tk.Tk):
         ttk.Combobox(
             d0,
             textvariable=self.dimred_method,
-            values=["variance", "kmeans", "spatial", "random", "pca"],
+            values=["variance", "kmeans", "spatial", "random", "pca_full", "pca_randomized", "pca_gram"],
             state="readonly",
             width=10,
         ).pack(side="left")
@@ -511,6 +513,10 @@ class App(tk.Tk):
         d1 = ttk.Frame(dr)
         d1.pack(fill="x", pady=2)
         ttk.Label(d1, text="Параметры метода:").pack(side="left")
+        ttk.Label(d1, text="pca priority:").pack(side="left", padx=(10, 5))
+        ttk.Combobox(d1, textvariable=self.dimred_priority, values=["explained_variance", "n_components", "auto"], state="readonly", width=18).pack(side="left")
+        ttk.Label(d1, text="pca solver:").pack(side="left", padx=(10, 5))
+        ttk.Combobox(d1, textvariable=self.dimred_pca_solver, values=["full", "randomized", "gram"], state="readonly", width=12).pack(side="left")
         ttk.Label(d1, text="kmeans batch:").pack(side="left", padx=(10, 5))
         ttk.Entry(d1, textvariable=self.dimred_kmeans_batch, width=8).pack(side="left")
         ttk.Label(d1, text="spatial bin (шаг по xyz):").pack(side="left", padx=(10, 5))
@@ -791,6 +797,8 @@ class App(tk.Tk):
             dimred_target_var=(
                 None if self._as_float(self.dimred_target_var, 0.0) <= 0 else self._as_float(self.dimred_target_var, 0.0)
             ),
+            dimred_priority=str(self._as_str(self.dimred_priority)),
+            dimred_pca_solver=str(self._as_str(self.dimred_pca_solver)),
             dimred_spatial_bin=self._as_int(self.dimred_spatial_bin, 2),
             dimred_kmeans_batch=self._as_int(self.dimred_kmeans_batch, 2048),
             dimred_seed=self._as_int(self.dimred_seed, 0),

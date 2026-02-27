@@ -3215,6 +3215,8 @@ class BigMasterTool:
         seed = int(kwargs.get("dimred_seed", 0) or 0)
         spatial_bin = int(kwargs.get("dimred_spatial_bin", 2) or 2)
         kmeans_batch = int(kwargs.get("dimred_kmeans_batch", 2048) or 2048)
+        dimred_priority = str(kwargs.get("dimred_priority") or "auto").strip().lower()
+        dimred_pca_solver = str(kwargs.get("dimred_pca_solver") or "full").strip().lower()
 
         base = (
             self.data_preprocessed
@@ -3248,6 +3250,8 @@ class BigMasterTool:
             coords_df=getattr(self, "coords_df", None),
             kmeans_batch=kmeans_batch,
             spatial_bin=spatial_bin,
+            pca_priority=dimred_priority,
+            pca_solver=dimred_pca_solver,
         )
         self.data_dimred = res.reduced
         self.dimred_mapping = res.mapping

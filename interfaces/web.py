@@ -239,6 +239,9 @@ def main() -> None:
             dimred_enabled = st.checkbox("Включить DimRed", value=False)
             dimred_method = "variance"
             dimred_target = 50
+            dimred_target_var = 0.0
+            dimred_priority = "explained_variance"
+            dimred_pca_solver = "full"
             if dimred_enabled:
                 st.caption("Если у вас 100+ каналов, анализ будет долгим. Выберите метод сжатия:")
                 dimred_method = st.selectbox(
@@ -247,9 +250,16 @@ def main() -> None:
                         "variance (оставить самые меняющиеся)",
                         "kmeans (объединить похожие в кластеры)",
                         "spatial (усреднить по соседним вокселям)",
+                        "pca_full (PCA: полный SVD)",
+                        "pca_randomized (PCA: randomized SVD)",
+                        "pca_gram (PCA: грам-матрица XX^T)",
                     ],
                 )
-                dimred_target = st.slider("Сколько каналов оставить?", 10, 500, 50)
+                st.caption("Цель: либо K компонент, либо доля объяснённой дисперсии.")
+                dimred_target = int(st.number_input("K (сколько компонент/каналов оставить, 0=авто)", min_value=0, max_value=50000, value=50, step=10))
+                dimred_target_var = float(st.number_input("Explained variance (0..1, пусто/0=не использовать)", min_value=0.0, max_value=1.0, value=0.0, step=0.05, format="%.3f"))
+                dimred_priority = st.selectbox("Приоритет (если заданы и K, и explained variance)", ["explained_variance", "n_components"], index=0)
+                dimred_pca_solver = st.selectbox("PCA solver (только для pca_full)", ["full", "randomized", "gram"], index=0, help="Если метод выбран как pca_* — solver берётся из метода. Здесь это для pca_full.")
                 if dimred_method.startswith("kmeans"):
                     st.caption("K-Means: Группирует похожие временные ряды в один 'средний' ряд.")
                 elif dimred_method.startswith("spatial"):
@@ -531,8 +541,11 @@ def main() -> None:
                     window_cube_eval_limit=int(window_cube_eval_limit),
                     method_options=method_options,
                     dimred_enabled=bool(dimred_enabled),
-                    dimred_method=("variance" if str(dimred_method).startswith("variance") else ("kmeans" if str(dimred_method).startswith("kmeans") else "spatial")),
+                    dimred_method=str(dimred_method).split()[0],
                     dimred_target=int(dimred_target),
+                    dimred_target_var=(float(dimred_target_var) if float(dimred_target_var) > 0 else None),
+                    dimred_priority=str(dimred_priority),
+                    dimred_pca_solver=str(dimred_pca_solver),
                     # scans
                     scan_window_pos=(bool(scan_window_pos) if include_scans else False),
                     scan_window_size=(bool(scan_window_size) if include_scans else False),
