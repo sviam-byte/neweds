@@ -540,6 +540,22 @@ class HTMLReportGenerator:
             if ad.get("enabled"):
                 prep_lines.append("<b>Auto-diff</b>: дифференцированы " + html.escape(", ".join(map(str, ad.get("differenced", []))) or "—"))
 
+            dr = prep.get("dimred") or {}
+            if dr.get("enabled"):
+                method = html.escape(str(dr.get("method") or "—"))
+                n_before = dr.get("n_before")
+                n_after = dr.get("n_after")
+                priority = html.escape(str(dr.get("priority") or "—"))
+                explained = dr.get("explained_var")
+                ev_txt = ""
+                try:
+                    ev_txt = f", explained_var={float(explained):.4g}" if explained is not None else ""
+                except Exception:
+                    ev_txt = ""
+                prep_lines.append(
+                    f"<b>DimRed</b>: {method} ({n_before} → {n_after}), приоритет={priority}{ev_txt}"
+                )
+
             prep_html = "<div class='meta'>" + "<br/>".join(prep_lines) + "</div>" if prep_lines else ""
 
             harm = {}
@@ -630,6 +646,7 @@ class HTMLReportGenerator:
             else:
                 for name, d in diag.items():
                     season = d.get("seasonality") or {}
+                    ac = d.get("autocorr") or {}
                     fftp = d.get("fft_peaks") or {}
 
                     def _fmt(x) -> str:
@@ -679,6 +696,11 @@ class HTMLReportGenerator:
                         "<div><b>Sample entropy</b>: " + _fmt(d.get("sample_entropy")) + "</div>"
                         "<div><b>Shannon H</b>: " + _fmt(d.get("shannon_entropy")) + "</div>"
                         "<div><b>Permutation H</b>: " + _fmt(d.get("permutation_entropy")) + "</div>"
+                        "<div><b>ACF лаг-1</b>: " + _fmt(ac.get("rho1")) + "</div>"
+                        "<div><b>AR(1) φ</b>: " + _fmt(ac.get("phi_ar1")) + "</div>"
+                        "<div><b>τ_int</b>: " + _fmt(ac.get("tau_int")) + "</div>"
+                        "<div><b>N_eff</b>: " + _fmt(ac.get("n_eff")) + "</div>"
+                        "<div><b>Ljung–Box</b>: p=" + _fmt(ac.get("lb_p")) + " (lags=" + _fmt(ac.get("lb_lags")) + ")</div>"
                         "<div><b>ACF сезонность</b>: период="
                         + _fmt(season.get("acf_period"))
                         + ", сила="

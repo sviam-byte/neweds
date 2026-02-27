@@ -12,6 +12,11 @@ from scipy.signal import find_peaks
 from statsmodels.tsa.stattools import adfuller
 
 try:
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+except Exception:  # pragma: no cover - optional dependency path
+    acorr_ljungbox = None
+
+try:
     import nolds
 except ImportError:  # pragma: no cover - optional dependency path
     nolds = None
@@ -404,4 +409,84 @@ def detect_seasonality(series: pd.Series, fs: float = 1.0, max_period: int | Non
         "acf_strength": acf_strength,
         "fft_period": fft_period,
         "fft_freq": fft_freq,
+    }
+
+
+def autocorr_summary(series: pd.Series, *, max_lag: int | None = None) -> dict:
+    """Возвращает компактную сводку автокорреляции ряда.
+
+    Метрики:
+      - rho1: автокорреляция на лаге 1;
+      - phi_ar1: OLS-оценка коэффициента AR(1);
+      - tau_int: интегральное время корреляции (оценка);
+      - n_eff: эффективный размер выборки;
+      - lb_p / lb_lags: p-value теста Ljung–Box и число лагов.
+    """
+    arr = _coerce_1d_numeric(series)
+    n = int(arr.size)
+    if n < 6:
+        return {
+            "rho1": None,
+            "phi_ar1": None,
+            "tau_int": None,
+            "n_eff": None,
+            "lb_p": None,
+            "lb_lags": None,
+        }
+
+    x = np.asarray(arr, dtype=float)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    if n < 6:
+        return {"rho1": None, "phi_ar1": None, "tau_int": None, "n_eff": None, "lb_p": None, "lb_lags": None}
+
+    x0 = x[:-1]
+    x1 = x[1:]
+    m = np.isfinite(x0) & np.isfinite(x1)
+    rho1 = None
+    phi = None
+    if int(m.sum()) >= 5:
+        a = x0[m]
+        b = x1[m]
+        sa = float(np.std(a))
+        sb = float(np.std(b))
+        if sa * sb > 1e-12:
+            rho1 = float(np.corrcoef(a, b)[0, 1])
+        den = float(np.dot(a, a))
+        if den > 1e-12 and np.isfinite(den):
+            phi = float(np.dot(a, b) / den)
+
+    xz = x - float(np.mean(x))
+    vx = float(np.var(xz))
+    tau_int = None
+    n_eff = None
+    if np.isfinite(vx) and vx > 1e-12:
+        max_l = int(min(n - 1, max_lag if max_lag is not None else max(10, n // 4)))
+        ac = np.correlate(xz, xz, mode="full")[n - 1:]
+        ac = ac / (ac[0] + 1e-12)
+        seg = np.asarray(ac[1:max_l + 1], dtype=float)
+        # Усечённая сумма по положительным ACF для устойчивой оценки.
+        pos = seg[seg > 0]
+        tau = 1.0 + 2.0 * float(np.sum(pos)) if pos.size else 1.0
+        tau = max(1.0, tau)
+        tau_int = float(tau)
+        n_eff = float(max(1.0, n / tau))
+
+    lb_p = None
+    lb_lags = int(max(1, min(n // 5, 20)))
+    if acorr_ljungbox is not None and n >= max(12, 3 * lb_lags):
+        try:
+            res = acorr_ljungbox(x, lags=[lb_lags], return_df=True)
+            pv = float(res["lb_pvalue"].iloc[0])
+            lb_p = pv if np.isfinite(pv) else None
+        except Exception:
+            lb_p = None
+
+    return {
+        "rho1": rho1,
+        "phi_ar1": phi,
+        "tau_int": tau_int,
+        "n_eff": n_eff,
+        "lb_p": lb_p,
+        "lb_lags": lb_lags,
     }

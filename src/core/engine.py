@@ -2184,9 +2184,39 @@ class BigMasterTool:
                 if stat is None:
                     continue
                 if pval is not None and pval > 0.05:
-                    self.data[col] = self.data[col].diff().fillna(0)
+                    # ВАЖНО: после diff первый элемент становится NaN; если просто fillna(0),
+                    # в ряде появляется искусственный «ступенчатый» артефакт.
+                    # Поэтому явно задаём первый элемент и выполняем стабилизацию масштаба.
+                    s = pd.to_numeric(self.data[col], errors="coerce").astype(float)
+                    d = s.diff()
+                    if len(d) > 0:
+                        d.iloc[0] = 0.0
+
+                    # Центрирование/масштабирование после дифференцирования:
+                    # это снижает риск доминирования отдельных рядов по дисперсии.
+                    mean_d = d.mean(skipna=True)
+                    mu = float(mean_d) if np.isfinite(mean_d) else 0.0
+                    d = d - mu
+                    std_d = d.std(skipna=True)
+                    sd = float(std_d) if np.isfinite(std_d) else 0.0
+                    if sd > 1e-12:
+                        d = d / sd
+
+                    self.data[col] = d.fillna(0.0)
                     diff_count += 1
                     self.autodiff_report.setdefault("differenced", []).append(col)
+
+                    # Метаданные для прозрачности отчёта: что именно было сделано.
+                    try:
+                        self.autodiff_report.setdefault("stabilized", {})
+                        self.autodiff_report["stabilized"][str(col)] = {
+                            "centered": True,
+                            "scaled": bool(sd > 1e-12),
+                            "mean_removed": float(mu),
+                            "std_after_diff": float(sd),
+                        }
+                    except Exception:
+                        pass
 
             if diff_count > 0:
                 logging.warning("Применено дифференцирование к %s нестационарным рядам.", diff_count)
@@ -3512,6 +3542,12 @@ class BigMasterTool:
             rep["preprocess"] = {"enabled": None, "steps_global": [], "steps_by_column": {}, "dropped_columns": [], "notes": {}}
 
         rep["autodiff"] = dict(self.autodiff_report or {"enabled": False, "differenced": []})
+        # В отчёт включаем и dimred, чтобы UI/HTML мог корректно объяснить
+        # итоговое число признаков и стратегию выбора компонент.
+        try:
+            rep["dimred"] = dict(getattr(self, "dimred_report", {}) or {})
+        except Exception:
+            rep["dimred"] = {}
         return rep
 
     def get_harmonics(self, top_k: int = 5, fs: float | None = None) -> dict:
@@ -3535,6 +3571,7 @@ class BigMasterTool:
             adf_stat, adf_p = analysis_stats.test_stationarity(series)
             season = analysis_stats.detect_seasonality(series)
             fft_pk = analysis_stats.fft_peaks(series, top_k=3)
+            ac = analysis_stats.autocorr_summary(series)
             diagnostics[col] = {
                 "adf_stat": adf_stat,
                 "adf_p": adf_p,
@@ -3546,6 +3583,7 @@ class BigMasterTool:
                 "shannon_entropy": analysis_stats.shannon_entropy(series),
                 "permutation_entropy": analysis_stats.permutation_entropy(series, order=3, delay=1, normalize=True),
                 "seasonality": season,
+                "autocorr": ac,
                 "fft_peaks": fft_pk,
             }
         return diagnostics
