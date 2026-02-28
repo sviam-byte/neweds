@@ -2439,7 +2439,7 @@ class BigMasterTool:
         pair_mode = str(kwargs.get("pair_mode") or "auto").lower()
         auto_thr = int(kwargs.get("pair_auto_threshold") or 0)
         if auto_thr <= 0:
-            auto_thr = 600
+            auto_thr = 500
 
         def _parse_pairs_text(text: str) -> list[tuple[int, int]]:
             """Parse user pairs like: a-b; a->b; 0-1; 0->1.
@@ -2539,11 +2539,25 @@ class BigMasterTool:
         # Определяем итоговый список пар
         pairs_idx: Optional[list[tuple[int, int]]] = None
         if pair_mode == "auto":
-            pair_mode = "neighbors" if n_cols >= auto_thr else "full"
+            _has_coords = (
+                getattr(self, "coords_df", None) is not None
+                and self.coords_df is not None
+                and not getattr(self.coords_df, "empty", True)
+            )
+            if n_cols >= auto_thr and _has_coords:
+                pair_mode = "neighbors"
+            elif n_cols >= auto_thr:
+                pair_mode = "random"
+                logging.info("[auto pair_mode] N=%d >= %d, no coords -> random", n_cols, auto_thr)
+            else:
+                pair_mode = "full"
         if pair_mode == "pairs":
             pairs_idx = _parse_pairs_text(str(kwargs.get("pairs_text") or ""))
         elif pair_mode == "neighbors":
             pairs_idx = _build_neighbor_pairs(str(kwargs.get("neighbor_kind") or "26"), int(kwargs.get("neighbor_radius") or 1))
+            if not pairs_idx and n_cols >= auto_thr:
+                logging.info("[pair_mode] neighbors empty, fallback -> random for N=%d", n_cols)
+                pair_mode = "random"
         elif pair_mode == "random":
             # Случайные неориентированные пары (если нет coords), с фиксированным seed.
             max_pairs = int(max(1, kwargs.get("max_pairs") or 50000))
@@ -2570,6 +2584,24 @@ class BigMasterTool:
             )
 
         # Выбор лага
+        # OOM guard для режимов, где может собираться полная NxN матрица.
+        _mat_gb = (n_cols * n_cols * 8) / (1024**3)
+        if pairs_idx is None and _mat_gb > 8.0:
+            logging.error("[memory] Matrix %dx%d=%.1fGB>8GB, forcing random.", n_cols, n_cols, _mat_gb)
+            _rng = np.random.default_rng(12345)
+            _mp = min(n_cols * 5, 500_000)
+            _ps: set[tuple[int, int]] = set()
+            _bi = _rng.integers(0, n_cols, size=_mp * 3)
+            _bj = _rng.integers(0, n_cols, size=_mp * 3)
+            for _ii, _jj in zip(_bi, _bj):
+                if _ii != _jj:
+                    _ps.add((int(min(_ii, _jj)), int(max(_ii, _jj))))
+                if len(_ps) >= _mp:
+                    break
+            pairs_idx = list(_ps)
+            meta["pair_mode"] = "random (OOM guard)"
+            meta["pairs_count"] = len(pairs_idx)
+
         supports_lag = is_directed_method(variant) or variant.startswith("granger") or variant.startswith("te_") or variant.startswith("ah_")
         lag_sel = (kwargs.get("lag_selection") or self.config.lag_selection or "optimize").lower()
         max_lag = int(kwargs.get("max_lag") or self.config.max_lag or 1)
