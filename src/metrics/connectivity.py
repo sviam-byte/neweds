@@ -311,6 +311,20 @@ def lagged_directed_correlation(
         out[i, j] = _corr_1d(X[: T - lag, i], X[lag:, j])
     return out
 
+def _neighbor_counts_with_fallback(tree: cKDTree, points: np.ndarray, eps: np.ndarray) -> np.ndarray:
+    """Counts neighbors per-point under Chebyshev metric with SciPy-version fallback."""
+    try:
+        neighbors = tree.query_ball_point(points, r=eps, p=np.inf)
+        return np.array([max(0, len(lst) - 1) for lst in neighbors], dtype=float)
+    except (TypeError, ValueError):
+        n = int(points.shape[0])
+        return np.fromiter(
+            (max(0, len(tree.query_ball_point(points[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)),
+            dtype=float,
+            count=n,
+        )
+
+
 def _knn_mutual_info(x: np.ndarray, y: np.ndarray, k: int = DEFAULT_K_MI) -> float:
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -328,16 +342,8 @@ def _knn_mutual_info(x: np.ndarray, y: np.ndarray, k: int = DEFAULT_K_MI) -> flo
     tree_x = cKDTree(x.reshape(-1, 1))
     tree_y = cKDTree(y.reshape(-1, 1))
 
-    nx = np.fromiter(
-        (max(0, len(tree_x.query_ball_point([x[i]], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)),
-        dtype=float,
-        count=n,
-    )
-    ny = np.fromiter(
-        (max(0, len(tree_y.query_ball_point([y[i]], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)),
-        dtype=float,
-        count=n,
-    )
+    nx = _neighbor_counts_with_fallback(tree_x, x.reshape(-1, 1), eps)
+    ny = _neighbor_counts_with_fallback(tree_y, y.reshape(-1, 1), eps)
     mi = digamma(n) + digamma(int(k)) - np.mean(digamma(nx + 1.0) + digamma(ny + 1.0))
     return float(max(0.0, mi)) if np.isfinite(mi) else float("nan")
 
@@ -366,9 +372,9 @@ def _knn_conditional_mutual_info(x: np.ndarray, y: np.ndarray, z: np.ndarray, k:
     tree_yz = cKDTree(yz)
     tree_z = cKDTree(z)
 
-    nxz = np.fromiter((max(0, len(tree_xz.query_ball_point(xz[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)), dtype=float, count=n)
-    nyz = np.fromiter((max(0, len(tree_yz.query_ball_point(yz[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)), dtype=float, count=n)
-    nz = np.fromiter((max(0, len(tree_z.query_ball_point(z[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)), dtype=float, count=n)
+    nxz = _neighbor_counts_with_fallback(tree_xz, xz, eps)
+    nyz = _neighbor_counts_with_fallback(tree_yz, yz, eps)
+    nz = _neighbor_counts_with_fallback(tree_z, z, eps)
 
     cmi = digamma(int(k)) - np.mean(digamma(nxz + 1.0) + digamma(nyz + 1.0) - digamma(nz + 1.0))
     return float(max(0.0, cmi)) if np.isfinite(cmi) else float("nan")

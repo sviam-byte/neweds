@@ -232,13 +232,31 @@ def _knn_entropy(X, k=DEFAULT_K_MI):
     return digamma(N) - digamma(k) + np.mean(np.log(2 * r + 1e-10)) 
 
 
+def _neighbor_counts_with_fallback(tree: cKDTree, points: np.ndarray, eps: np.ndarray) -> np.ndarray:
+    """Подсчёт соседей в радиусе eps для каждой точки с fallback для старого SciPy.
+
+    Возвращает количество соседей без учёта самой точки (len(list)-1).
+    """
+    try:
+        # Современный SciPy: batch-подсчёт для массива точек и массива радиусов.
+        neighbors = tree.query_ball_point(points, r=eps, p=np.inf)
+        return np.array([max(0, len(lst) - 1) for lst in neighbors], dtype=float)
+    except (TypeError, ValueError):
+        # Старый SciPy может не поддерживать массив r/или batch-формат.
+        n = int(points.shape[0])
+        return np.fromiter(
+            (max(0, len(tree.query_ball_point(points[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)),
+            dtype=float,
+            count=n,
+        )
+
+
 def _knn_mutual_info(X, Y, k=DEFAULT_K_MI):
     """KSG-оценка взаимной информации I(X;Y) через kNN (max-норма).
 
-    Правки относительно наивных реализаций:
-    - строгий eps (nextafter) для устойчивости к ties;
-    - исключаем саму точку из подсчёта соседей;
-    - используем ψ(nx+1), ψ(ny+1).
+    Оптимизация:
+    - используем batch query_ball_point, чтобы уменьшить Python-цикл;
+    - сохраняем fallback на поэлементный подсчёт для старых версий SciPy.
     """
     X = np.asarray(X, dtype=np.float64).ravel()
     Y = np.asarray(Y, dtype=np.float64).ravel()
@@ -251,23 +269,13 @@ def _knn_mutual_info(X, Y, k=DEFAULT_K_MI):
     XY = np.c_[X, Y]
     tree_XY = cKDTree(XY)
     d, _ = tree_XY.query(XY, k=int(k) + 1, p=np.inf)
-    eps = d[:, int(k)]
-    # строгий радиус
-    eps = np.nextafter(eps, 0.0)
+    eps = np.nextafter(d[:, int(k)], 0.0)
 
     tree_X = cKDTree(X.reshape(-1, 1))
     tree_Y = cKDTree(Y.reshape(-1, 1))
 
-    nx = np.fromiter(
-        (max(0, len(tree_X.query_ball_point([X[i]], r=float(eps[i]), p=np.inf)) - 1) for i in range(N)),
-        dtype=float,
-        count=N,
-    )
-    ny = np.fromiter(
-        (max(0, len(tree_Y.query_ball_point([Y[i]], r=float(eps[i]), p=np.inf)) - 1) for i in range(N)),
-        dtype=float,
-        count=N,
-    )
+    nx = _neighbor_counts_with_fallback(tree_X, X.reshape(-1, 1), eps)
+    ny = _neighbor_counts_with_fallback(tree_Y, Y.reshape(-1, 1), eps)
 
     raw_mi = digamma(N) + digamma(int(k)) - np.mean(digamma(nx + 1.0) + digamma(ny + 1.0))
     if not np.isfinite(raw_mi):
@@ -329,21 +337,9 @@ def _knn_conditional_mutual_info(X, Y, Z, k=DEFAULT_K_MI):
     tree_YZ = cKDTree(YZ)
     tree_Z = cKDTree(Z)
 
-    nxz = np.fromiter(
-        (max(0, len(tree_XZ.query_ball_point(XZ[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(N)),
-        dtype=float,
-        count=N,
-    )
-    nyz = np.fromiter(
-        (max(0, len(tree_YZ.query_ball_point(YZ[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(N)),
-        dtype=float,
-        count=N,
-    )
-    nz = np.fromiter(
-        (max(0, len(tree_Z.query_ball_point(Z[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(N)),
-        dtype=float,
-        count=N,
-    )
+    nxz = _neighbor_counts_with_fallback(tree_XZ, XZ, eps)
+    nyz = _neighbor_counts_with_fallback(tree_YZ, YZ, eps)
+    nz = _neighbor_counts_with_fallback(tree_Z, Z, eps)
 
     cmi = digamma(int(k)) - np.mean(digamma(nxz + 1.0) + digamma(nyz + 1.0) - digamma(nz + 1.0))
     if not np.isfinite(cmi):
