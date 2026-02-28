@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .preprocessing import additional_preprocessing
-from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import adfuller
 import numpy as np
 from scipy import stats
@@ -221,6 +220,18 @@ def read_input_table(
         kw: Dict[str, Any] = {"header": None, "low_memory": False}
         if csv_engine in {"pyarrow", "c", "python"}:
             kw["engine"] = csv_engine
+        elif csv_engine == "auto":
+            # Автовыбор: pyarrow обычно существенно быстрее на больших CSV.
+            # Если пакет недоступен, мягко падаем на pandas default-engine.
+            try:
+                import pyarrow  # noqa: F401
+
+                kw["engine"] = "pyarrow"
+            except ImportError:
+                pass
+        # pandas+pyarrow не поддерживает low_memory.
+        if kw.get("engine") == "pyarrow":
+            kw.pop("low_memory", None)
         df0 = pd.read_csv(fp, **kw)
     else:
         xl_usecols = usecols
@@ -295,13 +306,18 @@ def tidy_timeseries_table(
         out = out.drop(columns=[time_col])
 
     out = out.apply(pd.to_numeric, errors="coerce")
-    # Vectorized: не трогаем Series.notna() поштучно (оно тащит attrs/deepcopy в некоторых версиях pandas).
+    # Векторная фильтрация колонок: одна операция по всему numpy-массиву.
+    # Это быстрее и меньше нагружает attrs/deepcopy-путь pandas.
     try:
-        col_frac = out.notna().mean(axis=0)
+        arr = out.to_numpy()
+        if arr.dtype.kind == "f":
+            col_frac = np.isfinite(arr).mean(axis=0)
+        else:
+            col_frac = pd.notna(arr).mean(axis=0)
         out = out.loc[:, col_frac >= 0.2]
     except Exception:
-        good = [c for c in out.columns if pd.notna(out[c].to_numpy()).mean() >= 0.2]
-        out = out[good]
+        col_frac = out.notna().mean(axis=0)
+        out = out.loc[:, col_frac >= 0.2]
 
     if transpose not in {"auto", "yes", "no"}:
         raise ValueError("transpose must be one of: auto|yes|no")
@@ -616,28 +632,60 @@ def preprocess_timeseries(
         action = str(outlier_action or "mask")
         report.add(f"[Preprocess] outliers: rule={rule}, action={action}")
         total = 0
-        for col in out.columns:
-            if not pd.api.types.is_numeric_dtype(out[col]):
-                continue
-            x = out[col].astype(float).to_numpy()
-            y, msk = _apply_outliers_1d(
-                x,
-                rule=rule,
-                action=action,
-                z=float(outlier_z),
-                k=float(outlier_k),
-                abs_thr=(None if outlier_abs is None else float(outlier_abs)),
-                p_low=float(outlier_p_low),
-                p_high=float(outlier_p_high),
-                hampel_window=int(outlier_hampel_window),
-                jump_thr=(None if outlier_jump_thr is None else float(outlier_jump_thr)),
-                local_median_window=int(outlier_local_median_window),
-            )
-            n = int(np.sum(msk))
-            if n:
-                total += n
-                out[col] = y
-                report.add(f"[Preprocess] outliers: n={n}", col=col)
+        # Быстрый векторный путь для robust_z/mad на всех numeric-колонках.
+        num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+        if rule in {"robust", "robust_z", "mad"} and num_cols:
+            arr = out[num_cols].to_numpy(dtype=np.float64)
+            medians = np.nanmedian(arr, axis=0)
+            mad = np.nanmedian(np.abs(arr - medians[np.newaxis, :]), axis=0) * 1.4826 + 1e-12
+            z_scores = np.abs((arr - medians[np.newaxis, :]) / mad[np.newaxis, :])
+            outlier_mask = z_scores > float(outlier_z)
+            outlier_mask[~np.isfinite(arr)] = False
+            total = int(outlier_mask.sum())
+            if total > 0:
+                if action in {"mask", "nan"}:
+                    arr[outlier_mask] = np.nan
+                elif action == "median":
+                    for j in range(arr.shape[1]):
+                        arr[outlier_mask[:, j], j] = medians[j]
+                elif action in {"clip", "winsorize"}:
+                    lo = np.nanpercentile(arr, float(outlier_p_low), axis=0)
+                    hi = np.nanpercentile(arr, float(outlier_p_high), axis=0)
+                    for j in range(arr.shape[1]):
+                        col_mask = outlier_mask[:, j]
+                        arr[col_mask, j] = np.clip(arr[col_mask, j], lo[j], hi[j])
+                else:
+                    arr[outlier_mask] = np.nan
+                out[num_cols] = arr
+
+            for j, c in enumerate(num_cols):
+                n_col = int(outlier_mask[:, j].sum())
+                if n_col:
+                    report.add(f"[Preprocess] outliers: n={n_col}", col=c)
+        else:
+            # Fallback: построчная обработка для остальных правил.
+            for col in out.columns:
+                if not pd.api.types.is_numeric_dtype(out[col]):
+                    continue
+                x = out[col].astype(float).to_numpy()
+                y, msk = _apply_outliers_1d(
+                    x,
+                    rule=rule,
+                    action=action,
+                    z=float(outlier_z),
+                    k=float(outlier_k),
+                    abs_thr=(None if outlier_abs is None else float(outlier_abs)),
+                    p_low=float(outlier_p_low),
+                    p_high=float(outlier_p_high),
+                    hampel_window=int(outlier_hampel_window),
+                    jump_thr=(None if outlier_jump_thr is None else float(outlier_jump_thr)),
+                    local_median_window=int(outlier_local_median_window),
+                )
+                n = int(np.sum(msk))
+                if n:
+                    total += n
+                    out[col] = y
+                    report.add(f"[Preprocess] outliers: n={n}", col=col)
         report.add(f"[Preprocess] outliers total: {total}")
 
     if fill_missing:
@@ -951,8 +999,11 @@ def preprocess_timeseries(
             report.add("[Preprocess] normalize: off")
         elif mode in {"z", "zscore", "standard"}:
             report.add("[Preprocess] normalize: z-score (mean/std) per series")
-            scaler = StandardScaler()
-            out[cols] = scaler.fit_transform(out[cols])
+            arr = out[cols].to_numpy(dtype=np.float64)
+            means = np.nanmean(arr, axis=0)
+            stds = np.nanstd(arr, axis=0)
+            stds[stds < 1e-12] = 1.0
+            out[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
         elif mode in {"robust", "robust_z", "mad"}:
             report.add("[Preprocess] normalize: robust z-score (median/MAD) per series")
             for col in cols:
@@ -970,8 +1021,11 @@ def preprocess_timeseries(
                 out[col] = _rank_normalize_1d(x, mode=rmode, ties=str(rank_ties))
         else:
             report.add(f"[Preprocess] normalize: unknown mode '{mode}', fallback to z-score")
-            scaler = StandardScaler()
-            out[cols] = scaler.fit_transform(out[cols])
+            arr = out[cols].to_numpy(dtype=np.float64)
+            means = np.nanmean(arr, axis=0)
+            stds = np.nanstd(arr, axis=0)
+            stds[stds < 1e-12] = 1.0
+            out[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
 
     if check_stationarity:
         report.add("[Preprocess] stationarity check: ADF")

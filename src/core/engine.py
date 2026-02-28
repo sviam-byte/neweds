@@ -42,7 +42,6 @@ from scipy.signal import coherence, find_peaks
 from scipy.spatial import cKDTree
 from scipy.special import digamma
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
 from statsmodels.graphics.tsaplots import plot_acf
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
@@ -2260,7 +2259,7 @@ class BigMasterTool:
         return self.data
 
     def normalize_data(self) -> None:
-        """Нормализация данных (Z-score)."""
+        """Нормализация данных (Z-score). Векторизовано через numpy."""
         if self.data.empty:
             logging.warning("Нет данных для нормализации.")
             return
@@ -2268,9 +2267,12 @@ class BigMasterTool:
         self._stage("Нормализация", 0.75)
 
         cols = [c for c in self.data.columns if pd.api.types.is_numeric_dtype(self.data[c])]
-        scaler = StandardScaler()
         self.data_normalized = self.data.copy()
-        self.data_normalized[cols] = scaler.fit_transform(self.data[cols])
+        arr = self.data_normalized[cols].to_numpy(dtype=np.float64)
+        means = np.nanmean(arr, axis=0)
+        stds = np.nanstd(arr, axis=0)
+        stds[stds < 1e-12] = 1.0
+        self.data_normalized[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
         logging.info("Данные нормализованы.")
 
     def _apply_fdr_correction(self) -> None:
