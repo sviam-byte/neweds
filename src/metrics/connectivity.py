@@ -18,7 +18,7 @@ from statsmodels.tsa.vector_ar.var_model import VAR
 from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 
 # Порог пар, с которого пробуем распараллеливание тяжёлых покомпонентных расчётов.
-_PARALLEL_PAIR_THRESHOLD = 800
+_PARALLEL_PAIR_THRESHOLD = 200
 # Верхняя граница автоматически сэмплируемых пар для очень больших матриц.
 _MAX_AUTO_RANDOM_PAIRS = 500_000
 
@@ -185,6 +185,24 @@ def _residualize_df(df: pd.DataFrame, control: Optional[list[str]] = None, contr
     return out, desc
 
 
+def _fast_corr_matrix(X: np.ndarray) -> np.ndarray:
+    """Vectorized Pearson correlation via numpy для больших матриц."""
+    X = np.asarray(X, dtype=np.float64)
+    col_means = np.nanmean(X, axis=0)
+    nan_mask = ~np.isfinite(X)
+    if nan_mask.any():
+        X = X.copy()
+        for j in range(X.shape[1]):
+            X[nan_mask[:, j], j] = col_means[j]
+    X_centered = X - X.mean(axis=0, keepdims=True)
+    norms = np.sqrt((X_centered ** 2).sum(axis=0, keepdims=True))
+    norms[norms < 1e-12] = 1.0
+    X_normed = X_centered / norms
+    C = X_normed.T @ X_normed
+    np.clip(C, -1.0, 1.0, out=C)
+    return C
+
+
 def correlation_matrix(
     data: pd.DataFrame,
     lag: int = 1,
@@ -203,15 +221,12 @@ def correlation_matrix(
         for i, j in _iter_pairs(n_cols, pairs, directed=False):
             out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
         return out
-    if n_cols <= 20_000:
-        return data.corr().values
-
-    effective = _get_effective_pairs(n_cols, None, directed=False)
+    # Векторный numpy-путь: быстрее pandas .corr() и лучше масштабируется.
+    # При наличии NaN сохраняем pairwise-поведение pandas для корректности.
     X = _prepare_numpy(data)
-    out = _init_matrix(n_cols, 0.0, diag=1.0)
-    for i, j in effective:
-        out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
-    return out
+    if not np.isfinite(X).all():
+        return data.corr().values
+    return _fast_corr_matrix(X)
 
 def partial_correlation_matrix(
     df: pd.DataFrame,
@@ -221,7 +236,10 @@ def partial_correlation_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    """Частная корреляция."""
+    """Частная корреляция.
+
+    Оптимизация: через матрицу точности (inverse correlation) для all-vs-all.
+    """
     cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     n_cols = len(cols)
     n_rows = len(df)
@@ -229,7 +247,7 @@ def partial_correlation_matrix(
         sub = df[cols].copy()
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
         if pairs is None:
-            return sub.corr().values
+            return _fast_corr_matrix(sub.to_numpy(dtype=np.float64, copy=False))
         n = int(len(cols))
         out = _init_matrix(n, 0.0, diag=1.0)
         X = sub.to_numpy(dtype=np.float64, copy=False)
@@ -239,19 +257,28 @@ def partial_correlation_matrix(
     if n_rows <= n_cols + 2:
         logging.warning("Слишком мало данных для Partial Correlation: строк %s <= колонок %s. Возвращаю NaN.", n_rows, n_cols)
         return np.full((n_cols, n_cols), np.nan)
-    if n_cols > 200 and control is None and pairs is None:
+    # pcor(i,j) = -P(i,j)/sqrt(P(i,i)*P(j,j)); считаем один раз за O(N^3).
+    if pairs is None or n_cols <= 500:
         try:
-            R = df[cols].corr().values
+            R = _fast_corr_matrix(_prepare_numpy(df[cols]))
             P = np.linalg.pinv(R)
             d = np.sqrt(np.abs(np.diag(P)))
             d[d < 1e-12] = 1.0
             pcor = -P / np.outer(d, d)
             np.fill_diagonal(pcor, 1.0)
+            if pairs is not None:
+                out = _init_matrix(n_cols, 0.0, diag=1.0)
+                for i, j in _iter_pairs(n_cols, pairs, directed=False):
+                    out[i, j] = out[j, i] = pcor[i, j]
+                return out
             return pcor
         except Exception:
             pass
+
+    # Fallback для очень больших N при точечных pairs.
     out = _init_matrix(n_cols, 0.0, diag=1.0)
     effective = _get_effective_pairs(n_cols, pairs, directed=False)
+    X = _prepare_numpy(df[cols])
     for i, j in effective:
         xi, xj = cols[i], cols[j]
         ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
@@ -289,26 +316,40 @@ def lagged_directed_correlation(
     if T <= lag + 3:
         return _init_matrix(n_cols, 0.0, diag=0.0)
 
-    # Быстрый векторизованный путь для dense-случая без NaN.
+    x_past = X[: T - lag]
+    x_future = X[lag:]
+
+    # Векторный путь: заполняем NaN средними по колонке и считаем матрицу сразу.
     if pairs is None and n_cols <= 10_000:
-        x_past = X[: T - lag]
-        x_future = X[lag:]
-        if not (np.any(~np.isfinite(x_past)) or np.any(~np.isfinite(x_future))):
-            t_eff = T - lag
-            past_centered = x_past - x_past.mean(axis=0, keepdims=True)
-            fut_centered = x_future - x_future.mean(axis=0, keepdims=True)
-            sp = np.sqrt((past_centered**2).sum(axis=0, keepdims=True))
-            sf = np.sqrt((fut_centered**2).sum(axis=0, keepdims=True))
-            sp[sp < 1e-12] = 1.0
-            sf[sf < 1e-12] = 1.0
-            out = (past_centered / sp).T @ (fut_centered / sf) / t_eff
-            np.fill_diagonal(out, 0.0)
-            return out
+        past = x_past.copy()
+        future = x_future.copy()
+        for arr in (past, future):
+            nan_mask = ~np.isfinite(arr)
+            if nan_mask.any():
+                col_means = np.nanmean(arr, axis=0)
+                for j in range(arr.shape[1]):
+                    arr[nan_mask[:, j], j] = col_means[j]
+
+        t_eff = past.shape[0]
+        past_centered = past - past.mean(axis=0, keepdims=True)
+        fut_centered = future - future.mean(axis=0, keepdims=True)
+        sp = np.sqrt((past_centered**2).sum(axis=0, keepdims=True))
+        sf = np.sqrt((fut_centered**2).sum(axis=0, keepdims=True))
+        sp[sp < 1e-12] = 1.0
+        sf[sf < 1e-12] = 1.0
+        out = (past_centered / sp).T @ (fut_centered / sf) / t_eff
+        np.fill_diagonal(out, 0.0)
+        return out
 
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     out = _init_matrix(n_cols, 0.0, diag=0.0)
+    col_finite_past = np.isfinite(x_past)
+    col_finite_future = np.isfinite(x_future)
     for i, j in effective:
-        out[i, j] = _corr_1d(X[: T - lag, i], X[lag:, j])
+        mask = col_finite_past[:, i] & col_finite_future[:, j]
+        if int(mask.sum()) < 4:
+            continue
+        out[i, j] = _corr_1d(x_past[mask, i], x_future[mask, j])
     return out
 
 def _neighbor_counts_with_fallback(tree: cKDTree, points: np.ndarray, eps: np.ndarray) -> np.ndarray:
@@ -388,20 +429,20 @@ def mutual_info_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    """Взаимная информация (KSG kNN). Если pairs задан, считаем только эти пары."""
+    """Взаимная информация (KSG kNN). Оптимизировано: precompute numpy и масок."""
     n_vars = int(len(data.columns))
     effective = _get_effective_pairs(n_vars, pairs, directed=False)
     mi_matrix = _init_matrix(n_vars, 0.0, diag=0.0)
     X = _prepare_numpy(data)
+    col_finite = np.isfinite(X)
 
     def _compute_mi_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
         i, j = pair
-        xi = X[:, i]
-        xj = X[:, j]
-        mask = np.isfinite(xi) & np.isfinite(xj)
-        if int(mask.sum()) <= k:
+        mask = col_finite[:, i] & col_finite[:, j]
+        n_valid = int(mask.sum())
+        if n_valid <= k:
             return i, j, 0.0
-        v = _knn_mutual_info(xi[mask], xj[mask], k=k)
+        v = _knn_mutual_info(X[mask, i], X[mask, j], k=k)
         return i, j, float(v) if np.isfinite(v) else 0.0
 
     for i, j, value in _try_parallel(_compute_mi_pair, effective):
@@ -445,20 +486,20 @@ def coherence_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
+    """Mean coherence. Оптимизировано: precompute numpy и масок."""
     fs = fs if np.isfinite(fs) and fs > 0 else 1.0
     n_vars = int(data.shape[1])
     effective = _get_effective_pairs(n_vars, pairs, directed=False)
     coh = _init_matrix(n_vars, 0.0, diag=1.0)
     X = _prepare_numpy(data)
+    col_finite = np.isfinite(X)
     for i, j in effective:
-        xi = X[:, i]
-        xj = X[:, j]
-        mask = np.isfinite(xi) & np.isfinite(xj)
+        mask = col_finite[:, i] & col_finite[:, j]
         n = int(mask.sum())
         if n <= 3:
             continue
-        s1 = xi[mask].astype(np.float64)
-        s2 = xj[mask].astype(np.float64)
+        s1 = X[mask, i]
+        s2 = X[mask, j]
         nperseg = int(max(8, min(64, n // 2)))
         try:
             _, cxy = signal.coherence(s1, s2, fs=fs, nperseg=nperseg, detrend="constant")
@@ -481,15 +522,16 @@ def granger_matrix(
     columns = df.columns.tolist()
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     X = _prepare_numpy(df)
+    col_finite = np.isfinite(X)
+    min_obs = lag * 2 + 5
 
     def _compute_granger_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
         src, tgt = pair
-        x_src = X[:, src]
-        x_tgt = X[:, tgt]
-        mask = np.isfinite(x_src) & np.isfinite(x_tgt)
-        if int(mask.sum()) <= lag * 2 + 5:
+        mask = col_finite[:, src] & col_finite[:, tgt]
+        n_valid = int(mask.sum())
+        if n_valid <= min_obs:
             return src, tgt, 1.0
-        pair_df = pd.DataFrame({columns[tgt]: x_tgt[mask], columns[src]: x_src[mask]})
+        pair_df = pd.DataFrame({columns[tgt]: X[mask, tgt], columns[src]: X[mask, src]}, copy=False)
         try:
             tests = grangercausalitytests(pair_df, maxlag=int(lag), verbose=False)
             return src, tgt, float(tests[int(lag)][0]["ssr_ftest"][1])
@@ -632,15 +674,15 @@ def transfer_entropy_matrix(
     out = _init_matrix(n_cols, 0.0, diag=0.0)
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     X = _prepare_numpy(df)
+    col_finite = np.isfinite(X)
 
     def _compute_te_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
         src, tgt = pair
-        x_src = X[:, src]
-        x_tgt = X[:, tgt]
-        mask = np.isfinite(x_src) & np.isfinite(x_tgt)
-        if int(mask.sum()) <= lag:
+        mask = col_finite[:, src] & col_finite[:, tgt]
+        n_valid = int(mask.sum())
+        if n_valid <= lag:
             return src, tgt, 0.0
-        v = compute_te_jitter(x_src[mask], x_tgt[mask], lag=lag, bins=bins)
+        v = compute_te_jitter(X[mask, src], X[mask, tgt], lag=lag, bins=bins)
         return src, tgt, float(v) if np.isfinite(v) else 0.0
 
     for src, tgt, value in _try_parallel(_compute_te_pair, effective):
@@ -656,6 +698,7 @@ def transfer_entropy_matrix_partial(
     **extra: dict,
 ) -> np.ndarray:
     cols = list(df.columns); n_cols = len(cols); out = _init_matrix(n_cols, 0.0, diag=0.0)
+    X = _prepare_numpy(df)
     control_matrix = extra.get("control_matrix", None)
     def residualize(y, x_ctrl):
         if x_ctrl is None or x_ctrl.size == 0: return y
@@ -704,15 +747,31 @@ def coherence_matrix_partial(
     return coherence_matrix(sub, lag=lag, control=None, fs=fs, pairs=pairs)
 
 def _dcov_sq(x: np.ndarray, y: np.ndarray) -> float:
-    """Квадрат дистанционной ковариации (Székely et al. 2007)."""
+    """Квадрат дистанционной ковариации (Székely et al. 2007).
+
+    Для больших N используем subsampling, чтобы ограничить O(N^2) память/время.
+    """
     n = x.size
     if n < 4:
         return np.nan
+    max_n = 5000
+    if n > max_n:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n, size=max_n, replace=False)
+        x = x[idx]
+        y = y[idx]
+        n = max_n
     a = np.abs(x[:, None] - x[None, :])
     b = np.abs(y[:, None] - y[None, :])
-    A = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
-    B = b - b.mean(axis=0, keepdims=True) - b.mean(axis=1, keepdims=True) + b.mean()
-    return float(np.mean(A * B))
+    a_row = a.mean(axis=1, keepdims=True)
+    a_col = a.mean(axis=0, keepdims=True)
+    a_grand = a.mean()
+    A = a - a_row - a_col + a_grand
+    b_row = b.mean(axis=1, keepdims=True)
+    b_col = b.mean(axis=0, keepdims=True)
+    b_grand = b.mean()
+    B = b - b_row - b_col + b_grand
+    return float(np.einsum("ij,ij->", A, B) / (n * n))
 
 
 def _dcor(x: np.ndarray, y: np.ndarray) -> float:
