@@ -17,6 +17,11 @@ from statsmodels.tsa.vector_ar.var_model import VAR
 
 from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 
+# Порог пар, с которого пробуем распараллеливание тяжёлых покомпонентных расчётов.
+_PARALLEL_PAIR_THRESHOLD = 800
+# Верхняя граница автоматически сэмплируемых пар для очень больших матриц.
+_MAX_AUTO_RANDOM_PAIRS = 500_000
+
 
 def _init_matrix(n: int, default: float, *, diag: Optional[float] = None, dtype=np.float64) -> np.ndarray:
     out = np.full((n, n), float(default), dtype=dtype)
@@ -51,6 +56,59 @@ def _iter_pairs(n: int, pairs: Optional[list[tuple[int, int]]], *, directed: boo
         else:
             out.append((i, j))
     return out
+
+
+def _get_effective_pairs(
+    n: int,
+    pairs: Optional[list[tuple[int, int]]],
+    *,
+    directed: bool,
+) -> list[tuple[int, int]]:
+    """Возвращает итоговый список пар; при huge-N и pairs=None делает auto-sampling."""
+    if pairs is not None:
+        return _iter_pairs(n, pairs, directed=directed)
+    n_full = n * (n - 1) if directed else n * (n - 1) // 2
+    if n_full <= 10_000_000:
+        if directed:
+            return [(i, j) for i in range(n) for j in range(n) if i != j]
+        return [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    max_pairs = min(_MAX_AUTO_RANDOM_PAIRS, max(1, n * 5))
+    logging.warning(
+        "[connectivity] N=%d -> %d pairs, auto random sample %d.",
+        n,
+        n_full,
+        max_pairs,
+    )
+    rng = np.random.default_rng(42)
+    result: set[tuple[int, int]] = set()
+    bi = rng.integers(0, n, size=max_pairs * 3)
+    bj = rng.integers(0, n, size=max_pairs * 3)
+    for ii, jj in zip(bi, bj):
+        if ii == jj:
+            continue
+        key = (int(ii), int(jj)) if directed else (int(min(ii, jj)), int(max(ii, jj)))
+        result.add(key)
+        if len(result) >= max_pairs:
+            break
+    return list(result)
+
+
+def _prepare_numpy(data: pd.DataFrame) -> np.ndarray:
+    """Преобразует DataFrame -> float64 numpy без лишних копий где возможно."""
+    return data.to_numpy(dtype=np.float64, copy=False)
+
+
+def _try_parallel(func, pairs: list[tuple[int, int]], n_jobs: int = -1):
+    """joblib-parallel для списка пар, с безопасным fallback в последовательный режим."""
+    if len(pairs) < _PARALLEL_PAIR_THRESHOLD:
+        return [func(p) for p in pairs]
+    try:
+        from joblib import Parallel, delayed
+
+        return Parallel(n_jobs=n_jobs, backend="loky")(delayed(func)(p) for p in pairs)
+    except ImportError:
+        return [func(p) for p in pairs]
 
 
 def _corr_1d(x: np.ndarray, y: np.ndarray) -> float:
@@ -138,13 +196,20 @@ def correlation_matrix(
 
     Если pairs задан, считаем только эти пары (упрощение для больших N).
     """
-    if pairs is None:
+    n_cols = int(data.shape[1])
+    if pairs is not None:
+        X = _prepare_numpy(data)
+        out = _init_matrix(n_cols, 0.0, diag=1.0)
+        for i, j in _iter_pairs(n_cols, pairs, directed=False):
+            out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
+        return out
+    if n_cols <= 20_000:
         return data.corr().values
 
-    n_cols = int(data.shape[1])
+    effective = _get_effective_pairs(n_cols, None, directed=False)
+    X = _prepare_numpy(data)
     out = _init_matrix(n_cols, 0.0, diag=1.0)
-    X = data.to_numpy(dtype=np.float64, copy=False)
-    for i, j in _iter_pairs(n_cols, pairs, directed=False):
+    for i, j in effective:
         out[i, j] = out[j, i] = _corr_1d(X[:, i], X[:, j])
     return out
 
@@ -174,9 +239,20 @@ def partial_correlation_matrix(
     if n_rows <= n_cols + 2:
         logging.warning("Слишком мало данных для Partial Correlation: строк %s <= колонок %s. Возвращаю NaN.", n_rows, n_cols)
         return np.full((n_cols, n_cols), np.nan)
+    if n_cols > 200 and control is None and pairs is None:
+        try:
+            R = df[cols].corr().values
+            P = np.linalg.pinv(R)
+            d = np.sqrt(np.abs(np.diag(P)))
+            d[d < 1e-12] = 1.0
+            pcor = -P / np.outer(d, d)
+            np.fill_diagonal(pcor, 1.0)
+            return pcor
+        except Exception:
+            pass
     out = _init_matrix(n_cols, 0.0, diag=1.0)
-    it = _iter_pairs(n_cols, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols)]
-    for i, j in it:
+    effective = _get_effective_pairs(n_cols, pairs, directed=False)
+    for i, j in effective:
         xi, xj = cols[i], cols[j]
         ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
         sub_cols = [xi, xj] + [c for c in ctrl_vars if c in cols and c not in (xi, xj)]
@@ -208,15 +284,31 @@ def lagged_directed_correlation(
     """Вычисляет направленную лаговую корреляцию, где M[src, tgt] = corr(src(t), tgt(t+lag))."""
     lag = int(max(1, lag))
     n_cols = len(df.columns)
+    X = _prepare_numpy(df)
+    T = X.shape[0]
+    if T <= lag + 3:
+        return _init_matrix(n_cols, 0.0, diag=0.0)
+
+    # Быстрый векторизованный путь для dense-случая без NaN.
+    if pairs is None and n_cols <= 10_000:
+        x_past = X[: T - lag]
+        x_future = X[lag:]
+        if not (np.any(~np.isfinite(x_past)) or np.any(~np.isfinite(x_future))):
+            t_eff = T - lag
+            past_centered = x_past - x_past.mean(axis=0, keepdims=True)
+            fut_centered = x_future - x_future.mean(axis=0, keepdims=True)
+            sp = np.sqrt((past_centered**2).sum(axis=0, keepdims=True))
+            sf = np.sqrt((fut_centered**2).sum(axis=0, keepdims=True))
+            sp[sp < 1e-12] = 1.0
+            sf[sf < 1e-12] = 1.0
+            out = (past_centered / sp).T @ (fut_centered / sf) / t_eff
+            np.fill_diagonal(out, 0.0)
+            return out
+
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
     out = _init_matrix(n_cols, 0.0, diag=0.0)
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for i, j in it:
-        x_series = df.iloc[:, i]
-        y_series = df.iloc[:, j].shift(-lag)
-        pair = pd.concat([x_series, y_series], axis=1).dropna()
-        if pair.shape[0] <= 3:
-            continue
-        out[i, j] = _corr_1d(pair.iloc[:, 0].to_numpy(), pair.iloc[:, 1].to_numpy())
+    for i, j in effective:
+        out[i, j] = _corr_1d(X[: T - lag, i], X[lag:, j])
     return out
 
 def _knn_mutual_info(x: np.ndarray, y: np.ndarray, k: int = DEFAULT_K_MI) -> float:
@@ -292,15 +384,21 @@ def mutual_info_matrix(
 ) -> np.ndarray:
     """Взаимная информация (KSG kNN). Если pairs задан, считаем только эти пары."""
     n_vars = int(len(data.columns))
+    effective = _get_effective_pairs(n_vars, pairs, directed=False)
     mi_matrix = _init_matrix(n_vars, 0.0, diag=0.0)
-    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
-    for i, j in it:
-        pair = data.iloc[:, [i, j]].dropna()
-        if pair.shape[0] <= k:
-            value = 0.0
-        else:
-            v = _knn_mutual_info(pair.iloc[:, 0].values, pair.iloc[:, 1].values, k=k)
-            value = float(v) if np.isfinite(v) else 0.0
+    X = _prepare_numpy(data)
+
+    def _compute_mi_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
+        i, j = pair
+        xi = X[:, i]
+        xj = X[:, j]
+        mask = np.isfinite(xi) & np.isfinite(xj)
+        if int(mask.sum()) <= k:
+            return i, j, 0.0
+        v = _knn_mutual_info(xi[mask], xj[mask], k=k)
+        return i, j, float(v) if np.isfinite(v) else 0.0
+
+    for i, j, value in _try_parallel(_compute_mi_pair, effective):
         mi_matrix[i, j] = mi_matrix[j, i] = value
     return mi_matrix
 
@@ -342,18 +440,24 @@ def coherence_matrix(
     **_: dict,
 ) -> np.ndarray:
     fs = fs if np.isfinite(fs) and fs > 0 else 1.0
-    n_vars = int(data.shape[1]); coh = _init_matrix(n_vars, 0.0, diag=1.0)
-    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
-    for i, j in it:
-        pair = data.iloc[:, [i, j]].dropna()
-        if pair.shape[0] <= 3: continue
-        s1 = np.asarray(pair.iloc[:, 0].values, dtype=np.float64); s2 = np.asarray(pair.iloc[:, 1].values, dtype=np.float64)
-        n = int(min(s1.size, s2.size));
-        if n <= 3: continue
+    n_vars = int(data.shape[1])
+    effective = _get_effective_pairs(n_vars, pairs, directed=False)
+    coh = _init_matrix(n_vars, 0.0, diag=1.0)
+    X = _prepare_numpy(data)
+    for i, j in effective:
+        xi = X[:, i]
+        xj = X[:, j]
+        mask = np.isfinite(xi) & np.isfinite(xj)
+        n = int(mask.sum())
+        if n <= 3:
+            continue
+        s1 = xi[mask].astype(np.float64)
+        s2 = xj[mask].astype(np.float64)
         nperseg = int(max(8, min(64, n // 2)))
         try:
-            _, cxy = signal.coherence(s1[:n], s2[:n], fs=fs, nperseg=nperseg, detrend="constant")
-            cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0); cxy[~np.isfinite(cxy)] = np.nan
+            _, cxy = signal.coherence(s1, s2, fs=fs, nperseg=nperseg, detrend="constant")
+            cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0)
+            cxy[~np.isfinite(cxy)] = np.nan
             coh[i, j] = coh[j, i] = float(np.nanmean(cxy)) if np.isfinite(cxy).any() else 0.0
         except Exception:
             coh[i, j] = coh[j, i] = 0.0
@@ -366,18 +470,28 @@ def granger_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    n_cols = int(df.shape[1]); out = _init_matrix(n_cols, 1.0, diag=0.0)
+    n_cols = int(df.shape[1])
+    out = _init_matrix(n_cols, 1.0, diag=0.0)
     columns = df.columns.tolist()
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for src, tgt in it:
-        pair = df[[columns[tgt], columns[src]]].dropna()
-        if len(pair) <= lag * 2 + 5:
-            out[src, tgt] = 1.0; continue
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    X = _prepare_numpy(df)
+
+    def _compute_granger_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
+        src, tgt = pair
+        x_src = X[:, src]
+        x_tgt = X[:, tgt]
+        mask = np.isfinite(x_src) & np.isfinite(x_tgt)
+        if int(mask.sum()) <= lag * 2 + 5:
+            return src, tgt, 1.0
+        pair_df = pd.DataFrame({columns[tgt]: x_tgt[mask], columns[src]: x_src[mask]})
         try:
-            tests = grangercausalitytests(pair, maxlag=int(lag), verbose=False)
-            out[src, tgt] = float(tests[int(lag)][0]["ssr_ftest"][1])
+            tests = grangercausalitytests(pair_df, maxlag=int(lag), verbose=False)
+            return src, tgt, float(tests[int(lag)][0]["ssr_ftest"][1])
         except Exception:
-            out[src, tgt] = 1.0
+            return src, tgt, 1.0
+
+    for src, tgt, value in _try_parallel(_compute_granger_pair, effective):
+        out[src, tgt] = value
     return out
 
 def granger_matrix_partial(
@@ -395,8 +509,12 @@ def granger_matrix_partial(
     if len(df) <= n_cols + 2:
         logging.warning("Слишком мало данных для Granger partial: строк %s <= колонок %s. Возвращаю NaN.", len(df), n_cols)
         return out
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for src_i, tgt_j in it:
+    if n_cols > 50 and control is None:
+        logging.warning("[granger_partial] N=%d > 50, VAR infeasible. Fallback.", n_cols)
+        return granger_matrix(df, lag=lag, control=None, pairs=pairs)
+
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    for src_i, tgt_j in effective:
         src = columns[src_i]; tgt = columns[tgt_j]
         control_cols = control if control is not None else [c for c in columns if c not in (src, tgt)]
         control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
@@ -504,14 +622,23 @@ def transfer_entropy_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    n_cols = int(df.shape[1]); out = _init_matrix(n_cols, 0.0, diag=0.0)
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for src, tgt in it:
-        pair = df.iloc[:, [src, tgt]].dropna()
-        if len(pair) <= lag:
-            out[src, tgt] = 0.0; continue
-        v = compute_te_jitter(pair.iloc[:, 0].values, pair.iloc[:, 1].values, lag=lag, bins=bins)
-        out[src, tgt] = float(v) if np.isfinite(v) else 0.0
+    n_cols = int(df.shape[1])
+    out = _init_matrix(n_cols, 0.0, diag=0.0)
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    X = _prepare_numpy(df)
+
+    def _compute_te_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
+        src, tgt = pair
+        x_src = X[:, src]
+        x_tgt = X[:, tgt]
+        mask = np.isfinite(x_src) & np.isfinite(x_tgt)
+        if int(mask.sum()) <= lag:
+            return src, tgt, 0.0
+        v = compute_te_jitter(x_src[mask], x_tgt[mask], lag=lag, bins=bins)
+        return src, tgt, float(v) if np.isfinite(v) else 0.0
+
+    for src, tgt, value in _try_parallel(_compute_te_pair, effective):
+        out[src, tgt] = value
     return out
 
 def transfer_entropy_matrix_partial(
@@ -533,7 +660,7 @@ def transfer_entropy_matrix_partial(
     for i, j in it:
         src = cols[i]; tgt = cols[j]
         if control_matrix is not None:
-            pair_vals = df[[src, tgt]].to_numpy(dtype=np.float64, copy=False)
+            pair_vals = X[:, [i, j]]
             X_ctrl = np.asarray(control_matrix, dtype=np.float64)
             valid = np.isfinite(pair_vals).all(axis=1)
             if X_ctrl.size and X_ctrl.ndim == 1: X_ctrl = X_ctrl.reshape(-1, 1)
@@ -599,14 +726,23 @@ def dcor_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    n_vars = int(data.shape[1]); out = _init_matrix(n_vars, 0.0, diag=1.0)
-    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
-    for i, j in it:
-        pair = data.iloc[:, [i, j]].dropna()
-        if pair.shape[0] < 8:
-            out[i, j] = out[j, i] = 0.0; continue
-        v = _dcor(pair.iloc[:, 0].values, pair.iloc[:, 1].values)
-        out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
+    n_vars = int(data.shape[1])
+    effective = _get_effective_pairs(n_vars, pairs, directed=False)
+    out = _init_matrix(n_vars, 0.0, diag=1.0)
+    X = _prepare_numpy(data)
+
+    def _compute_dcor_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
+        i, j = pair
+        xi = X[:, i]
+        xj = X[:, j]
+        mask = np.isfinite(xi) & np.isfinite(xj)
+        if int(mask.sum()) < 8:
+            return i, j, 0.0
+        v = _dcor(xi[mask], xj[mask])
+        return i, j, float(v) if np.isfinite(v) else 0.0
+
+    for i, j, value in _try_parallel(_compute_dcor_pair, effective):
+        out[i, j] = out[j, i] = value
     return out
 
 def dcor_matrix_partial(
@@ -620,16 +756,23 @@ def dcor_matrix_partial(
     if control_matrix is not None or (control is not None and len(control) > 0):
         sub, _desc = _residualize_df(data, control=control, control_matrix=control_matrix)
         return dcor_matrix(sub, lag=lag, control=None, pairs=pairs)
-    cols = list(data.columns); n_cols = len(cols); out = _init_matrix(n_cols, 0.0, diag=1.0)
-    it = _iter_pairs(n_cols, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols)]
-    for i, j in it:
-        xi, xj = cols[i], cols[j]; z_cols = [c for c in cols if c not in (xi, xj)]
-        sub = data[[xi, xj] + z_cols].dropna()
-        if sub.shape[0] < 8:
-            out[i, j] = out[j, i] = 0.0; continue
-        x_ctrl = sub[z_cols].values if z_cols else np.empty((len(sub), 0))
-        xr = _residualize_1d(sub[xi].values, x_ctrl); yr = _residualize_1d(sub[xj].values, x_ctrl)
-        v = _dcor(xr, yr); out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
+    n_cols = len(data.columns)
+    effective = _get_effective_pairs(n_cols, pairs, directed=False)
+    out = _init_matrix(n_cols, 0.0, diag=1.0)
+    X = _prepare_numpy(data)
+    for i, j in effective:
+        z_idx = [k for k in range(n_cols) if k not in (i, j)]
+        sub_idx = np.array([i, j] + z_idx)
+        sub_data = X[:, sub_idx]
+        valid = np.isfinite(sub_data).all(axis=1)
+        if int(valid.sum()) < 8:
+            out[i, j] = out[j, i] = 0.0
+            continue
+        x_ctrl = sub_data[valid, 2:]
+        xr = _residualize_1d(sub_data[valid, 0], x_ctrl)
+        yr = _residualize_1d(sub_data[valid, 1], x_ctrl)
+        v = _dcor(xr, yr)
+        out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
     return out
 
 def dcor_matrix_directed(
@@ -639,14 +782,21 @@ def dcor_matrix_directed(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    lag = int(max(1, lag)); n_cols = len(data.columns); out = _init_matrix(n_cols, 0.0, diag=0.0)
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for i, j in it:
-        x = data.iloc[:, i].to_numpy(dtype=np.float64, copy=False)
-        y_shifted = data.iloc[:, j].shift(-lag).to_numpy(dtype=np.float64, copy=False)
+    lag = int(max(1, lag))
+    n_cols = len(data.columns)
+    out = _init_matrix(n_cols, 0.0, diag=0.0)
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    X = _prepare_numpy(data)
+    for i, j in effective:
+        x = X[:, i]
+        y_shifted = np.roll(X[:, j], -lag)
+        if lag > 0:
+            y_shifted[-lag:] = np.nan
         mask = np.isfinite(x) & np.isfinite(y_shifted)
-        if int(mask.sum()) < 8: continue
-        v = _dcor(x[mask], y_shifted[mask]); out[i, j] = float(v) if np.isfinite(v) else 0.0
+        if int(mask.sum()) < 8:
+            continue
+        v = _dcor(x[mask], y_shifted[mask])
+        out[i, j] = float(v) if np.isfinite(v) else 0.0
     return out
 
 def _ordinal_pattern(x: np.ndarray, order: int = 3, delay: int = 1) -> np.ndarray:
@@ -706,13 +856,18 @@ def ordinal_matrix(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    n_vars = int(data.shape[1]); out = _init_matrix(n_vars, 0.0, diag=0.0)
-    it = _iter_pairs(n_vars, pairs, directed=False) if pairs is not None else [(i, j) for i in range(n_vars) for j in range(i + 1, n_vars)]
-    for i, j in it:
-        pair = data.iloc[:, [i, j]].dropna()
-        if pair.shape[0] < 20:
-            out[i, j] = out[j, i] = 0.0; continue
-        v = _ordinal_mi(pair.iloc[:, 0].values, pair.iloc[:, 1].values, order=order, delay=delay)
+    n_vars = int(data.shape[1])
+    effective = _get_effective_pairs(n_vars, pairs, directed=False)
+    out = _init_matrix(n_vars, 0.0, diag=0.0)
+    X = _prepare_numpy(data)
+    for i, j in effective:
+        xi = X[:, i]
+        xj = X[:, j]
+        mask = np.isfinite(xi) & np.isfinite(xj)
+        if int(mask.sum()) < 20:
+            out[i, j] = out[j, i] = 0.0
+            continue
+        v = _ordinal_mi(xi[mask], xj[mask], order=order, delay=delay)
         out[i, j] = out[j, i] = float(v) if np.isfinite(v) else 0.0
     return out
 
@@ -725,14 +880,19 @@ def ordinal_matrix_directed(
     pairs: Optional[list[tuple[int, int]]] = None,
     **_: dict,
 ) -> np.ndarray:
-    lag = int(max(1, lag)); n_cols = len(data.columns); out = _init_matrix(n_cols, 0.0, diag=0.0)
-    it = _iter_pairs(n_cols, pairs, directed=True) if pairs is not None else [(i, j) for i in range(n_cols) for j in range(n_cols) if i != j]
-    for i, j in it:
-        x = data.iloc[:, i].to_numpy(dtype=np.float64, copy=False)
-        y_shifted = data.iloc[:, j].shift(-lag).to_numpy(dtype=np.float64, copy=False)
+    lag = int(max(1, lag))
+    n_cols = len(data.columns)
+    out = _init_matrix(n_cols, 0.0, diag=0.0)
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    X = _prepare_numpy(data)
+    for i, j in effective:
+        x = X[:, i]
+        y_shifted = np.roll(X[:, j], -lag)
+        if lag > 0:
+            y_shifted[-lag:] = np.nan
         mask = np.isfinite(x) & np.isfinite(y_shifted)
-        if int(mask.sum()) < 20: continue
+        if int(mask.sum()) < 20:
+            continue
         v = _ordinal_mi(x[mask], y_shifted[mask], order=order, delay=delay)
         out[i, j] = float(v) if np.isfinite(v) else 0.0
     return out
-
