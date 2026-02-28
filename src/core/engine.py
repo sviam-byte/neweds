@@ -626,29 +626,61 @@ def TE_matrix_partial(
     return M
 
 
-def AH_matrix(df: pd.DataFrame, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU) -> np.ndarray:
+def AH_matrix(df: pd.DataFrame, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU,
+              pairs=None, **_kwargs) -> np.ndarray:
     """
     Конвенция: M[src, tgt] = мера src → tgt.
+    Оптимизировано: поддержка pairs, joblib parallel.
     """
     df = df.dropna(axis=0, how='any')
     N = df.shape[1]
     out = np.zeros((N, N))
     arr = df.values
-    for src in range(N):
-        for tgt in range(N):
-            if src == tgt:
-                out[src, tgt] = 0.0
-                continue
 
-            # _H_ratio_direction(X, Y): интерпретируется как X → Y
-            H_val = _H_ratio_direction(arr[:, src], arr[:, tgt], m=embed_dim, tau=tau)
-            if H_val is None or H_val <= 0:
-                AH = 0.0
-            else:
-                AH = 1.0 / H_val
-                if AH > 1.0:
-                    AH = 1.0
-            out[src, tgt] = AH
+    # Определяем пары
+    if pairs is not None:
+        from src.metrics.connectivity import _iter_pairs
+        effective = _iter_pairs(N, pairs, directed=True)
+    else:
+        n_full = N * (N - 1)
+        if n_full > 10_000_000:
+            logging.warning("[AH] N=%d -> %d pairs, auto random sample.", N, n_full)
+            max_p = min(500_000, N * 5)
+            rng = np.random.default_rng(42)
+            effective_set: set[tuple[int, int]] = set()
+            bi = rng.integers(0, N, size=max_p * 3)
+            bj = rng.integers(0, N, size=max_p * 3)
+            for ii, jj in zip(bi, bj):
+                if ii != jj:
+                    effective_set.add((int(ii), int(jj)))
+                    if len(effective_set) >= max_p:
+                        break
+            effective = list(effective_set)
+        else:
+            effective = [(s, t) for s in range(N) for t in range(N) if s != t]
+
+    def _compute_ah_pair(pair):
+        src, tgt = pair
+        H_val = _H_ratio_direction(arr[:, src], arr[:, tgt], m=embed_dim, tau=tau)
+        if H_val is None or H_val <= 0:
+            return (src, tgt, 0.0)
+        AH = min(1.0, 1.0 / H_val)
+        return (src, tgt, AH)
+
+    # Parallel для больших наборов
+    if len(effective) > 800:
+        try:
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=-1, backend="loky")(
+                delayed(_compute_ah_pair)(p) for p in effective
+            )
+        except ImportError:
+            results = [_compute_ah_pair(p) for p in effective]
+    else:
+        results = [_compute_ah_pair(p) for p in effective]
+
+    for src, tgt, val in results:
+        out[src, tgt] = val
     return out
 
 def _H_ratio_direction(X, Y, m=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU):
@@ -705,7 +737,8 @@ def compute_partial_AH_matrix(data: pd.DataFrame,
                                max_lag: int = DEFAULT_MAX_LAG,
                                embed_dim: int = DEFAULT_EMBED_DIM,
                                tau: int = DEFAULT_EMBED_TAU,
-                               control: List[str] = None) -> np.ndarray:
+                               control: List[str] = None,
+                               pairs=None) -> np.ndarray:
     df = data.dropna(axis=0, how='any')
     N = df.shape[1]
     if N < 2:
@@ -734,11 +767,11 @@ def compute_partial_AH_matrix(data: pd.DataFrame,
             logging.error(f"VAR fit error (partial AH, fallback to raw): {e}")
             resid_df = df 
 
-    return AH_matrix(resid_df, embed_dim=embed_dim, tau=tau)
+    return AH_matrix(resid_df, embed_dim=embed_dim, tau=tau, pairs=pairs)
 
 
-def directional_AH_matrix(df: pd.DataFrame, maxlags: int = 5) -> np.ndarray:
-    return AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU)
+def directional_AH_matrix(df: pd.DataFrame, maxlags: int = 5, **kwargs) -> np.ndarray:
+    return AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU, pairs=kwargs.get("pairs"))
 
 def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
     results = {}
@@ -1208,15 +1241,16 @@ method_mapping = dict(METRICS_REGISTRY)
 
 # AH methods are still implemented in this module, so they are registered here.
 def _metric_ah_full(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    return AH_matrix(data)
+    return AH_matrix(data, pairs=kwargs.get("pairs"))
 
 
 def _metric_ah_partial(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    return compute_partial_AH_matrix(data, max_lag=lag, control=control)
+    return compute_partial_AH_matrix(data, max_lag=lag, control=control, pairs=kwargs.get("pairs"))
 
 
 def _metric_ah_directed(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    return AH_matrix(data) if not control else compute_partial_AH_matrix(data, max_lag=lag, control=control)
+    p = kwargs.get("pairs")
+    return AH_matrix(data, pairs=p) if not control else compute_partial_AH_matrix(data, max_lag=lag, control=control, pairs=p)
 
 
 for _name, _func in {
@@ -1414,14 +1448,14 @@ def _pairwise_partial_matrix(
     lag: int,
     policy: str,
     custom_controls: Optional[List[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
 ) -> np.ndarray:
     """
     NxN матрица частичной меры, где control-set выбирается ПО ПАРЕ.
-    policy:
-      - 'others': контролируем все остальные переменные (кроме пары)
-      - 'custom': контролируем выбранный список custom_controls (пересечённый с остальными)
-      - 'none'  : без контролей
+    Оптимизировано: _get_effective_pairs для больших N.
     """
+    from src.metrics.connectivity import _get_effective_pairs
+
     cols = list(data.columns)
     n = len(cols)
     M = np.full((n, n), np.nan, dtype=float)
@@ -1432,19 +1466,19 @@ def _pairwise_partial_matrix(
     custom_controls = list(custom_controls) if custom_controls else []
     custom_idx = [name_to_idx[c] for c in custom_controls if c in name_to_idx]
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if policy == "others":
-                controls = [k for k in range(n) if k not in (i, j)]
-            elif policy == "custom":
-                controls = [k for k in custom_idx if k not in (i, j)]
-            elif policy == "none":
-                controls = []
-            else:
-                controls = []
-            v = _pairwise_partial_value(data, i, j, controls, metric=metric, lag=lag)
-            M[i, j] = v
-            M[j, i] = v
+    effective = _get_effective_pairs(n, pairs, directed=False)
+    for i, j in effective:
+        if policy == "others":
+            controls = [k for k in range(n) if k not in (i, j)]
+        elif policy == "custom":
+            controls = [k for k in custom_idx if k not in (i, j)]
+        elif policy == "none":
+            controls = []
+        else:
+            controls = []
+        v = _pairwise_partial_value(data, i, j, controls, metric=metric, lag=lag)
+        M[i, j] = v
+        M[j, i] = v
     return M
 
 def compute_connectivity_variant(
@@ -1519,6 +1553,7 @@ def compute_connectivity_variant(
                     lag=max(1, int(lag or 1)),
                     policy=pairwise_policy,
                     custom_controls=custom_controls,
+                    pairs=pairs,
                 )
             if variant == "h2_partial":
                 return _pairwise_partial_matrix(
@@ -1527,6 +1562,7 @@ def compute_connectivity_variant(
                     lag=max(1, int(lag or 1)),
                     policy=pairwise_policy,
                     custom_controls=custom_controls,
+                    pairs=pairs,
                 )
             if variant == "mutinf_partial":
                 return _pairwise_partial_matrix(
@@ -1535,6 +1571,7 @@ def compute_connectivity_variant(
                     lag=max(1, int(lag or 1)),
                     policy=pairwise_policy,
                     custom_controls=custom_controls,
+                    pairs=pairs,
                 )
             # Остальные partial пока считаем GLOBAL-режимом (через control):
             # корректное "pairwise partial" для TE/AH/Granger требует отдельной
@@ -2627,15 +2664,24 @@ class BigMasterTool:
         elif lag_sel == "fixed":
             chosen_lag = int(max(1, kwargs.get("lag", 1)))
         else:
-            # Оптимизация
+            # Оптимизация лага
+            # Для больших N с pairs: матрица уже ограничена парами, ок.
+            # Для больших max_lag: early stop если score не улучшается.
             best_score = float("-inf")
             best_lag = 1
+            no_improve_count = 0
             for lag in range(1, max_lag + 1):
                 mat = _compute_at_lag(df, lag)
                 score = _lag_quality(variant, mat)
                 if np.isfinite(score) and float(score) > best_score:
                     best_score = float(score)
                     best_lag = int(lag)
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+                # Early stop: если 3 лага подряд без улучшения
+                if no_improve_count >= 3 and lag >= 3:
+                    break
             chosen_lag = int(best_lag)
             meta["lag_optimization"] = {
                 "max_lag": int(max_lag),
