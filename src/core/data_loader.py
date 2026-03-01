@@ -117,10 +117,71 @@ def _detect_voxel_wide(df: pd.DataFrame) -> tuple[bool, dict[str, str]]:
     return True, lower
 
 
-def voxel_wide_to_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+def _select_voxels_wide(
+    df: pd.DataFrame,
+    *,
+    xcol: str,
+    ycol: str,
+    zcol: str,
+    time_cols: list,
+    feature_limit: int | None,
+    feature_sampling: str,
+    feature_seed: int,
+) -> pd.DataFrame:
+    """Сэмплинг/сокращение вокселей ДО транспонирования.
+
+    Для формата x,y,z,t0..tN это критично: транспонирование превращает N_voxels в число колонок.
+    При N~250k это резко увеличивает память и время даже до dimred.
+
+    Режимы:
+      - first: первые K строк;
+      - random: случайные K строк;
+      - variance: топ-K по дисперсии по time_cols.
+    """
+    _ = (xcol, ycol, zcol)  # Явно фиксируем сигнатуру для читаемости вызова.
+    if feature_limit is None:
+        return df
+    try:
+        k = int(feature_limit)
+    except Exception:
+        return df
+    if k <= 0 or int(df.shape[0]) <= k:
+        return df
+
+    mode = str(feature_sampling or "first").strip().lower()
+    if mode in {"first", "head"}:
+        return df.iloc[:k, :].copy()
+
+    if mode in {"random", "rand"}:
+        rng = np.random.default_rng(int(feature_seed))
+        idx = rng.choice(int(df.shape[0]), size=k, replace=False)
+        idx = np.sort(idx)
+        return df.iloc[idx, :].copy()
+
+    if mode in {"variance", "var", "topvar"}:
+        arr = df[time_cols].to_numpy(dtype=np.float32, copy=False)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        v = np.var(arr, axis=1, ddof=0)
+        idx = np.argpartition(v, -k)[-k:]
+        idx = idx[np.argsort(-v[idx])]
+        return df.iloc[idx, :].copy()
+
+    return df.iloc[:k, :].copy()
+
+
+def voxel_wide_to_timeseries(
+    df: pd.DataFrame,
+    *,
+    feature_limit: int | None = None,
+    feature_sampling: str = "first",
+    feature_seed: int = 13,
+) -> pd.DataFrame:
     """Конвертирует таблицу x,y,z,t0..tN в матрицу time × voxel.
 
     Метаданные координат сохраняются в out.attrs['coords'] как DataFrame.
+
+    Оптимизация: при больших N (число строк/вокселей) применяем feature_limit ДО транспонирования,
+    чтобы не создавать DataFrame с сотнями тысяч колонок.
     """
     is_vox, lower = _detect_voxel_wide(df)
     if not is_vox:
@@ -129,12 +190,26 @@ def voxel_wide_to_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     xcol, ycol, zcol = lower["x"], lower["y"], lower["z"]
     time_cols = [c for c in df.columns if str(c).strip().lower() not in {"x", "y", "z"}]
 
-    coords = df[[xcol, ycol, zcol]].copy()
-    coords.columns = ["x", "y", "z"]
-    for c in ["x", "y", "z"]:
-        coords[c] = pd.to_numeric(coords[c], errors="coerce")
+    work = df[[xcol, ycol, zcol] + time_cols].copy()
+    for c in [xcol, ycol, zcol]:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+    work[time_cols] = work[time_cols].apply(pd.to_numeric, errors="coerce")
 
-    ts = df[time_cols].copy().apply(pd.to_numeric, errors="coerce")
+    work = _select_voxels_wide(
+        work,
+        xcol=xcol,
+        ycol=ycol,
+        zcol=zcol,
+        time_cols=time_cols,
+        feature_limit=feature_limit,
+        feature_sampling=feature_sampling,
+        feature_seed=feature_seed,
+    )
+
+    coords = work[[xcol, ycol, zcol]].copy()
+    coords.columns = ["x", "y", "z"]
+
+    ts = work[time_cols].copy()
 
     def _t_index(name: str) -> int | None:
         s = str(name).strip().lower()
@@ -152,12 +227,37 @@ def voxel_wide_to_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     else:
         time_cols_sorted = list(time_cols)
 
-    voxel_ids: list[str] = []
-    for i in range(len(coords)):
-        x, y, z = coords.iloc[i].tolist()
-        voxel_ids.append(
-            f"v{i:04d}_x{int(x) if np.isfinite(x) else 'nan'}_y{int(y) if np.isfinite(y) else 'nan'}_z{int(z) if np.isfinite(z) else 'nan'}"
-        )
+    n = int(coords.shape[0])
+    x = coords["x"].to_numpy(dtype=float, copy=False)
+    y = coords["y"].to_numpy(dtype=float, copy=False)
+    z = coords["z"].to_numpy(dtype=float, copy=False)
+
+    def _int_or_nan(a: np.ndarray) -> np.ndarray:
+        m = np.isfinite(a)
+        out = np.empty(a.shape[0], dtype=object)
+        out[m] = a[m].astype(np.int64).astype(str)
+        out[~m] = "nan"
+        return out
+
+    xs = _int_or_nan(x)
+    ys = _int_or_nan(y)
+    zs = _int_or_nan(z)
+
+    i_str = np.char.zfill(np.arange(n, dtype=np.int64).astype(str), 4)
+    voxel_ids = np.char.add(
+        np.char.add(
+            np.char.add(
+                np.char.add(
+                    np.char.add(np.char.add(np.char.add("v", i_str), "_x"), xs),
+                    "_y",
+                ),
+                ys,
+            ),
+            "_z",
+        ),
+        zs,
+    ).astype(object)
+
     coords.insert(0, "voxel_id", voxel_ids)
     try:
         dup = coords.duplicated(subset=["x", "y", "z"], keep=False)
@@ -276,7 +376,12 @@ def tidy_timeseries_table(
 
     # Спец-кейс: x,y,z,t0..tN (воксельный wide-формат)
     try:
-        out = voxel_wide_to_timeseries(out)
+        out = voxel_wide_to_timeseries(
+            out,
+            feature_limit=feature_limit,
+            feature_sampling=feature_sampling,
+            feature_seed=feature_seed,
+        )
     except Exception:
         pass
 

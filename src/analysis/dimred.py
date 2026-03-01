@@ -216,6 +216,8 @@ def _pca_reduce(
     *,
     priority: str = "auto",
     solver: str = "full",
+    mapping_topk: int | None = None,
+    mapping_min_abs: float | None = None,
 ) -> DimRedResult:
     """PCA по оси колонок (рядам): вход T×N -> выход T×K.
 
@@ -277,16 +279,41 @@ def _pca_reduce(
         reduced = pd.DataFrame(scores, index=data.index, columns=cols)
 
         mapping_rows = []
-        sources = [str(c) for c in data.columns]
+        sources = np.asarray([str(c) for c in data.columns], dtype=object)
+
+        topk = None
+        try:
+            topk = int(mapping_topk) if mapping_topk is not None and int(mapping_topk) > 0 else None
+        except Exception:
+            topk = None
+        min_abs = None
+        try:
+            min_abs = float(mapping_min_abs) if mapping_min_abs is not None else None
+        except Exception:
+            min_abs = None
+        if min_abs is not None and min_abs < 0:
+            min_abs = None
+
         for ci, cname in enumerate(cols):
-            for source, weight in zip(sources, comps[ci].tolist()):
-                mapping_rows.append({"source": source, "target": cname, "weight": float(weight)})
+            ww_row = np.asarray(comps[ci], dtype=float)
+            if topk is not None and topk < ww_row.size:
+                idx = np.argpartition(np.abs(ww_row), -topk)[-topk:]
+                idx = idx[np.argsort(-np.abs(ww_row[idx]))]
+            else:
+                idx = np.arange(ww_row.size)
+            for j in idx.tolist():
+                ww = float(ww_row[j])
+                if min_abs is not None and abs(ww) < min_abs:
+                    continue
+                mapping_rows.append({"source": str(sources[j]), "target": cname, "weight": ww})
 
         meta = {
             "method": "pca",
             "solver": "gram",
             "k": int(k),
             "seed": int(seed),
+            "mapping_topk": (int(mapping_topk) if mapping_topk is not None else None),
+            "mapping_min_abs": (float(mapping_min_abs) if mapping_min_abs is not None else None),
             "target_n": (int(target_n) if target_n is not None else None),
             "target_var": (float(target_var) if target_var is not None else None),
             "priority": pr_used,
@@ -330,10 +357,34 @@ def _pca_reduce(
 
     mapping_rows = []
     if getattr(pca, "components_", None) is not None:
-        sources = [str(c) for c in data.columns]
+        sources = np.asarray([str(c) for c in data.columns], dtype=object)
+        comps = np.asarray(pca.components_, dtype=float)
+
+        topk = None
+        try:
+            topk = int(mapping_topk) if mapping_topk is not None and int(mapping_topk) > 0 else None
+        except Exception:
+            topk = None
+        min_abs = None
+        try:
+            min_abs = float(mapping_min_abs) if mapping_min_abs is not None else None
+        except Exception:
+            min_abs = None
+        if min_abs is not None and min_abs < 0:
+            min_abs = None
+
         for ci, cname in enumerate(cols):
-            for source, weight in zip(sources, pca.components_[ci].tolist()):
-                mapping_rows.append({"source": source, "target": cname, "weight": float(weight)})
+            w = comps[ci]
+            if topk is not None and topk < w.size:
+                idx = np.argpartition(np.abs(w), -topk)[-topk:]
+                idx = idx[np.argsort(-np.abs(w[idx]))]
+            else:
+                idx = np.arange(w.size)
+            for j in idx.tolist():
+                ww = float(w[j])
+                if min_abs is not None and abs(ww) < min_abs:
+                    continue
+                mapping_rows.append({"source": str(sources[j]), "target": cname, "weight": ww})
 
     evr_list: list[float] = []
     if getattr(pca, "explained_variance_ratio_", None) is not None:
@@ -347,6 +398,8 @@ def _pca_reduce(
         "solver": solver_norm,
         "k": k_out,
         "seed": int(seed),
+        "mapping_topk": (int(mapping_topk) if mapping_topk is not None else None),
+        "mapping_min_abs": (float(mapping_min_abs) if mapping_min_abs is not None else None),
         "target_n": (int(target_n) if target_n is not None else None),
         "target_var": (float(target_var) if target_var is not None else None),
         "priority": pr_used,
@@ -405,6 +458,8 @@ def apply_dimred(
     spatial_bin: int = 2,
     pca_priority: str = "auto",
     pca_solver: str = "full",
+    mapping_topk: int | None = None,
+    mapping_min_abs: float | None = None,
 ) -> DimRedResult:
     """Применяет выбранный метод уменьшения размерности к колонкам DataFrame."""
     if data is None or data.empty:
@@ -428,10 +483,37 @@ def apply_dimred(
     if method_norm == "kmeans":
         return _kmeans_reduce(data, target_n or n_features, seed, kmeans_batch)
     if method_norm in {"pca", "pca_full"}:
-        return _pca_reduce(data, target_n, target_var, seed, priority=pca_priority, solver=pca_solver)
+        return _pca_reduce(
+            data,
+            target_n,
+            target_var,
+            seed,
+            priority=pca_priority,
+            solver=pca_solver,
+            mapping_topk=mapping_topk,
+            mapping_min_abs=mapping_min_abs,
+        )
     if method_norm in {"pca_gram", "pca_gram_matrix"}:
-        return _pca_reduce(data, target_n, target_var, seed, priority=pca_priority, solver="gram")
+        return _pca_reduce(
+            data,
+            target_n,
+            target_var,
+            seed,
+            priority=pca_priority,
+            solver="gram",
+            mapping_topk=mapping_topk,
+            mapping_min_abs=mapping_min_abs,
+        )
     if method_norm in {"pca_randomized", "pca_rand", "pca_random"}:
-        return _pca_reduce(data, target_n, target_var, seed, priority=pca_priority, solver="randomized")
+        return _pca_reduce(
+            data,
+            target_n,
+            target_var,
+            seed,
+            priority=pca_priority,
+            solver="randomized",
+            mapping_topk=mapping_topk,
+            mapping_min_abs=mapping_min_abs,
+        )
 
     return _variance_select(data, target_n or n_features)
