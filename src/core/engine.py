@@ -3293,6 +3293,8 @@ class BigMasterTool:
         kmeans_batch = int(kwargs.get("dimred_kmeans_batch", 2048) or 2048)
         dimred_priority = str(kwargs.get("dimred_priority") or "auto").strip().lower()
         dimred_pca_solver = str(kwargs.get("dimred_pca_solver") or "full").strip().lower()
+        mapping_topk = kwargs.get("dimred_mapping_topk", None)
+        mapping_min_abs = kwargs.get("dimred_mapping_min_abs", None)
 
         base = (
             self.data_preprocessed
@@ -3317,6 +3319,12 @@ class BigMasterTool:
         if (target_n <= 0) and (target_var is None or not (0.0 < target_var <= 1.0)):
             target_n = int(min(500, n0))
 
+        # Экономим память/время на больших N: не строим полный mapping (k*N строк).
+        if mapping_topk is None and n0 >= 5000:
+            mapping_topk = 50
+        if mapping_min_abs is None:
+            mapping_min_abs = None
+
         res = apply_dimred(
             base,
             method=method,
@@ -3328,6 +3336,8 @@ class BigMasterTool:
             spatial_bin=spatial_bin,
             pca_priority=dimred_priority,
             pca_solver=dimred_pca_solver,
+            mapping_topk=(int(mapping_topk) if mapping_topk is not None else None),
+            mapping_min_abs=(float(mapping_min_abs) if mapping_min_abs is not None else None),
         )
         self.data_dimred = res.reduced
         self.dimred_mapping = res.mapping
@@ -3399,6 +3409,8 @@ class BigMasterTool:
                                 coords_df=getattr(self, "coords_df", None),
                                 kmeans_batch=int(rep.get("batch_size", 2048) or 2048),
                                 spatial_bin=int(rep.get("bin_size", 2) or 2),
+                                mapping_topk=(int(rep.get("mapping_topk")) if rep.get("mapping_topk") is not None else None),
+                                mapping_min_abs=(float(rep.get("mapping_min_abs")) if rep.get("mapping_min_abs") is not None else None),
                             )
                             sub = vroot / f"{m}_n{t2}"
                             sub.mkdir(parents=True, exist_ok=True)
