@@ -33,10 +33,8 @@ METRICS_REGISTRY: dict[str, MetricFunc] = {
     "coherence_partial": connectivity.coherence_matrix_partial,
     "granger_full": connectivity.granger_matrix,
     "granger_partial": connectivity.granger_matrix_partial,
-    "granger_directed": connectivity.granger_matrix,
     "te_full": connectivity.transfer_entropy_matrix,
     "te_partial": connectivity.transfer_entropy_matrix_partial,
-    "te_directed": connectivity.transfer_entropy_matrix,
     # Спец-метрика: distance correlation
     "dcor_full": connectivity.dcor_matrix,
     "dcor_partial": connectivity.dcor_matrix_partial,
