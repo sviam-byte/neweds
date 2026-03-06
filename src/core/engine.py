@@ -1232,7 +1232,7 @@ def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarra
 # МАППИНГ
 ###
 # Metric registry lives in src.metrics.registry to keep engine as orchestrator.
-method_mapping = dict(METRICS_REGISTRY)
+method_mapping = METRICS_REGISTRY
 
 # AH methods are still implemented in this module, so they are registered here.
 def _metric_ah_full(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
@@ -1244,8 +1244,27 @@ def _metric_ah_partial(data: pd.DataFrame, lag: int = 1, control=None, **kwargs)
 
 
 def _metric_ah_directed(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    p = kwargs.get("pairs")
-    return AH_matrix(data, pairs=p) if not control else compute_partial_AH_matrix(data, max_lag=lag, control=control, pairs=p)
+    """Направленный AH как влияние src(t) -> tgt(t+lag) через сдвинутую матрицу признаков."""
+    lag = int(max(1, lag))
+    cols = list(data.columns)
+    shifted = pd.DataFrame(index=data.index)
+    for col in cols:
+        shifted[col] = pd.to_numeric(data[col], errors="coerce").shift(-lag)
+    aligned = pd.DataFrame(index=data.index)
+    for col in cols:
+        aligned[f"src::{col}"] = pd.to_numeric(data[col], errors="coerce")
+        aligned[f"tgt::{col}"] = shifted[col]
+    aligned = aligned.dropna(axis=0, how="any")
+    if aligned.empty:
+        return np.zeros((len(cols), len(cols)), dtype=float)
+    ah_raw = AH_matrix(aligned, pairs=None)
+    out = np.zeros((len(cols), len(cols)), dtype=float)
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            if i == j:
+                continue
+            out[i, j] = float(ah_raw[i, len(cols) + j])
+    return out
 
 
 for _name, _func in {
@@ -1255,7 +1274,7 @@ for _name, _func in {
 }.items():
     register_metric(_name, _func)
 
-method_mapping = dict(METRICS_REGISTRY)
+method_mapping = METRICS_REGISTRY
 
 
 @dataclass(frozen=True)
@@ -2457,6 +2476,14 @@ class BigMasterTool:
 
         # Описание control-переменных для partial-вариантов
         meta: dict = {"variant": variant}
+        contract = ComputationContract(
+            variant=variant,
+            input_channels=int(df.shape[1]),
+            input_T=int(df.shape[0]),
+            input_missing_frac=float(pd.isna(df).mean().mean()) if len(df.columns) else 0.0,
+            directed=bool(is_directed_method(variant)),
+            seed=int(getattr(self.config, "master_seed", 12345)),
+        )
         if is_control_sensitive_method(variant):
             # В текущей реализации (pairwise_policy='others' по умолчанию) это значит:
             # для пары (Xi, Xj) исключаем влияние всех остальных переменных.
@@ -2596,7 +2623,7 @@ class BigMasterTool:
         elif pair_mode == "random":
             # Случайные неориентированные пары (если нет coords), с фиксированным seed.
             max_pairs = int(max(1, kwargs.get("max_pairs") or 50000))
-            rng = np.random.default_rng(12345)
+            rng = np.random.default_rng(int(getattr(self.config, "master_seed", 12345)))
             # Выбор индексов в верхнем треугольнике
             m = min(max_pairs, max(1, n_cols * 5))
             pairs_out = set()
@@ -2623,7 +2650,7 @@ class BigMasterTool:
         _mat_gb = (n_cols * n_cols * 8) / (1024**3)
         if pairs_idx is None and _mat_gb > 8.0:
             logging.error("[memory] Matrix %dx%d=%.1fGB>8GB, forcing random.", n_cols, n_cols, _mat_gb)
-            _rng = np.random.default_rng(12345)
+            _rng = np.random.default_rng(int(getattr(self.config, "master_seed", 12345)))
             _mp = min(n_cols * 5, 500_000)
             _ps: set[tuple[int, int]] = set()
             _bi = _rng.integers(0, n_cols, size=_mp * 3)
@@ -2639,6 +2666,10 @@ class BigMasterTool:
 
         supports_lag = is_directed_method(variant) or variant.startswith("granger") or variant.startswith("te_") or variant.startswith("ah_")
         lag_sel = (kwargs.get("lag_selection") or self.config.lag_selection or "optimize").lower()
+        if is_pvalue_method(variant) and "lag_selection" not in kwargs:
+            # Для p-value метрик фиксируем лаг по умолчанию, чтобы не вносить смещение отбора.
+            lag_sel = "fixed"
+            meta["lag_policy"] = "fixed_for_pvalue_method"
         max_lag = int(kwargs.get("max_lag") or self.config.max_lag or 1)
         max_lag = int(max(1, max_lag))
 
@@ -2655,6 +2686,29 @@ class BigMasterTool:
                 control_strategy=kwargs.get("control_strategy", "none"),
                 control_pca_k=int(kwargs.get("control_pca_k", 0) or 0),
             )
+
+        def _store_contract(mat_obj: np.ndarray | None) -> None:
+            try:
+                contract.output_shape = tuple(np.asarray(mat_obj).shape) if mat_obj is not None else (0, 0)
+            except Exception:
+                contract.output_shape = (0, 0)
+            try:
+                preprocess_steps: list[str] = []
+                for rep_name in ("preprocessing_report", "autodiff_report", "dimred_report"):
+                    rep = getattr(self, rep_name, None) or {}
+                    if isinstance(rep, dict):
+                        for k, v in rep.items():
+                            if v not in (None, False, "", [], {}):
+                                preprocess_steps.append(f"{rep_name}:{k}={v}")
+                contract.preprocess_steps = preprocess_steps
+                if isinstance(meta.get("partial"), dict):
+                    contract.control_strategy = str(meta["partial"].get("control_strategy", "none"))
+                    cc = meta["partial"].get("custom_controls")
+                    if isinstance(cc, (list, tuple)):
+                        contract.controls = [str(x) for x in cc]
+                meta["contract"] = contract.as_dict()
+            except Exception:
+                pass
 
         chosen_lag = 1
         if not supports_lag:
@@ -2685,7 +2739,12 @@ class BigMasterTool:
                 "max_lag": int(max_lag),
                 "criterion": "mean(|offdiag|)" if not is_pvalue_method(variant) else "mean(-log10(p))",
             }
+            if is_pvalue_method(variant):
+                meta["warning"] = "selection_bias"
+                contract.validity_warnings.append("lag optimization over p-values can introduce selection bias")
         meta["chosen_lag"] = int(chosen_lag)
+        contract.directed_lag = int(chosen_lag)
+        contract.lag_selection = str(lag_sel)
 
         # --- Диагностические сканы по окнам/лагам/позициям ---
         scans = {
@@ -3106,6 +3165,7 @@ class BigMasterTool:
         window_sizes = kwargs.get("window_sizes") or self.config.window_sizes
         if not window_sizes:
             mat = _compute_at_lag(df, chosen_lag)
+            _store_contract(mat)
             return mat, meta
 
         policy = (kwargs.get("window_policy") or self.config.window_policy or "best").lower()
@@ -3190,6 +3250,7 @@ class BigMasterTool:
 
         if not mats:
             mat = _compute_at_lag(df, chosen_lag)
+            _store_contract(mat)
             return mat, meta
 
         if policy == "mean":
@@ -3204,6 +3265,7 @@ class BigMasterTool:
             "policy": policy,
             "best": best,
         }
+        _store_contract(mat)
         return mat, meta
 
     def export_html_report(self, output_path: str, **kwargs) -> str:

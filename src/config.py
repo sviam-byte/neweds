@@ -48,7 +48,6 @@ EXPERIMENTAL_METHODS_BASE = [
     "mutinf_partial",
     "te_full",
     "te_partial",
-    "te_directed",
     "ah_full",
     "ah_partial",
     "ah_directed",
@@ -68,7 +67,6 @@ EXPERIMENTAL_METHODS = [
 PVAL_METHODS = {
     "granger_full",
     "granger_partial",
-    "granger_directed",
 }
 
 # Directed методы
@@ -77,10 +75,8 @@ DIRECTED_METHODS = {
     "h2_directed",
     "granger_full",
     "granger_partial",
-    "granger_directed",
     "te_full",
     "te_partial",
-    "te_directed",
     "ah_full",
     "ah_partial",
     "ah_directed",
@@ -158,10 +154,6 @@ METHOD_INFO = {
         "title": "Granger partial (p-values)",
         "meaning": "Granger partial (linear control; best lag up to L): p-value после удаления влияния control. Меньше = сильнее.",
     },
-    "granger_directed": {
-        "title": "Granger directed (p-values)",
-        "meaning": "То же семейство p-values. Меньше = сильнее.",
-    },
     "te_full": {
         "title": "Transfer Entropy",
         "meaning": "Направленный поток информации. Больше = сильнее.",
@@ -169,10 +161,6 @@ METHOD_INFO = {
     "te_partial": {
         "title": "Transfer Entropy (partial)",
         "meaning": "TE при контроле. Больше = сильнее.",
-    },
-    "te_directed": {
-        "title": "Transfer Entropy (directed)",
-        "meaning": "TE (directed). Больше = сильнее.",
     },
     "ah_full": {
         "title": "Active information storage (AH)",
@@ -281,6 +269,9 @@ class AnalysisConfig:
     # - fixed: используем lag=1 (или явно заданный)
     # - optimize: перебираем 1..max_lag и выбираем лучший по quality-score
     lag_selection: str = "optimize"
+
+    # Единый master-seed для воспроизводимых стохастических шагов
+    master_seed: int = 12345
 
 def is_pvalue_method(variant: str) -> bool:
     """Проверяет, является ли метод p-value методом."""

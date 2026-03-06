@@ -188,12 +188,6 @@ def _residualize_df(df: pd.DataFrame, control: Optional[list[str]] = None, contr
 def _fast_corr_matrix(X: np.ndarray) -> np.ndarray:
     """Vectorized Pearson correlation via numpy для больших матриц."""
     X = np.asarray(X, dtype=np.float64)
-    col_means = np.nanmean(X, axis=0)
-    nan_mask = ~np.isfinite(X)
-    if nan_mask.any():
-        X = X.copy()
-        for j in range(X.shape[1]):
-            X[nan_mask[:, j], j] = col_means[j]
     X_centered = X - X.mean(axis=0, keepdims=True)
     norms = np.sqrt((X_centered ** 2).sum(axis=0, keepdims=True))
     norms[norms < 1e-12] = 1.0
@@ -247,7 +241,10 @@ def partial_correlation_matrix(
         sub = df[cols].copy()
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
         if pairs is None:
-            return _fast_corr_matrix(sub.to_numpy(dtype=np.float64, copy=False))
+            X_sub = sub.to_numpy(dtype=np.float64, copy=False)
+            if not np.isfinite(X_sub).all():
+                return sub.corr().values
+            return _fast_corr_matrix(X_sub)
         n = int(len(cols))
         out = _init_matrix(n, 0.0, diag=1.0)
         X = sub.to_numpy(dtype=np.float64, copy=False)
@@ -534,7 +531,11 @@ def granger_matrix(
         pair_df = pd.DataFrame({columns[tgt]: X[mask, tgt], columns[src]: X[mask, src]}, copy=False)
         try:
             tests = grangercausalitytests(pair_df, maxlag=int(lag), verbose=False)
-            return src, tgt, float(tests[int(lag)][0]["ssr_ftest"][1])
+            # Корректируем выбор минимального p-value по лагам простой Bonferroni-поправкой.
+            p_values = [float(tests[l][0]["ssr_ftest"][1]) for l in range(1, int(lag) + 1)]
+            p_min = min(p_values) if p_values else 1.0
+            p_corr = min(1.0, p_min * max(1, len(p_values)))
+            return src, tgt, p_corr
         except Exception:
             return src, tgt, 1.0
 
