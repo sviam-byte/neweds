@@ -2716,10 +2716,29 @@ class BigMasterTool:
             except Exception:
                 return None
 
-        raw_df = _pick(getattr(self, 'data_raw', None)) or _pick(getattr(self, 'data', None)) or pd.DataFrame()
-        pre_df = _pick(getattr(self, 'data_preprocessed', None)) or _pick(getattr(self, 'data', None)) or pd.DataFrame()
-        ad_df = _pick(getattr(self, 'data_after_autodiff', None)) or _pick(getattr(self, 'data', None)) or pd.DataFrame()
-        norm_df = _pick(getattr(self, 'data_normalized', None)) or pd.DataFrame()
+        # Не используем `or` для DataFrame: bool(DataFrame) неоднозначен и может
+        # выбросить ValueError. Явно проверяем None после _pick(...).
+        raw_df = _pick(getattr(self, 'data_raw', None))
+        if raw_df is None:
+            raw_df = _pick(getattr(self, 'data', None))
+        if raw_df is None:
+            raw_df = pd.DataFrame()
+
+        pre_df = _pick(getattr(self, 'data_preprocessed', None))
+        if pre_df is None:
+            pre_df = _pick(getattr(self, 'data', None))
+        if pre_df is None:
+            pre_df = pd.DataFrame()
+
+        ad_df = _pick(getattr(self, 'data_after_autodiff', None))
+        if ad_df is None:
+            ad_df = _pick(getattr(self, 'data', None))
+        if ad_df is None:
+            ad_df = pd.DataFrame()
+
+        norm_df = _pick(getattr(self, 'data_normalized', None))
+        if norm_df is None:
+            norm_df = pd.DataFrame()
 
         with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
             raw_df.to_excel(writer, sheet_name='RAW', index=False)

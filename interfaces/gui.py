@@ -698,7 +698,14 @@ class App(tk.Tk):
     def _get_selected_methods(self) -> list[str]:
         return [m for m, var in self.method_vars.items() if var.get()]
 
-    def _run_tool(self, df: pd.DataFrame, out_dir: str, name_prefix: str) -> str | None:
+    def _run_tool(self, fp: str, out_dir: str, name_prefix: str) -> str | None:
+        """Запускает BigMasterTool на файле и сохраняет отчёты в out_dir.
+
+        Важно: используем именно ``BigMasterTool.load_data_excel(...)``, чтобы
+        инициализировать весь внутренний стейт инструмента (raw/preprocessed,
+        координаты, QC и отчёт предобработки), от которого зависят HTML/Excel
+        экспортёры.
+        """
         cfg = self._get_config()
         methods = self._get_selected_methods()
 
@@ -710,8 +717,34 @@ class App(tk.Tk):
             self._set_stage(stage, progress)
 
         self._set_stage("Старт анализа", 0.0)
-        tool = BigMasterTool(df, config=cfg, stage_callback=_stage_cb)
-        tool.data = df.fillna(df.mean(numeric_only=True))
+        tool = BigMasterTool(config=cfg, stage_callback=_stage_cb)
+
+        # Загружаем данные через API движка, а не вручную через tool.data = ...,
+        # чтобы не терять служебные артефакты (coords_df, qc_*, data_raw и т.д.).
+        tool.load_data_excel(
+            fp,
+            preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
+            log_transform=self._as_bool(self.preproc_log_transform),
+            remove_outliers=self._as_bool(self.preproc_remove_outliers),
+            outlier_rule=str(self._as_str(self.preproc_outlier_rule)),
+            outlier_action=str(self._as_str(self.preproc_outlier_action)),
+            outlier_z=self._as_float(self.preproc_outlier_z, 5.0),
+            outlier_k=self._as_float(self.preproc_outlier_k, 1.5),
+            outlier_p_low=self._as_float(self.preproc_outlier_p_low, 0.5),
+            outlier_p_high=self._as_float(self.preproc_outlier_p_high, 99.5),
+            outlier_hampel_window=self._as_int(self.preproc_outlier_hampel_window, 7),
+            outlier_jump_thr=(None if self._as_float(self.preproc_outlier_jump_thr, 0.0) == 0.0 else self._as_float(self.preproc_outlier_jump_thr, 0.0)),
+            outlier_local_median_window=self._as_int(self.preproc_outlier_local_median_window, 7),
+            normalize=self._as_bool(self.preproc_normalize),
+            normalize_mode=str(self._as_str(self.preproc_normalize_mode)),
+            rank_ties=str(self._as_str(self.preproc_rank_ties)),
+            fill_missing=self._as_bool(self.preproc_fill_missing),
+            remove_ar1=self._as_bool(self.preproc_remove_ar1),
+            remove_ar_order=self._as_int(self.preproc_ar_order, 1) or 1,
+            remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
+            season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
+            qc_enabled=True,
+        )
 
         if cfg.auto_difference:
             from src.analysis import stats as s_stats
@@ -757,7 +790,7 @@ class App(tk.Tk):
         cube_pairs = None
         try:
             if bool(self.scan_cube.get()):
-                ncols = int(df.shape[1])
+                ncols = int(tool.data.shape[1])
                 if bool(self.cube_pairs_all.get()) and (3 <= ncols <= 4):
                     cube_pairs = [(i, j) for i in range(ncols) for j in range(i + 1, ncols)]
                 else:
@@ -886,34 +919,11 @@ class App(tk.Tk):
             return
 
         try:
-            df = data_loader.load_or_generate(
-                fp,
-                preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
-                log_transform=self._as_bool(self.preproc_log_transform),
-                remove_outliers=self._as_bool(self.preproc_remove_outliers),
-                outlier_rule=str(self._as_str(self.preproc_outlier_rule)),
-                outlier_action=str(self._as_str(self.preproc_outlier_action)),
-                outlier_z=self._as_float(self.preproc_outlier_z, 5.0),
-                outlier_k=self._as_float(self.preproc_outlier_k, 1.5),
-                outlier_p_low=self._as_float(self.preproc_outlier_p_low, 0.5),
-                outlier_p_high=self._as_float(self.preproc_outlier_p_high, 99.5),
-                outlier_hampel_window=self._as_int(self.preproc_outlier_hampel_window, 7),
-                outlier_jump_thr=(None if self._as_float(self.preproc_outlier_jump_thr, 0.0) == 0.0 else self._as_float(self.preproc_outlier_jump_thr, 0.0)),
-                outlier_local_median_window=self._as_int(self.preproc_outlier_local_median_window, 7),
-                normalize=self._as_bool(self.preproc_normalize),
-                normalize_mode=str(self._as_str(self.preproc_normalize_mode)),
-                rank_ties=str(self._as_str(self.preproc_rank_ties)),
-                fill_missing=self._as_bool(self.preproc_fill_missing),
-                remove_ar1=self._as_bool(self.preproc_remove_ar1),
-                remove_ar_order=self._as_int(self.preproc_ar_order, 1) or 1,
-                remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
-                season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
-            )
             out_dir = os.path.join(os.path.dirname(fp), "time_series_analysis", Path(fp).stem)
             name = Path(fp).stem
             os.makedirs(out_dir, exist_ok=True)
 
-            report = self._run_tool(df, out_dir, name)
+            report = self._run_tool(fp, out_dir, name)
             if report and messagebox.askyesno("Готово", "Открыть отчет?"):
                 webbrowser.open(report)
         except Exception as e:
@@ -942,32 +952,9 @@ class App(tk.Tk):
         for f in files:
             fp = os.path.join(folder, f)
             try:
-                df = data_loader.load_or_generate(
-                    fp,
-                    preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
-                    log_transform=self._as_bool(self.preproc_log_transform),
-                    remove_outliers=self._as_bool(self.preproc_remove_outliers),
-                    outlier_rule=str(self._as_str(self.preproc_outlier_rule)),
-                    outlier_action=str(self._as_str(self.preproc_outlier_action)),
-                    outlier_z=self._as_float(self.preproc_outlier_z, 5.0),
-                    outlier_k=self._as_float(self.preproc_outlier_k, 1.5),
-                    outlier_p_low=self._as_float(self.preproc_outlier_p_low, 0.5),
-                    outlier_p_high=self._as_float(self.preproc_outlier_p_high, 99.5),
-                    outlier_hampel_window=self._as_int(self.preproc_outlier_hampel_window, 7),
-                    outlier_jump_thr=(None if self._as_float(self.preproc_outlier_jump_thr, 0.0) == 0.0 else self._as_float(self.preproc_outlier_jump_thr, 0.0)),
-                    outlier_local_median_window=self._as_int(self.preproc_outlier_local_median_window, 7),
-                    normalize=self._as_bool(self.preproc_normalize),
-                    normalize_mode=str(self._as_str(self.preproc_normalize_mode)),
-                    rank_ties=str(self._as_str(self.preproc_rank_ties)),
-                    fill_missing=self._as_bool(self.preproc_fill_missing),
-                    remove_ar1=self._as_bool(self.preproc_remove_ar1),
-                    remove_ar_order=self._as_int(self.preproc_ar_order, 1) or 1,
-                    remove_seasonality=self._as_bool(self.preproc_remove_seasonality),
-                    season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
-                )
                 name = Path(f).stem
                 file_out_dir = os.path.join(out_root, name)
-                self._run_tool(df, file_out_dir, "report")
+                self._run_tool(fp, file_out_dir, "report")
                 success_count += 1
             except Exception as e:
                 print(f"Failed to process {f}: {e}")
