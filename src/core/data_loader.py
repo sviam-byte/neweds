@@ -14,6 +14,7 @@ from .preprocessing import additional_preprocessing
 from statsmodels.tsa.stattools import adfuller
 import numpy as np
 from scipy import stats
+from scipy.io import loadmat
 
 
 @dataclass
@@ -290,6 +291,58 @@ def _detect_time_like_col(col: pd.Series) -> bool:
     return False
 
 
+
+
+def _mat_value_candidates(obj: Any) -> list[tuple[str, np.ndarray]]:
+    """Извлекает числовые 2D/1D массивы из MAT-словаря/объекта."""
+    out: list[tuple[str, np.ndarray]] = []
+
+    def _walk(prefix: str, value: Any) -> None:
+        if isinstance(value, np.ndarray):
+            if value.dtype == object:
+                try:
+                    if value.size == 1:
+                        _walk(prefix, value.reshape(-1)[0])
+                    return
+                except Exception:
+                    return
+            if value.ndim in (1, 2) and np.issubdtype(value.dtype, np.number):
+                out.append((prefix, value))
+            return
+
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if str(k).startswith("__"):
+                    continue
+                _walk(f"{prefix}.{k}" if prefix else str(k), v)
+            return
+
+    _walk("", obj)
+    return out
+
+
+def _mat_to_dataframe(filepath: str) -> pd.DataFrame:
+    """Загружает .mat и выбирает наиболее подходящую числовую матрицу."""
+    blob = loadmat(filepath, squeeze_me=True, struct_as_record=False, simplify_cells=True)
+    cand = _mat_value_candidates(blob)
+    if not cand:
+        raise ValueError("No numeric arrays found in MAT file")
+
+    def _score(item: tuple[str, np.ndarray]) -> tuple[int, int, int]:
+        _name, arr = item
+        a = np.asarray(arr)
+        return (1 if a.ndim == 2 else 0, int(a.size), int(min(a.shape)) if a.ndim >= 1 else 0)
+
+    name, arr = max(cand, key=_score)
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    df = pd.DataFrame(arr)
+    try:
+        df.attrs["mat_source"] = str(name)
+    except Exception:
+        pass
+    return df
 def read_input_table(
     filepath: str,
     header: str = "auto",
@@ -297,7 +350,7 @@ def read_input_table(
     usecols: Any = "auto",
     csv_engine: str = "auto",
 ) -> pd.DataFrame:
-    """Чтение CSV/XLSX/PARQUET с поддержкой автодетекта заголовка и «CSV в ячейке».
+    """Чтение CSV/XLSX/PARQUET/MAT с поддержкой автодетекта заголовка и «CSV в ячейке».
 
     Для больших файлов:
     - XLSX + usecols="auto": сначала читаем только 1-ю колонку (частый кейс, когда
@@ -313,6 +366,11 @@ def read_input_table(
         if header not in {"auto", "yes", "no"}:
             raise ValueError("header must be one of: auto|yes|no")
         return df0
+
+    if low.endswith(".mat"):
+        if header not in {"auto", "yes", "no"}:
+            raise ValueError("header must be one of: auto|yes|no")
+        return _mat_to_dataframe(fp)
 
     if low.endswith(".csv"):
         # Важно: low_memory=False выключает покусковую догадку типов в pandas

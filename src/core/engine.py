@@ -30,7 +30,10 @@ from src.analysis.dimred import apply_dimred
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
-from hurst import compute_Hc
+try:
+    from hurst import compute_Hc
+except ImportError:  # pragma: no cover - optional dependency path
+    compute_Hc = None
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill
@@ -98,6 +101,46 @@ def _nolds_or_warn() -> bool:
             msg += f"\nПричина импорта: {_NOLDS_IMPORT_ERROR}"
         logging.error(msg)
     return False
+
+
+def _safe_parallel_config(requested_n_jobs: int | None = None, backend: str | None = None) -> tuple[int, str]:
+    """Возвращает безопасную конфигурацию параллелизма для UI/desktop сценариев.
+
+    По умолчанию избегаем process-based loky, т.к. он дублирует память и
+    часто нестабилен внутри Streamlit/desktop GUI. Поведение можно
+    переопределить через env TS_TOOL_PARALLEL_BACKEND / TS_TOOL_N_JOBS.
+    """
+    env_jobs = os.getenv("TS_TOOL_N_JOBS", "").strip()
+    env_backend = os.getenv("TS_TOOL_PARALLEL_BACKEND", "").strip().lower()
+
+    if env_jobs:
+        try:
+            requested_n_jobs = int(env_jobs)
+        except Exception:
+            pass
+    if env_backend:
+        backend = env_backend
+
+    try:
+        cpu_n = max(1, int(os.cpu_count() or 1))
+    except Exception:
+        cpu_n = 1
+
+    try:
+        nj = int(requested_n_jobs) if requested_n_jobs is not None else 1
+    except Exception:
+        nj = 1
+
+    if nj == -1:
+        nj = max(1, min(cpu_n - 1 if cpu_n > 1 else 1, 4))
+    nj = max(1, min(int(nj), max(1, cpu_n)))
+
+    be = str(backend or "threading").strip().lower()
+    if be not in {"threading", "loky", "multiprocessing", "sequential"}:
+        be = "threading"
+    if be == "sequential" or nj <= 1:
+        return 1, "sequential"
+    return nj, be
 
 # Импорты из нашей новой структуры
 from ..config import *
@@ -249,9 +292,13 @@ def AH_matrix(df: pd.DataFrame, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_T
     if len(effective) > 800:
         try:
             from joblib import Parallel, delayed
-            results = Parallel(n_jobs=-1, backend="loky")(
-                delayed(_compute_ah_pair)(p) for p in effective
-            )
+            nj, backend = _safe_parallel_config(-1, None)
+            if nj <= 1 or backend == "sequential":
+                results = [_compute_ah_pair(p) for p in effective]
+            else:
+                results = Parallel(n_jobs=nj, backend=backend)(
+                    delayed(_compute_ah_pair)(p) for p in effective
+                )
         except ImportError:
             results = [_compute_ah_pair(p) for p in effective]
     else:
@@ -1115,11 +1162,7 @@ def analyze_sliding_windows_with_metric(
 
     # Параллелизация только внутри прохода по стартам окна.
     # По умолчанию работаем в 1 потоке ради предсказуемого поведения UI.
-    try:
-        nj = int(n_jobs) if n_jobs is not None else 1
-    except Exception:
-        nj = 1
-    nj = int(max(1, nj))
+    nj, safe_backend = _safe_parallel_config(n_jobs, parallel_backend)
 
     def _compute_one_start(start: int) -> tuple[int, int, float, Optional[np.ndarray]]:
         end = start + w
@@ -1153,8 +1196,10 @@ def analyze_sliding_windows_with_metric(
         if Parallel is None:
             computed = [_compute_one_start(st) for st in starts]
         else:
-            backend = str(parallel_backend or "loky")
-            computed = Parallel(n_jobs=nj, backend=backend)(delayed(_compute_one_start)(st) for st in starts)
+            if safe_backend == "sequential":
+                computed = [_compute_one_start(st) for st in starts]
+            else:
+                computed = Parallel(n_jobs=nj, backend=safe_backend)(delayed(_compute_one_start)(st) for st in starts)
 
     for start, end, score_f, mat in computed:
         xs.append(int(start))
@@ -2704,85 +2749,130 @@ class BigMasterTool:
         return ExcelReportWriter(self).write(save_path, **kwargs)
 
     def export_series_bundle(self, save_path: str) -> str:
-        """Сохраняет сами ряды (RAW/после предобработки/после auto-diff/normalized) единым файлом.
+        """Сохраняет ряды и метаданные рядом с отчётами.
 
-        Это отдельный файл, который удобно держать рядом с отчётами (HTML/Excel).
+        Для небольших таблиц пишет единый XLSX. Для слишком больших — делает папку с CSV/TSV,
+        чтобы не упираться в лимиты Excel и не раздувать память.
         """
+        import json
         import pandas as pd
+
+        excel_max_rows = 1_048_576
+        excel_max_cols = 16_384
+        csv_threshold_cells = int(os.getenv("TS_TOOL_SERIES_BUNDLE_MAX_CELLS", "5000000") or 5000000)
 
         def _pick(df):
             try:
-                return df if df is not None and not getattr(df, 'empty', True) else None
+                return df if df is not None and not getattr(df, "empty", True) else None
             except Exception:
                 return None
 
-        # Не используем `or` для DataFrame: bool(DataFrame) неоднозначен и может
-        # выбросить ValueError. Явно проверяем None после _pick(...).
-        raw_df = _pick(getattr(self, 'data_raw', None))
+        def _shape(df) -> tuple[int, int]:
+            try:
+                return int(df.shape[0]), int(df.shape[1])
+            except Exception:
+                return 0, 0
+
+        def _can_store_in_xlsx(df) -> bool:
+            r, c = _shape(df)
+            cells = r * max(c, 1)
+            return r <= excel_max_rows and c <= excel_max_cols and cells <= csv_threshold_cells
+
+        def _write_delimited(df: pd.DataFrame, path: Path) -> str:
+            suffix = path.suffix.lower()
+            sep = "	" if suffix == ".tsv" else ","
+            df.to_csv(path, index=False, sep=sep)
+            return str(path)
+
+        raw_df = _pick(getattr(self, "data_raw", None))
         if raw_df is None:
-            raw_df = _pick(getattr(self, 'data', None))
+            raw_df = _pick(getattr(self, "data", None))
         if raw_df is None:
             raw_df = pd.DataFrame()
 
-        pre_df = _pick(getattr(self, 'data_preprocessed', None))
+        pre_df = _pick(getattr(self, "data_preprocessed", None))
         if pre_df is None:
-            pre_df = _pick(getattr(self, 'data', None))
+            pre_df = _pick(getattr(self, "data", None))
         if pre_df is None:
             pre_df = pd.DataFrame()
 
-        ad_df = _pick(getattr(self, 'data_after_autodiff', None))
+        ad_df = _pick(getattr(self, "data_after_autodiff", None))
         if ad_df is None:
-            ad_df = _pick(getattr(self, 'data', None))
+            ad_df = _pick(getattr(self, "data", None))
         if ad_df is None:
             ad_df = pd.DataFrame()
 
-        norm_df = _pick(getattr(self, 'data_normalized', None))
+        norm_df = _pick(getattr(self, "data_normalized", None))
         if norm_df is None:
             norm_df = pd.DataFrame()
 
-        with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
-            raw_df.to_excel(writer, sheet_name='RAW', index=False)
-            pre_df.to_excel(writer, sheet_name='PREPROCESSED', index=False)
-            ad_df.to_excel(writer, sheet_name='AFTER_AUTODIFF', index=False)
-            if not norm_df.empty:
-                norm_df.to_excel(writer, sheet_name='NORMALIZED', index=False)
-
-            # QC (если есть)
-            try:
-                qc_raw = getattr(self, 'qc_raw', None)
-                qc_clean = getattr(self, 'qc_clean', None)
-                if qc_raw is not None and not getattr(qc_raw, 'empty', True):
-                    qc_raw.to_excel(writer, sheet_name='QC_RAW', index=False)
-                if qc_clean is not None and not getattr(qc_clean, 'empty', True):
-                    qc_clean.to_excel(writer, sheet_name='QC_CLEAN', index=False)
-            except Exception:
-                pass
-
-            # Координаты (если есть)
-            try:
-                coords = getattr(self, 'coords_df', None)
-                if coords is not None and not getattr(coords, 'empty', True):
-                    coords.to_excel(writer, sheet_name='COORDS', index=False)
-            except Exception:
-                pass
-
-        logging.info('[Series] Сохранены ряды: %s', save_path)
-
-        # Метаданные прогона рядом (JSON)
+        datasets = {
+            "RAW": raw_df,
+            "PREPROCESSED": pre_df,
+            "AFTER_AUTODIFF": ad_df,
+        }
+        if not norm_df.empty:
+            datasets["NORMALIZED"] = norm_df
         try:
-            import json
-            meta_path = Path(save_path).with_suffix('.meta.json')
+            qc_raw = getattr(self, "qc_raw", None)
+            qc_clean = getattr(self, "qc_clean", None)
+            if qc_raw is not None and not getattr(qc_raw, "empty", True):
+                datasets["QC_RAW"] = qc_raw
+            if qc_clean is not None and not getattr(qc_clean, "empty", True):
+                datasets["QC_CLEAN"] = qc_clean
+        except Exception:
+            pass
+        try:
+            coords = getattr(self, "coords_df", None)
+            if coords is not None and not getattr(coords, "empty", True):
+                datasets["COORDS"] = coords
+        except Exception:
+            pass
+
+        save_path_obj = Path(save_path)
+        warnings: list[str] = []
+        sheet_shapes = {name: list(_shape(df)) for name, df in datasets.items()}
+        needs_split = any(not _can_store_in_xlsx(df) for df in datasets.values())
+
+        artifact_paths: dict[str, str] = {}
+        if not needs_split:
+            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                for sheet_name, df in datasets.items():
+                    df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            artifact_paths["series_bundle_xlsx"] = str(save_path_obj)
+            logging.info("[Series] Сохранены ряды в XLSX: %s", save_path)
+        else:
+            bundle_dir = save_path_obj.with_suffix("")
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            for sheet_name, df in datasets.items():
+                out_file = bundle_dir / f"{sheet_name.lower()}.csv"
+                _write_delimited(df, out_file)
+                artifact_paths[f"{sheet_name.lower()}_csv"] = str(out_file)
+                if not _can_store_in_xlsx(df):
+                    warnings.append(
+                        f"{sheet_name}: слишком большой для одного XLSX sheet, сохранён отдельным CSV; shape={tuple(_shape(df))}"
+                    )
+            save_path = str(bundle_dir)
+            logging.info("[Series] Сохранены ряды в папку с CSV: %s", bundle_dir)
+
+        try:
+            meta_path = save_path_obj.with_suffix(".meta.json")
             meta = {
-                'series_file': str(Path(save_path).name),
-                'data_shape': list(getattr(self, 'data', pd.DataFrame()).shape),
-                'preprocessing': self.get_preprocessing_summary(),
-                'methods': list(getattr(self, 'results', {}).keys()),
-                'results_meta': getattr(self, 'results_meta', {}),
+                "series_artifact": str(Path(save_path).name),
+                "series_artifact_type": "directory" if needs_split else "xlsx",
+                "sheet_shapes": sheet_shapes,
+                "warnings": warnings,
+                "artifacts": artifact_paths,
+                "data_shape": list(getattr(self, "data", pd.DataFrame()).shape),
+                "preprocessing": self.get_preprocessing_summary(),
+                "methods": list(getattr(self, "results", {}).keys()),
+                "results_meta": getattr(self, "results_meta", {}),
             }
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
         return save_path
+
 
     def _maybe_apply_dimred(self, **kwargs) -> None:
         """Предобработка: опциональное уменьшение размерности для больших N."""

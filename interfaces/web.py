@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import zipfile
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +42,29 @@ def _parse_int_list_text(text: str) -> list[int] | None:
 
 
 
+def _save_uploaded_file(uploaded, dst_dir: Path) -> Path:
+    """Сохраняет UploadedFile в временную директорию и возвращает путь."""
+    name = Path(getattr(uploaded, "name", "upload.bin")).name
+    out = dst_dir / name
+    out.write_bytes(uploaded.getbuffer())
+    return out
+
+
+def _safe_slug(text: str) -> str:
+    """Нормализует произвольный текст в безопасный slug для имени папки."""
+    safe = "".join(ch for ch in str(text or "item") if ch.isalnum() or ch in "-_. ").strip().replace(" ", "_")
+    return safe or "item"
+
+
+def _zip_tree(src_dir: Path, zip_path: Path) -> Path:
+    """Упаковывает дерево src_dir в zip_path, сохраняя относительные пути."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pp in sorted(src_dir.rglob("*")):
+            if pp.is_file():
+                zf.write(pp, arcname=str(pp.relative_to(src_dir)))
+    return zip_path
+
 
 def _make_run_dir(stem: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -71,17 +96,21 @@ def main() -> None:
 
     source = st.radio(
         "Источник данных",
-        ["Файл (CSV/XLSX)", "Синтетика (формулы)", "Синтетика (пресеты)"],
+        ["Файл (CSV/XLSX/MAT/Parquet)", "Пакет файлов", "Синтетика (формулы)", "Синтетика (пресеты)"],
         index=0,
         horizontal=True,
     )
 
     uploaded_file = None
+    uploaded_files = []
     synth_df: pd.DataFrame | None = None
     synth_name = "synthetic"
 
     if source.startswith("Файл"):
-        uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx"])
+        uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls", "mat", "parquet"])
+    elif source.startswith("Пакет"):
+        uploaded_files = st.file_uploader("Выберите несколько файлов", type=["csv", "xlsx", "xls", "mat", "parquet"], accept_multiple_files=True) or []
+        st.caption("Файлы будут обработаны по одному. Для каждого входа создаётся отдельная папка результата и общий ZIP.")
     elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
             c0, c1, c2 = st.columns(3)
@@ -408,6 +437,185 @@ def main() -> None:
             "season_period": (None if int(season_period)==0 else int(season_period)),
             "qc_enabled": bool(qc_enabled),
         })
+
+    if source.startswith("Пакет"):
+        st.subheader("Пакетная обработка")
+        if not uploaded_files:
+            st.info("Загрузи несколько файлов для пакетного расчёта.")
+            return
+
+        if st.button("Запустить пакетный анализ", type="primary"):
+            batch_root = _make_run_dir("batch_web")
+            manifest_rows: list[dict] = []
+            prog = st.progress(0)
+            with tempfile.TemporaryDirectory(prefix="tsa_web_batch_") as tmpdir:
+                tmpdir_p = Path(tmpdir)
+                for i, uf in enumerate(uploaded_files, start=1):
+                    src_path = _save_uploaded_file(uf, tmpdir_p)
+                    stem = _safe_slug(Path(src_path).stem)
+                    run_dir = batch_root / stem
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    row = {
+                        "input_file": getattr(uf, "name", src_path.name),
+                        "status": "error",
+                        "run_dir": str(run_dir),
+                        "excel_path": "",
+                        "html_path": "",
+                        "series_path": "",
+                        "error": "",
+                    }
+                    try:
+                        cfg = engine.AnalysisConfig(
+                            max_lag=int(max_lag),
+                            p_value_alpha=float(alpha),
+                            graph_threshold=float(threshold),
+                            enable_experimental=bool(enable_experimental),
+                            auto_difference=bool(check_stat),
+                            pvalue_correction=str(pvalue_correction),
+                        )
+                        tool = engine.BigMasterTool(config=cfg)
+                        tool.load_data_excel(
+                            str(src_path),
+                            preprocess=bool(preprocess),
+                            fill_missing=bool(fill_missing),
+                            normalize=bool(normalize),
+                            normalize_mode=str(normalize_mode),
+                            rank_ties=str(rank_ties),
+                            remove_outliers=bool(remove_outliers),
+                            outlier_rule=str(outlier_rule),
+                            outlier_action=str(outlier_action).split()[0],
+                            outlier_z=float(outlier_z),
+                            outlier_k=float(outlier_k),
+                            outlier_p_low=float(outlier_p_low),
+                            outlier_p_high=float(outlier_p_high),
+                            outlier_hampel_window=int(outlier_hampel_window),
+                            outlier_jump_thr=(None if float(outlier_jump_thr) == 0.0 else float(outlier_jump_thr)),
+                            outlier_local_median_window=int(outlier_local_median_window),
+                            log_transform=log_transform,
+                            remove_ar1=bool(remove_ar1),
+                            remove_seasonality=bool(remove_seasonality),
+                            season_period=(None if int(season_period) == 0 else int(season_period)),
+                            qc_enabled=bool(qc_enabled),
+                        )
+                        window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
+                        stride_scan = None if int(window_stride_scan) == 0 else int(window_stride_scan)
+                        stride_main = None if int(window_stride_main) == 0 else int(window_stride_main)
+                        run_window_stride = stride_scan if stride_scan is not None else stride_main
+                        method_options = None
+                        if method_options_text.strip():
+                            try:
+                                method_options = json.loads(method_options_text)
+                                if not isinstance(method_options, dict):
+                                    method_options = None
+                            except Exception:
+                                method_options = None
+                        w_grid = list(range(int(window_min), int(window_max) + 1, max(1, int(window_step))))
+                        tool.run_selected_methods(
+                            selected_methods,
+                            max_lag=int(max_lag),
+                            lag_selection=lag_selection,
+                            lag=int(lag),
+                            control_strategy=(
+                                "none"
+                                if control_strategy == "нет"
+                                else (
+                                    "global_mean"
+                                    if control_strategy == "глобальный сигнал"
+                                    else ("global_mean_trend_pca" if "PCA" in control_strategy else "global_mean_trend")
+                                )
+                            ),
+                            control_pca_k=int(control_pca_k or 0),
+                            window_sizes=window_sizes_main,
+                            window_stride=run_window_stride,
+                            window_policy=window_policy,
+                            window_cube_level=window_cube_level,
+                            window_cube_eval_limit=int(window_cube_eval_limit),
+                            method_options=method_options,
+                            dimred_enabled=bool(dimred_enabled),
+                            dimred_method=str(dimred_method).split()[0],
+                            dimred_target=int(dimred_target),
+                            dimred_target_var=(float(dimred_target_var) if float(dimred_target_var) > 0 else None),
+                            dimred_priority=str(dimred_priority),
+                            dimred_pca_solver=str(dimred_pca_solver),
+                            scan_window_pos=(bool(scan_window_pos) if include_scans else False),
+                            scan_window_size=(bool(scan_window_size) if include_scans else False),
+                            scan_lag=(bool(scan_lag) if include_scans else False),
+                            scan_cube=(bool(scan_cube) if include_scans else False),
+                            window_sizes_grid=w_grid,
+                            window_min=int(window_min),
+                            window_max=int(window_max),
+                            window_step=int(window_step),
+                            window_size=int(window_size_default),
+                            window_start_min=int(window_start_min),
+                            window_start_max=int(window_start_max),
+                            window_max_windows=int(window_max_windows),
+                            lag_min=int(lag_min),
+                            lag_max=int(lag_max),
+                            lag_step=int(lag_step),
+                            cube_combo_limit=int(cube_combo_limit),
+                            cube_eval_limit=int(cube_eval_limit),
+                            cube_matrix_mode=str(cube_matrix_mode),
+                            cube_matrix_limit=int(cube_matrix_limit),
+                            cube_gallery_mode=str(cube_gallery_mode),
+                            cube_gallery_k=int(cube_gallery_k),
+                            cube_gallery_limit=int(cube_gallery_limit),
+                        )
+                        if calc_topology:
+                            try:
+                                tool.calculate_graph_metrics(threshold=float(graph_threshold))
+                            except Exception as exc:
+                                row["error"] = f"graph_metrics: {exc}"
+                        series_path = run_dir / f"{stem}_series.xlsx"
+                        if bool(save_series_bundle):
+                            try:
+                                tool.export_series_bundle(str(series_path))
+                            except Exception as exc:
+                                row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
+                        excel_path = run_dir / f"{stem}_full.xlsx"
+                        html_path = run_dir / f"{stem}_report.html"
+                        if output_mode in {"excel", "both"}:
+                            tool.export_big_excel(str(excel_path), threshold=threshold, p_value_alpha=alpha)
+                            row["excel_path"] = str(excel_path)
+                        if output_mode in {"html", "both"}:
+                            tool.export_html_report(
+                                str(html_path),
+                                graph_threshold=threshold,
+                                p_alpha=alpha,
+                                include_diagnostics=include_diagnostics,
+                                include_scans=include_scans,
+                                include_matrix_tables=include_matrix_tables,
+                                include_fft_plots=include_fft_plots,
+                                harmonic_top_k=int(harmonic_top_k),
+                                include_series_files=True,
+                            )
+                            row["html_path"] = str(html_path)
+                        if series_path.exists():
+                            row["series_path"] = str(series_path)
+                        try:
+                            tool.export_connectivity_bundle(
+                                str(run_dir),
+                                name_prefix=stem,
+                                include_scan_matrices=bool(include_scans),
+                            )
+                        except Exception as exc:
+                            row["error"] = (row["error"] + " | " if row["error"] else "") + f"bundle: {exc}"
+                        row["status"] = "ok" if not row["error"] else "partial"
+                    except Exception as exc:
+                        row["status"] = "error"
+                        row["error"] = str(exc)
+                    manifest_rows.append(row)
+                    prog.progress(int(100 * i / max(1, len(uploaded_files))))
+
+            manifest_path = batch_root / "batch_manifest.csv"
+            manifest_df = pd.DataFrame(manifest_rows)
+            manifest_df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
+            zip_path = _zip_tree(batch_root, batch_root.with_suffix(".zip"))
+            st.success("Пакетный расчёт завершён")
+            st.code(str(batch_root))
+            st.dataframe(manifest_df, use_container_width=True)
+            st.download_button("Скачать manifest.csv", manifest_path.read_bytes(), manifest_path.name)
+            st.download_button("Скачать ZIP результатов", zip_path.read_bytes(), zip_path.name)
+        return
 
     if st.button("Запустить анализ", type="primary"):
         if source.startswith("Файл") and not uploaded_file:
