@@ -12,4 +12,5 @@ statsmodels>=0.14
 streamlit>=1.37
 tqdm>=4.66
 hurst>=0.0.5
+h5py>=3.0
 dcor>=0.6  # optional: O(N log N) distance correlation

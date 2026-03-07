@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-_SUPPORTED_EXTS = (".csv", ".xlsx", ".xls", ".parquet", ".mat")
+_SUPPORTED_EXTS = (".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5")
 
 
 def _iter_supported_input_files(folder: str, recursive: bool = False) -> list[str]:

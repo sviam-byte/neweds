@@ -16,6 +16,11 @@ import numpy as np
 from scipy import stats
 from scipy.io import loadmat
 
+try:
+    import h5py as _h5py
+except ImportError:
+    _h5py = None  # type: ignore[assignment]
+
 
 @dataclass
 class PreprocessReport:
@@ -343,6 +348,197 @@ def _mat_to_dataframe(filepath: str) -> pd.DataFrame:
     except Exception:
         pass
     return df
+
+
+def _load_h5_neuroimaging(
+    filepath: str,
+    *,
+    feature_limit: int | None = None,
+    feature_sampling: str = "variance",
+    feature_seed: int = 13,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    time_stride: int | None = None,
+    nonzero_threshold: float = 1e-6,
+    default_feature_limit: int = 5000,
+) -> pd.DataFrame:
+    """Загрузка 4D нейровизуализационного HDF5 (X,Y,Z,T) в DataFrame time×voxel.
+
+    Поддерживает формат с dataset shape=(X,Y,Z,T) dtype=float32.
+    Возвращает DataFrame shape=(T_eff, N_voxels) с attrs["coords"].
+
+    Если feature_limit не задан, используется default_feature_limit (5000).
+    Для 700K+ вокселей subsampling по дисперсии критичен для памяти.
+    """
+    if _h5py is None:
+        raise ImportError(
+            "h5py не установлен. Для загрузки HDF5 файлов: pip install h5py"
+        )
+
+    with _h5py.File(filepath, "r") as f:
+        # Ищем наибольший 4D dataset
+        ds = None
+        ds_name = None
+
+        def _scan_datasets(group, prefix=""):
+            nonlocal ds, ds_name
+            for name in group:
+                path = f"{prefix}/{name}" if prefix else name
+                obj = group[name]
+                if isinstance(obj, _h5py.Dataset):
+                    if obj.ndim == 4:
+                        if ds is None or obj.size > ds.size:
+                            ds = obj
+                            ds_name = path
+                elif isinstance(obj, _h5py.Group):
+                    _scan_datasets(obj, path)
+
+        _scan_datasets(f)
+
+        # Fallback: 2D dataset (уже time×features или features×time)
+        if ds is None:
+            ds2d = None
+            ds2d_name = None
+            for name in f:
+                obj = f[name]
+                if isinstance(obj, _h5py.Dataset) and obj.ndim == 2:
+                    if ds2d is None or obj.size > ds2d.size:
+                        ds2d = obj
+                        ds2d_name = name
+            if ds2d is not None:
+                logging.info("[HDF5] Fallback to 2D dataset '%s' shape=%s", ds2d_name, ds2d.shape)
+                arr = np.asarray(ds2d[()], dtype=np.float32)
+                if arr.shape[0] < arr.shape[1]:
+                    arr = arr.T
+                df = pd.DataFrame(arr, columns=[f"c{i+1}" for i in range(arr.shape[1])])
+                return df
+            raise ValueError(
+                f"Нет подходящего 4D/2D dataset в HDF5: {filepath}. "
+                f"Доступные ключи: {list(f.keys())}"
+            )
+
+        shape = ds.shape
+        logging.info("[HDF5] Dataset '%s' shape=%s dtype=%s", ds_name, shape, ds.dtype)
+
+        # Определяем ось времени. Конвенция нейровизуализации: (X,Y,Z,T) → последняя ось.
+        # Проверяем: если последняя размерность ≥ каждой из остальных, это T.
+        # Иначе берём ось с наибольшим значением.
+        spatial_dims = list(shape[:3])
+        t_dim = shape[3] if len(shape) == 4 else shape[-1]
+        T_axis = 3
+        if t_dim < max(spatial_dims):
+            # Нестандартный порядок осей: T может быть первой (T,X,Y,Z)
+            T_axis = int(np.argmax(shape))
+            logging.warning(
+                "[HDF5] Нестандартный порядок осей: T_axis=%d (shape=%s)", T_axis, shape
+            )
+
+        T = int(shape[T_axis])
+
+        # Slicing по времени (до загрузки всего массива в память)
+        t0 = int(time_start) if time_start is not None else 0
+        t1 = int(time_end) if time_end is not None else T
+        ts = int(time_stride) if time_stride is not None and int(time_stride) > 0 else 1
+        t0 = max(0, min(t0, T))
+        t1 = max(t0, min(t1, T))
+
+        idx = [slice(None)] * len(shape)
+        idx[T_axis] = slice(t0, t1, ts)
+
+        logging.info("[HDF5] Loading slice %s ...", idx)
+        arr4d = np.asarray(ds[tuple(idx)], dtype=np.float32)
+
+    # Перемещаем ось T в конец если она не там
+    if T_axis != len(arr4d.shape) - 1:
+        arr4d = np.moveaxis(arr4d, T_axis, -1)
+
+    *spatial, T_actual = arr4d.shape
+    N_total = int(np.prod(spatial))
+
+    logging.info(
+        "[HDF5] Spatial=%s T=%d, total voxels=%d, array=%.1f MB",
+        spatial, T_actual, N_total,
+        arr4d.nbytes / (1024**2),
+    )
+
+    # Reshape в (N_voxels, T)
+    voxel_time = arr4d.reshape(N_total, T_actual)
+
+    # Координатная сетка
+    grids = np.meshgrid(
+        *[np.arange(s, dtype=np.int32) for s in spatial],
+        indexing="ij",
+    )
+    coords_flat = np.column_stack([g.ravel() for g in grids])  # (N_total, 3)
+
+    # Маска: убираем нулевые и константные воксели
+    voxel_var = np.var(voxel_time, axis=1, dtype=np.float64)
+    voxel_abs_sum = np.sum(np.abs(voxel_time), axis=1, dtype=np.float64)
+    nonzero_mask = (voxel_abs_sum > nonzero_threshold) & (voxel_var > 1e-12)
+    n_nonzero = int(nonzero_mask.sum())
+
+    logging.info("[HDF5] Nonzero + varying voxels: %d / %d", n_nonzero, N_total)
+
+    if n_nonzero == 0:
+        raise ValueError(
+            f"Все воксели нулевые или константные в {filepath}"
+        )
+
+    voxel_time = voxel_time[nonzero_mask]
+    coords_flat = coords_flat[nonzero_mask]
+    voxel_var = voxel_var[nonzero_mask]
+
+    # Ограничение числа вокселей (критично для памяти/вычислений)
+    k = feature_limit
+    if k is None or k <= 0:
+        k = default_feature_limit
+    k = int(min(k, n_nonzero))
+
+    if n_nonzero > k:
+        mode = str(feature_sampling or "variance").strip().lower()
+        if mode in {"variance", "var", "topvar"}:
+            top_idx = np.argpartition(voxel_var, -k)[-k:]
+            top_idx = top_idx[np.argsort(-voxel_var[top_idx])]
+        elif mode in {"random", "rand"}:
+            rng = np.random.default_rng(int(feature_seed))
+            top_idx = np.sort(rng.choice(n_nonzero, size=k, replace=False))
+        elif mode in {"activity", "act"}:
+            activity = np.sum(np.abs(voxel_time), axis=1, dtype=np.float64)
+            top_idx = np.argpartition(activity, -k)[-k:]
+            top_idx = top_idx[np.argsort(-activity[top_idx])]
+        else:
+            top_idx = np.arange(k)
+
+        voxel_time = voxel_time[top_idx]
+        coords_flat = coords_flat[top_idx]
+        logging.info("[HDF5] Subsampled: %d -> %d voxels (mode=%s)", n_nonzero, k, mode)
+
+    # Освобождаем 4D массив
+    del arr4d
+
+    # Строим voxel IDs
+    n_voxels = voxel_time.shape[0]
+    i_str = np.char.zfill(np.arange(n_voxels, dtype=np.int64).astype(str), 4)
+    xs = coords_flat[:, 0].astype(str)
+    ys = coords_flat[:, 1].astype(str)
+    zs = coords_flat[:, 2].astype(str) if coords_flat.shape[1] > 2 else np.full(n_voxels, "0")
+    voxel_ids = [
+        f"v{i_str[i]}_x{xs[i]}_y{ys[i]}_z{zs[i]}" for i in range(n_voxels)
+    ]
+
+    # DataFrame координат (совместим с voxel_wide_to_timeseries)
+    coords_dict = {"voxel_id": voxel_ids, "x": coords_flat[:, 0].astype(int), "y": coords_flat[:, 1].astype(int)}
+    if coords_flat.shape[1] > 2:
+        coords_dict["z"] = coords_flat[:, 2].astype(int)
+    coords_df = pd.DataFrame(coords_dict)
+
+    # DataFrame time×voxel
+    out = pd.DataFrame(voxel_time.T, columns=voxel_ids, dtype=np.float32)
+    out.attrs["coords"] = coords_df
+
+    logging.info("[HDF5] Output DataFrame: %s (%.1f MB)", out.shape, out.memory_usage(deep=True).sum() / (1024**2))
+    return out
+
 def read_input_table(
     filepath: str,
     header: str = "auto",
@@ -371,6 +567,11 @@ def read_input_table(
         if header not in {"auto", "yes", "no"}:
             raise ValueError("header must be one of: auto|yes|no")
         return _mat_to_dataframe(fp)
+
+    if low.endswith((".h5", ".hdf5", ".hdf")):
+        # HDF5 обрабатывается целиком в load_or_generate → _load_h5_neuroimaging.
+        # Если вызвали read_input_table напрямую, делаем базовую загрузку.
+        return _load_h5_neuroimaging(fp)
 
     if low.endswith(".csv"):
         # Важно: low_memory=False выключает покусковую догадку типов в pandas
@@ -1275,32 +1476,47 @@ def load_or_generate(
         для последующей визуализации шагов предобработки в UI/HTML-отчёте.
     """
     try:
-        raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
+        _fp_low = str(filepath).lower()
 
-        # Автопонижение типа: лучше осознанно перейти в float32,
-        # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
-        dtype_eff = dtype
-        if dtype_eff is None and auto_float32:
-            try:
-                n_rows, n_cols = int(raw.shape[0]), int(raw.shape[1])
-                n_cells = n_rows * n_cols
-                if n_cols >= 128 or n_cells >= 2_000_000:
-                    dtype_eff = "float32"
-            except Exception:
-                pass
+        # HDF5 neuroimaging: отдельный путь, т.к. 4D→2D конверсия
+        # принципиально отличается от табличного CSV/Excel пайплайна.
+        if _fp_low.endswith((".h5", ".hdf5", ".hdf")):
+            df = _load_h5_neuroimaging(
+                filepath,
+                feature_limit=feature_limit,
+                feature_sampling=feature_sampling or "variance",
+                feature_seed=feature_seed,
+                time_start=time_start,
+                time_end=time_end,
+                time_stride=time_stride,
+            )
+        else:
+            raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
 
-        df = tidy_timeseries_table(
-            raw,
-            time_col=time_col,
-            transpose=transpose,
-            dtype=dtype_eff,
-            time_start=time_start,
-            time_end=time_end,
-            time_stride=time_stride,
-            feature_limit=feature_limit,
-            feature_sampling=feature_sampling,
-            feature_seed=feature_seed,
-        )
+            # Автопонижение типа: лучше осознанно перейти в float32,
+            # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
+            dtype_eff = dtype
+            if dtype_eff is None and auto_float32:
+                try:
+                    n_rows, n_cols = int(raw.shape[0]), int(raw.shape[1])
+                    n_cells = n_rows * n_cols
+                    if n_cols >= 128 or n_cells >= 2_000_000:
+                        dtype_eff = "float32"
+                except Exception:
+                    pass
+
+            df = tidy_timeseries_table(
+                raw,
+                time_col=time_col,
+                transpose=transpose,
+                dtype=dtype_eff,
+                time_start=time_start,
+                time_end=time_end,
+                time_stride=time_stride,
+                feature_limit=feature_limit,
+                feature_sampling=feature_sampling,
+                feature_seed=feature_seed,
+            )
         coords_df = None
         try:
             coords_df = df.attrs.get("coords")

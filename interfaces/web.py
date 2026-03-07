@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import EXPERIMENTAL_METHODS, SAVE_FOLDER, STABLE_METHODS
 from src.core import engine, generator
 from src.core.preprocessing import configure_warnings
+from src.validation.runner import run_quick_validation, run_full_validation, run_validation
+from src.validation.scenarios import ALL_SCENARIOS, QUICK_SCENARIOS
 
 configure_warnings()
 
@@ -89,6 +91,158 @@ def _maybe_reset_formula_defaults(preset: str) -> None:
         st.session_state["y_expr"] = d["y"]
         st.session_state["z_expr"] = d["z"]
 
+
+
+def _render_validation_tab() -> None:
+    """Вкладка валидации: синтетические сценарии с известным ground truth."""
+    from src.metrics.registry import METRICS_REGISTRY
+
+    st.subheader("Валидация метрик связности")
+    st.markdown(
+        "Синтетические данные с **известной** структурой зависимостей. "
+        "Каждый сценарий проверяет, что метрики корректно обнаруживают (или не обнаруживают) связи."
+    )
+
+    # --- Выбор режима ---
+    mode = st.radio(
+        "Режим",
+        [f"Быстрый ({len(QUICK_SCENARIOS)} сценария × стабильные метрики)", "Полный (7 сценариев × все метрики)", "Выборочный"],
+        index=0,
+        horizontal=True,
+        key="val_mode",
+    )
+
+    lag = st.slider("Лаг для directed-метрик", 1, 10, 3, key="val_lag")
+
+    selected_scenarios = list(ALL_SCENARIOS.keys())
+    selected_metrics = list(METRICS_REGISTRY.keys())
+
+    if mode.startswith("Выборочный"):
+        c1, c2 = st.columns(2)
+        with c1:
+            selected_scenarios = st.multiselect(
+                "Сценарии",
+                list(ALL_SCENARIOS.keys()),
+                default=list(ALL_SCENARIOS.keys()),
+                key="val_scenarios",
+            )
+        with c2:
+            selected_metrics = st.multiselect(
+                "Метрики",
+                list(METRICS_REGISTRY.keys()),
+                default=list(METRICS_REGISTRY.keys()),
+                key="val_metrics",
+            )
+
+    # --- Описания сценариев ---
+    with st.expander("Описание сценариев", expanded=False):
+        for name, factory in ALL_SCENARIOS.items():
+            scenario = factory()
+            st.markdown(f"**{name}**: {scenario.description}")
+            st.caption(f"  Проверок: {len(scenario.expectations)}, данные: {scenario.data.shape}")
+
+    # --- Запуск ---
+    if not st.button("Запустить валидацию", type="primary", key="val_run"):
+        return
+
+    stage_box = st.empty()
+    prog = st.progress(0)
+
+    def _val_progress(stage: str, progress: float):
+        try:
+            stage_box.markdown(f"**{stage}**")
+            if progress is not None:
+                prog.progress(int(max(0, min(1, float(progress))) * 100))
+        except Exception:
+            pass
+
+    with st.spinner("Валидация..."):
+        if mode.startswith("Быстрый"):
+            report = run_quick_validation(lag=lag, progress_callback=_val_progress)
+        elif mode.startswith("Полный"):
+            report = run_full_validation(lag=lag, progress_callback=_val_progress)
+        else:
+            report = run_validation(
+                scenario_names=selected_scenarios,
+                metric_names=selected_metrics,
+                lag=lag,
+                progress_callback=_val_progress,
+            )
+
+    prog.progress(100)
+
+    # --- Результаты: сводка ---
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Всего проверок", report.n_total)
+    with c2:
+        st.metric("Пройдено", report.n_passed)
+    with c3:
+        color = "🟢" if report.n_failed == 0 else "🔴"
+        st.metric(f"{color} Провалено", report.n_failed)
+    with c4:
+        st.metric("Время (сек)", f"{report.elapsed_total_sec:.1f}")
+
+    if report.n_failed == 0:
+        st.success("Все проверки пройдены.")
+    else:
+        st.error(f"{report.n_failed} проверок провалено. Подробности ниже.")
+
+    # --- Таблица провалов ---
+    if report.n_failed > 0:
+        st.subheader("Провалившиеся проверки")
+        fail_df = report.failures_df()
+        if not fail_df.empty:
+            st.dataframe(fail_df, use_container_width=True, height=min(400, 50 + 35 * len(fail_df)))
+
+    # --- По сценариям ---
+    st.subheader("Результаты по сценариям")
+    by_scen = report.by_scenario()
+    for s_name, info in by_scen.items():
+        status = "✅" if info["failed"] == 0 else "❌"
+        with st.expander(f"{status} {s_name}: {info['passed']}/{info['total']} пройдено"):
+            rows = []
+            for c in info["checks"]:
+                rows.append({
+                    "metric": c.metric,
+                    "pair": f"({c.pair[0]},{c.pair[1]})",
+                    "check": c.check,
+                    "value": f"{c.actual_value:.4f}" if np.isfinite(c.actual_value) else str(c.actual_value),
+                    "result": "PASS" if c.passed else "FAIL",
+                    "details": c.message,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # --- По метрикам ---
+    st.subheader("Результаты по метрикам")
+    by_met = report.by_metric()
+    met_rows = []
+    for m_name, info in sorted(by_met.items()):
+        status = "✅" if info["failed"] == 0 else "❌"
+        met_rows.append({
+            "metric": f"{status} {m_name}",
+            "passed": info["passed"],
+            "failed": info["failed"],
+            "total": info["total"],
+            "rate": f"{info['passed']/max(1,info['total'])*100:.0f}%",
+        })
+    if met_rows:
+        st.dataframe(pd.DataFrame(met_rows), use_container_width=True)
+
+    # --- Ошибки вычислений ---
+    errors = [r for r in report.metric_results if r.error is not None]
+    if errors:
+        with st.expander(f"⚠️ Ошибки вычислений ({len(errors)})", expanded=False):
+            for r in errors:
+                st.text(f"[{r.scenario}] {r.metric}: {r.error}")
+
+    # --- Полная таблица ---
+    with st.expander("Полная таблица проверок", expanded=False):
+        full_df = report.summary_df()
+        if not full_df.empty:
+            st.dataframe(full_df, use_container_width=True)
+
 def main() -> None:
     st.set_page_config(page_title="Анализ Временных Рядов (Локально)", layout="wide")
     st.title("Анализ Связности Временных Рядов")
@@ -96,7 +250,7 @@ def main() -> None:
 
     source = st.radio(
         "Источник данных",
-        ["Файл (CSV/XLSX/MAT/Parquet)", "Пакет файлов", "Синтетика (формулы)", "Синтетика (пресеты)"],
+        ["Файл (CSV/XLSX/MAT/Parquet)", "Пакет файлов", "Синтетика (формулы)", "Синтетика (пресеты)", "Валидация метрик"],
         index=0,
         horizontal=True,
     )
@@ -107,9 +261,9 @@ def main() -> None:
     synth_name = "synthetic"
 
     if source.startswith("Файл"):
-        uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls", "mat", "parquet"])
+        uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"])
     elif source.startswith("Пакет"):
-        uploaded_files = st.file_uploader("Выберите несколько файлов", type=["csv", "xlsx", "xls", "mat", "parquet"], accept_multiple_files=True) or []
+        uploaded_files = st.file_uploader("Выберите несколько файлов", type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"], accept_multiple_files=True) or []
         st.caption("Файлы будут обработаны по одному. Для каждого входа создаётся отдельная папка результата и общий ZIP.")
     elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
@@ -157,7 +311,7 @@ def main() -> None:
                 except Exception as e:
                     st.error(f"Ошибка генерации: {e}")
 
-    else:
+    elif source.startswith("Синтетика (пресеты)"):
         with st.expander("Синтетика: пресеты", expanded=True):
             preset = st.selectbox(
                 "Набор",
@@ -181,6 +335,10 @@ def main() -> None:
                         st.dataframe(synth_df.head(200))
                 except Exception as e:
                     st.error(f"Ошибка генерации: {e}")
+
+    elif source.startswith("Валидация"):
+        _render_validation_tab()
+        return
 
     # === БЛОК 1: ПРЕДОБРАБОТКА (с пояснениями) ===
     with st.expander("🛠️ 1. Подготовка данных (Preprocessing & DimRed)", expanded=False):
