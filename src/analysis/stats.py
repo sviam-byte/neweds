@@ -6,7 +6,10 @@ import logging
 
 import numpy as np
 import pandas as pd
-from hurst import compute_Hc
+try:
+    from hurst import compute_Hc
+except ImportError:  # pragma: no cover - optional dependency path
+    compute_Hc = None
 from scipy.fft import fft
 from scipy.signal import find_peaks
 from statsmodels.tsa.stattools import adfuller
@@ -56,12 +59,14 @@ def compute_hurst_rs(series: pd.Series) -> float:
         if arr.size < 20:
             return np.nan
         try:
-            hurst_exp, _, _ = compute_Hc(arr, kind="change", simplified=True)
-            return float(hurst_exp)
+            if compute_Hc is not None:
+                hurst_exp, _, _ = compute_Hc(arr, kind="change", simplified=True)
+                return float(hurst_exp)
         except Exception:
-            if nolds is None:
-                return np.nan
-            return float(nolds.hurst_rs(arr))
+            pass
+        if nolds is None:
+            return np.nan
+        return float(nolds.hurst_rs(arr))
     except Exception as exc:
         logging.error("[Hurst RS] %s", exc)
         return np.nan

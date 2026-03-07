@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import argparse
-import glob
+import csv
 import logging
 import os
 import sys
+import traceback
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -44,7 +46,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="User run config (JSON/dict/key=value;...) for variant presets and tuning",
     )
     p.add_argument("--interactive-config", action="store_true", help="Read run config interactively from stdin")
+    p.add_argument("--recursive", action="store_true", help="Recursively scan subdirectories when input_file is a directory")
+    p.add_argument("--batch-zip", action="store_true", help="Create a ZIP archive of the whole batch output directory")
     return p
+
+
+_SUPPORTED_EXTS = (".csv", ".xlsx", ".xls", ".parquet", ".mat")
+
+
+def _iter_supported_input_files(folder: str, recursive: bool = False) -> list[str]:
+    """Возвращает поддерживаемые входные файлы из директории."""
+    root = Path(folder)
+    if recursive:
+        files = [str(pp) for pp in root.rglob("*") if pp.is_file() and pp.suffix.lower() in _SUPPORTED_EXTS]
+    else:
+        files = [str(pp) for pp in root.iterdir() if pp.is_file() and pp.suffix.lower() in _SUPPORTED_EXTS]
+    return sorted(files)
+
+
+def _safe_slug(text: str) -> str:
+    """Нормализует фрагмент пути в безопасный slug для имени подпапки."""
+    slug = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in (text or "item"))
+    slug = slug.strip("._")
+    return slug or "item"
+
+
+def _write_batch_manifest(rows: list[dict], manifest_csv: str) -> None:
+    """Пишет CSV-манифест пакетного запуска в стабильном формате полей."""
+    fields = [
+        "input_file",
+        "status",
+        "run_dir",
+        "excel_path",
+        "html_path",
+        "series_path",
+        "error",
+    ]
+    Path(manifest_csv).parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_csv, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+
+
+def _make_batch_zip(out_root: str) -> str:
+    """Создаёт ZIP со всем содержимым корневой папки batch-результатов."""
+    out_root_p = Path(out_root)
+    zip_path = str(out_root_p.with_suffix(".zip"))
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pp in sorted(out_root_p.rglob("*")):
+            if pp.is_file():
+                zf.write(pp, arcname=pp.relative_to(out_root_p.parent))
+    return zip_path
 
 
 def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) -> None:
@@ -276,18 +330,50 @@ def main() -> None:
     input_path = os.path.abspath(args.input_file)
 
     if os.path.isdir(input_path):
-        files = glob.glob(os.path.join(input_path, "*.csv")) + glob.glob(os.path.join(input_path, "*.xlsx"))
-        print(f"Found {len(files)} files in directory.")
+        files = _iter_supported_input_files(input_path, recursive=bool(args.recursive))
+        print(f"Found {len(files)} supported files in directory.")
 
         if not files:
             print("No supported files found.")
             return
 
         root_out = args.output_dir or os.path.join(input_path, "analysis_results")
-        for f in files:
-            print(f"Processing {f}...")
-            file_out_dir = os.path.join(root_out, Path(f).stem)
-            _process_single_file(f, args, file_out_dir)
+        os.makedirs(root_out, exist_ok=True)
+        manifest_rows: list[dict] = []
+
+        for idx, f in enumerate(files, start=1):
+            rel = Path(f).relative_to(Path(input_path))
+            stem = _safe_slug(str(rel.with_suffix("")))
+            file_out_dir = os.path.join(root_out, stem)
+            print(f"[{idx}/{len(files)}] Processing {f} ...")
+            row = {
+                "input_file": f,
+                "status": "ok",
+                "run_dir": os.path.abspath(file_out_dir),
+                "excel_path": os.path.abspath(os.path.join(file_out_dir, f"{Path(f).stem}_full.xlsx")),
+                "html_path": os.path.abspath(os.path.join(file_out_dir, f"{Path(f).stem}_report.html")),
+                "series_path": os.path.abspath(os.path.join(file_out_dir, f"{Path(f).stem}_series.xlsx")),
+                "error": "",
+            }
+            try:
+                _process_single_file(f, args, file_out_dir)
+            except Exception as exc:
+                row["status"] = "error"
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                print(f"[ERROR] {f}: {row['error']}")
+                logging.debug(traceback.format_exc())
+            manifest_rows.append(row)
+
+        manifest_csv = os.path.join(root_out, "batch_manifest.csv")
+        _write_batch_manifest(manifest_rows, manifest_csv)
+        print(f"Manifest: {os.path.abspath(manifest_csv)}")
+
+        if args.batch_zip:
+            try:
+                zip_path = _make_batch_zip(root_out)
+                print(f"ZIP: {os.path.abspath(zip_path)}")
+            except Exception as exc:
+                print(f"[WARN] Failed to create ZIP: {exc}")
         return
 
     out_dir = args.output_dir or os.path.dirname(args.output) if args.output else os.path.join(SAVE_FOLDER, "results")

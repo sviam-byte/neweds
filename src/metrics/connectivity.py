@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from collections import Counter
 from typing import Optional
 
@@ -110,15 +111,41 @@ def _prepare_numpy(data: pd.DataFrame) -> np.ndarray:
     return data.to_numpy(dtype=np.float64, copy=False)
 
 
+def _safe_parallel_backend(n_jobs: int = -1) -> tuple[int, str]:
+    """Подбирает безопасный backend/число воркеров с учётом переменных окружения."""
+    env_jobs = str(os.getenv("TS_TOOL_N_JOBS", "")).strip()
+    env_backend = str(os.getenv("TS_TOOL_PARALLEL_BACKEND", "")).strip().lower()
+    try:
+        cpu_n = max(1, int((os.cpu_count() or 1)))
+    except Exception:
+        cpu_n = 1
+    try:
+        nj = int(env_jobs) if env_jobs else int(n_jobs)
+    except Exception:
+        nj = 1
+    if nj == -1:
+        nj = max(1, min(cpu_n - 1 if cpu_n > 1 else 1, 4))
+    nj = max(1, min(int(nj), max(1, cpu_n)))
+    backend = env_backend or "threading"
+    if backend not in {"threading", "loky", "multiprocessing", "sequential"}:
+        backend = "threading"
+    if backend == "sequential" or nj <= 1:
+        return 1, "sequential"
+    return nj, backend
+
+
 def _try_parallel(func, pairs: list[tuple[int, int]], n_jobs: int = -1, *, heavy: bool = False):
     """joblib-parallel для списка пар, с безопасным fallback в последовательный режим."""
     threshold = _PARALLEL_PAIR_THRESHOLD_HEAVY if heavy else _PARALLEL_PAIR_THRESHOLD_DEFAULT
     if len(pairs) < threshold:
         return [func(p) for p in pairs]
+    nj, backend = _safe_parallel_backend(n_jobs)
+    if nj <= 1 or backend == "sequential":
+        return [func(p) for p in pairs]
     try:
         from joblib import Parallel, delayed
 
-        return Parallel(n_jobs=n_jobs, backend="loky")(delayed(func)(p) for p in pairs)
+        return Parallel(n_jobs=nj, backend=backend)(delayed(func)(p) for p in pairs)
     except ImportError:
         return [func(p) for p in pairs]
 

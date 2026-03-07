@@ -9,6 +9,7 @@ import gzip
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,7 @@ class ExportPolicy:
     topk_per_node: int = 50
     min_abs_weight: float = 0.0
     dense_csv: bool = True
+    include_names_in_edges: bool = True
 
 
 def _safe_variant(name: str) -> str:
@@ -53,36 +55,67 @@ def export_connectivity_matrix(
     policy: ExportPolicy,
     extra_meta: dict | None = None,
 ) -> dict:
-    """Экспортирует одну матрицу: edge-list, sparse и (опционально) dense."""
+    """Экспортирует одну матрицу: edge-list, sparse и (опционально) dense.
+
+    Реализация избегает построения огромного Python-списка словарей для больших матриц.
+    """
     arr = np.asarray(matrix, dtype=float)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
         raise ValueError("matrix must be square")
     n = int(arr.shape[0])
+    if len(names) != n:
+        names = [f"v{i:04d}" for i in range(n)]
+    if n == 0:
+        raise ValueError("matrix must be non-empty")
     var = _safe_variant(variant)
 
-    rows: list[dict[str, Any]] = []
-    for i in range(n):
-        row = arr[i]
-        if policy.topk_per_node > 0 and policy.topk_per_node < n:
-            idx = np.argpartition(np.abs(row), -policy.topk_per_node)[-policy.topk_per_node:]
-        else:
-            idx = np.arange(n)
-        idx = idx[idx != i]
-        for j in idx:
-            w = float(arr[i, j])
-            if abs(w) < float(policy.min_abs_weight):
-                continue
-            rows.append({"src": i, "dst": int(j), "src_name": names[i], "dst_name": names[int(j)], "weight": w})
+    work = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    np.fill_diagonal(work, 0.0)
 
-    edges_df = pd.DataFrame(rows)
+    topk = int(getattr(policy, "topk_per_node", 0) or 0)
+    min_abs = float(getattr(policy, "min_abs_weight", 0.0) or 0.0)
+
+    if 0 < topk < n:
+        idx = np.argpartition(np.abs(work), -topk, axis=1)[:, -topk:]
+        src = np.repeat(np.arange(n, dtype=np.int64), idx.shape[1])
+        dst = idx.reshape(-1).astype(np.int64, copy=False)
+        weights = work[src, dst]
+    else:
+        src, dst = np.nonzero(work)
+        weights = work[src, dst]
+
+    mask = src != dst
+    if min_abs > 0.0:
+        mask &= np.abs(weights) >= min_abs
+    src = src[mask]
+    dst = dst[mask]
+    weights = weights[mask]
+
+    if src.size:
+        edges_df = pd.DataFrame({
+            "src": src.astype(np.int64, copy=False),
+            "dst": dst.astype(np.int64, copy=False),
+            "weight": weights.astype(float, copy=False),
+        })
+        if bool(getattr(policy, "include_names_in_edges", True)):
+            names_arr = np.asarray(names, dtype=object)
+            edges_df["src_name"] = names_arr[src]
+            edges_df["dst_name"] = names_arr[dst]
+            edges_df = edges_df[["src", "dst", "src_name", "dst_name", "weight"]]
+    else:
+        cols = ["src", "dst", "weight"]
+        if bool(getattr(policy, "include_names_in_edges", True)):
+            cols = ["src", "dst", "src_name", "dst_name", "weight"]
+        edges_df = pd.DataFrame(columns=cols)
+
     edges_path = os.path.join(data_dir, f"{name_prefix}_{var}_edges.csv.gz")
     with gzip.open(edges_path, "wt", encoding="utf-8") as f:
         edges_df.to_csv(f, index=False)
 
-    if edges_df.empty:
+    if src.size == 0:
         sp = sparse.csr_matrix((n, n), dtype=float)
     else:
-        sp = sparse.coo_matrix((edges_df["weight"].to_numpy(), (edges_df["src"].to_numpy(), edges_df["dst"].to_numpy())), shape=(n, n)).tocsr()
+        sp = sparse.coo_matrix((weights, (src, dst)), shape=(n, n)).tocsr()
     sparse_path = os.path.join(data_dir, f"{name_prefix}_{var}_sparse.npz")
     sparse.save_npz(sparse_path, sp)
 
@@ -103,9 +136,14 @@ def export_connectivity_matrix(
         "dense_file": dense_file,
         "dense_csv_file": dense_csv_file,
         "edges_count": int(sp.nnz),
+        "topk_per_node": topk,
+        "min_abs_weight": min_abs,
+        "names_embedded": bool(getattr(policy, "include_names_in_edges", True)),
     }
     if extra_meta is not None:
         meta["extra_meta"] = extra_meta
+    meta_path = os.path.join(data_dir, f"{name_prefix}_{var}_meta.json")
+    Path(meta_path).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta
 
 

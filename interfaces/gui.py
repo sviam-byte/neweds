@@ -9,6 +9,8 @@ import os
 import sys
 import traceback
 import webbrowser
+import csv
+import zipfile
 from pathlib import Path
 import re
 import tkinter as tk
@@ -43,6 +45,8 @@ class App(tk.Tk):
         self.method_vars: dict[str, tk.BooleanVar] = {}
 
         self.output_mode = tk.StringVar(value="both")  # both|html|excel
+        self.batch_recursive = tk.BooleanVar(value=True)
+        self.batch_make_zip = tk.BooleanVar(value=True)
         self.include_diagnostics = tk.BooleanVar(value=True)
         self.include_fft_plots = tk.BooleanVar(value=False)
         self.include_scans = tk.BooleanVar(value=True)
@@ -314,6 +318,11 @@ class App(tk.Tk):
         row.pack(fill="x", pady=5)
         ttk.Entry(row, textvariable=self.folder_path).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Выбрать папку...", command=self._browse_folder).pack(side="left", padx=5)
+
+        opts = ttk.Frame(frame)
+        opts.pack(fill="x", pady=(4, 2))
+        ttk.Checkbutton(opts, text="Рекурсивно проходить подпапки", variable=self.batch_recursive).pack(side="left")
+        ttk.Checkbutton(opts, text="Собрать общий ZIP с результатами", variable=self.batch_make_zip).pack(side="left", padx=12)
 
         self.batch_progress = ttk.Progressbar(frame, orient="horizontal", mode="determinate")
         self.batch_progress.pack(fill="x", pady=10)
@@ -677,7 +686,7 @@ class App(tk.Tk):
         self._refresh_plan_json(force=True)
 
     def _browse_file(self) -> None:
-        f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
+        f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx *.xls *.parquet *.mat")])
         if f:
             self.file_path.set(f)
 
@@ -930,39 +939,100 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", str(e))
             print(traceback.format_exc())
 
+    def _iter_batch_input_files(self, folder: str, recursive: bool = True) -> list[str]:
+        """Возвращает список поддерживаемых входных файлов для batch-режима."""
+        exts = (".csv", ".xlsx", ".xls", ".parquet", ".mat")
+        found: list[str] = []
+        if recursive:
+            for root, _dirs, files in os.walk(folder):
+                if Path(root).name.lower() == "time_series_analysis":
+                    continue
+                for f in files:
+                    if f.lower().endswith(exts):
+                        found.append(str(Path(root) / f))
+        else:
+            for f in os.listdir(folder):
+                fp = Path(folder) / f
+                if fp.is_file() and f.lower().endswith(exts):
+                    found.append(str(fp))
+        return sorted(found)
+
+    def _make_batch_zip(self, out_root: str) -> str:
+        """Упаковывает корень batch-результатов в ZIP-архив."""
+        zip_path = str(Path(out_root).with_suffix(".zip"))
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, files in os.walk(out_root):
+                for f in files:
+                    fp = Path(root) / f
+                    zf.write(fp, arcname=str(fp.relative_to(Path(out_root).parent)))
+        return zip_path
+
     def _run_batch(self) -> None:
         folder = self.folder_path.get()
         if not os.path.exists(folder):
             messagebox.showerror("Error", "Папка не найдена")
             return
 
-        files = [f for f in os.listdir(folder) if f.lower().endswith((".csv", ".xlsx"))]
+        files = self._iter_batch_input_files(folder, recursive=self._as_bool(self.batch_recursive))
         if not files:
-            messagebox.showinfo("Info", "В папке нет файлов данных.")
+            messagebox.showinfo("Info", "В папке нет поддерживаемых файлов данных (.csv/.xlsx/.xls/.parquet/.mat).")
             return
 
         out_root = os.path.join(folder, "time_series_analysis")
         os.makedirs(out_root, exist_ok=True)
+        manifest_csv = os.path.join(out_root, "batch_manifest.csv")
 
         self.batch_progress["maximum"] = len(files)
         self.batch_progress["value"] = 0
 
         success_count = 0
+        rows: list[dict[str, str]] = []
 
-        for f in files:
-            fp = os.path.join(folder, f)
+        for idx, fp in enumerate(files, start=1):
+            p = Path(fp)
             try:
-                name = Path(f).stem
-                file_out_dir = os.path.join(out_root, name)
-                self._run_tool(fp, file_out_dir, "report")
+                rel_parent = p.parent.relative_to(Path(folder)) if Path(folder) in p.parents or p.parent == Path(folder) else Path('.')
+            except Exception:
+                rel_parent = Path('.')
+            safe_rel = str(rel_parent).replace('..', '_up_').replace(':', '_').replace('\\', '__').replace('/', '__')
+            name = p.stem if safe_rel in {'', '.'} else f"{safe_rel}__{p.stem}"
+            file_out_dir = os.path.join(out_root, name)
+            status = 'ok'
+            error = ''
+            try:
+                self._run_tool(fp, file_out_dir, p.stem)
                 success_count += 1
             except Exception as e:
-                print(f"Failed to process {f}: {e}")
+                status = 'error'
+                error = str(e)
+                print(f"Failed to process {fp}: {e}")
+                print(traceback.format_exc())
 
+            rows.append({
+                'index': str(idx),
+                'input_file': str(p),
+                'relative_parent': str(rel_parent),
+                'result_dir': str(file_out_dir),
+                'status': status,
+                'error': error,
+            })
             self.batch_progress["value"] += 1
             self.update_idletasks()
 
-        messagebox.showinfo("Готово", f"Обработано {success_count} из {len(files)} файлов.\nРезультаты в: {out_root}")
+        with open(manifest_csv, 'w', newline='', encoding='utf-8-sig') as fh:
+            writer = csv.DictWriter(fh, fieldnames=['index', 'input_file', 'relative_parent', 'result_dir', 'status', 'error'])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        extra = f"\nManifest: {manifest_csv}"
+        if self._as_bool(self.batch_make_zip):
+            try:
+                zip_path = self._make_batch_zip(out_root)
+                extra += f"\nZIP: {zip_path}"
+            except Exception as e:
+                extra += f"\nZIP не собран: {e}"
+
+        messagebox.showinfo("Готово", f"Обработано {success_count} из {len(files)} файлов.\nРезультаты в: {out_root}{extra}")
 
     def _run_gen(self) -> None:
         try:
