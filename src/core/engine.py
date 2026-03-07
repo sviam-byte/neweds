@@ -9,20 +9,17 @@
 """
 
 import argparse
-import base64
 import datetime as _dt
-import html as _html
 import importlib
 import importlib.util
 import logging
 import os
-import shutil
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from itertools import chain, combinations, permutations
+from itertools import chain, combinations
 from typing import Dict, List, Optional, Tuple
 
 from src.analysis.dimred import apply_dimred
@@ -44,10 +41,7 @@ from scipy.fft import fft
 from scipy.signal import coherence, find_peaks
 from scipy.spatial import cKDTree
 from sklearn.linear_model import LinearRegression
-from statsmodels.graphics.tsaplots import plot_acf
-from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.var_model import VAR
-from tqdm import tqdm
 
 
 class RunLog:
@@ -665,6 +659,9 @@ def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarra
         # use only upper triangle to avoid double-counting, then mirror
         tri = np.triu(mask, 1)
         q = fdr_bh(M[tri])
+        # BUG FIX: обнулить нижний треугольник ПЕРЕД зеркалированием,
+        # иначе M + M.T суммирует скорректированные q-values с оригинальными p-values.
+        M = np.zeros_like(M)
         M[tri] = q
         M = M + M.T
         np.fill_diagonal(M, 0.0)
@@ -681,8 +678,6 @@ def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarra
 # МАППИНГ
 ###
 # Metric registry lives in src.metrics.registry to keep engine as orchestrator.
-method_mapping = METRICS_REGISTRY
-
 # AH methods are still implemented in this module, so they are registered here.
 def _metric_ah_full(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
     return AH_matrix(data, pairs=kwargs.get("pairs"))
@@ -1623,6 +1618,14 @@ class BigMasterTool:
         self._stage("Загрузка данных", 0.0, file=str(filepath))
         qc_enabled = bool(kwargs.pop("qc_enabled", True))
         # 1) Сырой numeric-слепок без предобработки для честного before/after в отчёте.
+        # Пробрасываем параметры больших данных в RAW-загрузку,
+        # чтобы HDF5 4D файлы не пытались загрузить все 700K+ вокселей.
+        _big_data_keys = (
+            "feature_limit", "feature_sampling", "feature_seed",
+            "time_start", "time_end", "time_stride",
+            "dtype", "auto_float32",
+        )
+        _big_data_kwargs = {k: kwargs[k] for k in _big_data_keys if k in kwargs}
         try:
             self._stage("Загрузка RAW (без предобработки)", 0.05)
             self.data_raw = load_or_generate(
@@ -1632,6 +1635,7 @@ class BigMasterTool:
                 remove_outliers=False,
                 fill_missing=False,
                 check_stationarity=False,
+                **_big_data_kwargs,
             )
         except Exception:
             self.data_raw = pd.DataFrame()

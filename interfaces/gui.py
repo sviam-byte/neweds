@@ -686,7 +686,7 @@ class App(tk.Tk):
         self._refresh_plan_json(force=True)
 
     def _browse_file(self) -> None:
-        f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx *.xls *.parquet *.mat")])
+        f = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx *.xls *.parquet *.mat *.h5 *.hdf5")])
         if f:
             self.file_path.set(f)
 
@@ -941,7 +941,7 @@ class App(tk.Tk):
 
     def _iter_batch_input_files(self, folder: str, recursive: bool = True) -> list[str]:
         """Возвращает список поддерживаемых входных файлов для batch-режима."""
-        exts = (".csv", ".xlsx", ".xls", ".parquet", ".mat")
+        exts = (".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5")
         found: list[str] = []
         if recursive:
             for root, _dirs, files in os.walk(folder):
@@ -975,7 +975,7 @@ class App(tk.Tk):
 
         files = self._iter_batch_input_files(folder, recursive=self._as_bool(self.batch_recursive))
         if not files:
-            messagebox.showinfo("Info", "В папке нет поддерживаемых файлов данных (.csv/.xlsx/.xls/.parquet/.mat).")
+            messagebox.showinfo("Info", "В папке нет поддерживаемых файлов данных (.csv/.xlsx/.xls/.parquet/.mat/.h5).")
             return
 
         out_root = os.path.join(folder, "time_series_analysis")
