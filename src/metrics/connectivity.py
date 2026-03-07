@@ -17,10 +17,21 @@ from statsmodels.tsa.vector_ar.var_model import VAR
 
 from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 
-# Порог пар, с которого пробуем распараллеливание тяжёлых покомпонентных расчётов.
-_PARALLEL_PAIR_THRESHOLD = 200
+# Порог пар, с которого пробуем параллелизацию.
+# Для тяжёлых методов (dcor, MI, TE, AH) порог ниже — overhead joblib окупается быстрее.
+_PARALLEL_PAIR_THRESHOLD_DEFAULT = 200
+_PARALLEL_PAIR_THRESHOLD_HEAVY = 30
 # Верхняя граница автоматически сэмплируемых пар для очень больших матриц.
 _MAX_AUTO_RANDOM_PAIRS = 500_000
+
+# Глобальный seed для всех стохастических операций в этом модуле.
+# Устанавливается из AnalysisConfig.master_seed через set_module_seed().
+_MODULE_SEED: int = 42
+
+
+def set_module_seed(seed: int) -> None:
+    global _MODULE_SEED
+    _MODULE_SEED = int(seed)
 
 
 def _init_matrix(n: int, default: float, *, diag: Optional[float] = None, dtype=np.float64) -> np.ndarray:
@@ -80,7 +91,7 @@ def _get_effective_pairs(
         n_full,
         max_pairs,
     )
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(_MODULE_SEED)
     result: set[tuple[int, int]] = set()
     bi = rng.integers(0, n, size=max_pairs * 3)
     bj = rng.integers(0, n, size=max_pairs * 3)
@@ -99,9 +110,10 @@ def _prepare_numpy(data: pd.DataFrame) -> np.ndarray:
     return data.to_numpy(dtype=np.float64, copy=False)
 
 
-def _try_parallel(func, pairs: list[tuple[int, int]], n_jobs: int = -1):
+def _try_parallel(func, pairs: list[tuple[int, int]], n_jobs: int = -1, *, heavy: bool = False):
     """joblib-parallel для списка пар, с безопасным fallback в последовательный режим."""
-    if len(pairs) < _PARALLEL_PAIR_THRESHOLD:
+    threshold = _PARALLEL_PAIR_THRESHOLD_HEAVY if heavy else _PARALLEL_PAIR_THRESHOLD_DEFAULT
+    if len(pairs) < threshold:
         return [func(p) for p in pairs]
     try:
         from joblib import Parallel, delayed
@@ -442,7 +454,7 @@ def mutual_info_matrix(
         v = _knn_mutual_info(X[mask, i], X[mask, j], k=k)
         return i, j, float(v) if np.isfinite(v) else 0.0
 
-    for i, j, value in _try_parallel(_compute_mi_pair, effective):
+    for i, j, value in _try_parallel(_compute_mi_pair, effective, heavy=True):
         mi_matrix[i, j] = mi_matrix[j, i] = value
     return mi_matrix
 
@@ -563,11 +575,33 @@ def granger_matrix_partial(
         return granger_matrix(df, lag=lag, control=None, pairs=pairs)
 
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    p = int(max(1, lag))
+
+    # Оптимизация: если control не задан ("все остальные"), достаточно одной VAR-модели
+    # по всем переменным для проверки всех src -> tgt пар.
+    if control is None and n_cols <= 40:
+        sub_all = df.dropna()
+        if sub_all.shape[0] >= max(30, 5 * p * n_cols):
+            try:
+                result = VAR(sub_all).fit(maxlags=p, ic=None, trend="c")
+                for src_i, tgt_j in effective:
+                    try:
+                        causality = result.test_causality(
+                            caused=columns[tgt_j], causing=[columns[src_i]], kind="f"
+                        )
+                        out[src_i, tgt_j] = float(causality.pvalue) if np.isfinite(causality.pvalue) else 1.0
+                    except Exception:
+                        out[src_i, tgt_j] = 1.0
+                return out
+            except Exception:
+                pass  # fallback на попарный VAR
+
+    # Попарный VAR: при explicit control или если single-VAR не сработал.
     for src_i, tgt_j in effective:
         src = columns[src_i]; tgt = columns[tgt_j]
         control_cols = control if control is not None else [c for c in columns if c not in (src, tgt)]
         control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
-        use_cols = [tgt, src] + control_cols; sub = df[use_cols].dropna(); p = int(max(1, lag))
+        use_cols = [tgt, src] + control_cols; sub = df[use_cols].dropna()
         if sub.shape[0] < max(30, 5 * p * len(use_cols)): continue
         try:
             result = VAR(sub).fit(maxlags=p, ic=None, trend="c")
@@ -631,23 +665,24 @@ def compute_te_jitter(source: np.ndarray, target: np.ndarray, lag: int = 1, bins
             return x
         uniq = np.unique(x[np.isfinite(x)])
         if uniq.size < max(3, int(0.2 * x.size)):
-            rng = np.random.default_rng(0)
+            rng = np.random.default_rng(_MODULE_SEED)
             scale = (np.nanstd(x) if np.nanstd(x) > 0 else 1.0) * 1e-10
             x = x + rng.normal(0.0, scale, size=x.shape)
         return x
 
     def discretize_quantile(series: np.ndarray, num_bins: int) -> np.ndarray:
-        s = _add_tiny_jitter(_zscore_1d(series))
-        s = s[np.isfinite(s)]
+        s_full = _add_tiny_jitter(_zscore_1d(np.asarray(series, dtype=np.float64).ravel()))
+        s = s_full[np.isfinite(s_full)]
         if s.size == 0:
             return np.array([], dtype=int)
         if float(np.nanmin(s)) == float(np.nanmax(s)):
-            return np.zeros(int(np.asarray(series).size), dtype=int)
+            return np.zeros(s_full.size, dtype=int)
         edges = np.unique(np.quantile(s, np.linspace(0.0, 1.0, int(num_bins) + 1)))
         if edges.size <= 2:
-            return np.zeros(int(np.asarray(series).size), dtype=int)
+            return np.zeros(s_full.size, dtype=int)
         edges[-1] = np.nextafter(edges[-1], edges[-1] + 1.0)
-        disc = np.digitize(_add_tiny_jitter(_zscore_1d(np.asarray(series))), bins=edges[1:-1], right=False)
+        # digitize по тому же массиву, по которому вычисляли edges.
+        disc = np.digitize(s_full, bins=edges[1:-1], right=False)
         return np.clip(disc, 0, int(num_bins) - 1).astype(int)
 
     try:
@@ -686,7 +721,7 @@ def transfer_entropy_matrix(
         v = compute_te_jitter(X[mask, src], X[mask, tgt], lag=lag, bins=bins)
         return src, tgt, float(v) if np.isfinite(v) else 0.0
 
-    for src, tgt, value in _try_parallel(_compute_te_pair, effective):
+    for src, tgt, value in _try_parallel(_compute_te_pair, effective, heavy=True):
         out[src, tgt] = value
     return out
 
@@ -747,6 +782,19 @@ def coherence_matrix_partial(
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
     return coherence_matrix(sub, lag=lag, control=None, fs=fs, pairs=pairs)
 
+# Опциональный быстрый O(N log N) distance correlation (Huo & Székely 2016).
+try:
+    import dcor as _dcor_pkg
+
+    _DCOR_FAST = True
+except ImportError:
+    _dcor_pkg = None  # type: ignore[assignment]
+    _DCOR_FAST = False
+
+# Трекер: были ли dcor-результаты получены через subsampling.
+_dcor_subsampled: dict[str, bool] = {}
+
+
 def _dcov_sq(x: np.ndarray, y: np.ndarray) -> float:
     """Квадрат дистанционной ковариации (Székely et al. 2007).
 
@@ -757,11 +805,14 @@ def _dcov_sq(x: np.ndarray, y: np.ndarray) -> float:
         return np.nan
     max_n = 5000
     if n > max_n:
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(_MODULE_SEED)
         idx = rng.choice(n, size=max_n, replace=False)
         x = x[idx]
         y = y[idx]
         n = max_n
+        _dcor_subsampled["last"] = True
+    else:
+        _dcor_subsampled["last"] = False
     a = np.abs(x[:, None] - x[None, :])
     b = np.abs(y[:, None] - y[None, :])
     a_row = a.mean(axis=1, keepdims=True)
@@ -776,7 +827,18 @@ def _dcov_sq(x: np.ndarray, y: np.ndarray) -> float:
 
 
 def _dcor(x: np.ndarray, y: np.ndarray) -> float:
-    """Дистанционная корреляция.  dCor=0 ⟺ независимость (для конечных моментов)."""
+    """Дистанционная корреляция. dCor=0 ⟺ независимость (для конечных моментов).
+
+    При наличии пакета dcor используется O(N log N) AVL-алгоритм.
+    Иначе — O(N²) наивный расчёт через _dcov_sq.
+    """
+    if _DCOR_FAST:
+        try:
+            val = float(_dcor_pkg.distance_correlation(x, y, method="AVL"))
+            return val if np.isfinite(val) else np.nan
+        except Exception:
+            pass  # fallback на наивный O(N²)
+
     dcov2 = _dcov_sq(x, y)
     dvar_x = _dcov_sq(x, x)
     dvar_y = _dcov_sq(y, y)
@@ -807,8 +869,10 @@ def dcor_matrix(
         v = _dcor(xi[mask], xj[mask])
         return i, j, float(v) if np.isfinite(v) else 0.0
 
-    for i, j, value in _try_parallel(_compute_dcor_pair, effective):
+    for i, j, value in _try_parallel(_compute_dcor_pair, effective, heavy=True):
         out[i, j] = out[j, i] = value
+    # Сигнализируем вызывающему коду, применялся ли subsampling в dCor.
+    dcor_matrix._subsampled = bool(_dcor_subsampled.get("last", False))  # type: ignore[attr-defined]
     return out
 
 def dcor_matrix_partial(

@@ -40,10 +40,9 @@ from scipy import stats
 from scipy.fft import fft
 from scipy.signal import coherence, find_peaks
 from scipy.spatial import cKDTree
-from scipy.special import digamma
 from sklearn.linear_model import LinearRegression
 from statsmodels.graphics.tsaplots import plot_acf
-from statsmodels.tsa.stattools import adfuller, grangercausalitytests
+from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.var_model import VAR
 from tqdm import tqdm
 
@@ -105,6 +104,7 @@ from ..config import *
 from ..analysis import stats as analysis_stats
 from ..metrics import connectivity
 from ..metrics.registry import METRICS_REGISTRY, get_metric_func, register_metric
+from ..metrics.connectivity import set_module_seed as _set_connectivity_seed
 from ..reporting import ExcelReportWriter, HTMLReportGenerator
 from ..visualization import plots
 
@@ -117,508 +117,91 @@ from .preprocessing import configure_warnings
 
 # Метрики
 def correlation_matrix(data: pd.DataFrame, **kwargs) -> np.ndarray:
-    return data.corr().values
+    """Legacy API shim: перенаправление в connectivity.correlation_matrix."""
+    return connectivity.correlation_matrix(data, **kwargs)
+
 
 def partial_correlation_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
-    cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    n = len(cols)
-    out = np.eye(n)
-    for i in range(n):
-        for j in range(i + 1, n):
-            xi, xj = cols[i], cols[j]
-            ctrl_vars = control if control is not None else [c for c in cols if c not in (xi, xj)]
-            sub_cols = [xi, xj] + [c for c in ctrl_vars if c in cols and c not in (xi, xj)]
-            sub = df[sub_cols].dropna()
-            if sub.shape[0] < len(sub_cols) + 1:
-                pcor = np.nan
-            else:
-                try:
-                    R = sub.corr().values
-                    P = np.linalg.pinv(R)
-                    pcor = -P[0, 1] / np.sqrt(P[0, 0] * P[1, 1])
-                except Exception:
-                    pcor = np.nan
-            out[i, j] = out[j, i] = pcor
-    return out
+    """Legacy API shim для частичной корреляции."""
+    return connectivity.partial_correlation_matrix(df, control=control, **kwargs)
 
 
 def partial_h2_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
-    """Возвращает квадрат частичной корреляции (H^2) для заданного контроля."""
-    pcor = partial_correlation_matrix(df, control=control, **kwargs)
-    return pcor**2
+    """Legacy API shim: H² как квадрат partial-correlation."""
+    pcor = connectivity.partial_correlation_matrix(df, control=control, **kwargs)
+    return np.asarray(pcor, dtype=float) ** 2
+
 
 def lagged_directed_correlation(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
-    """Directed lagged correlation: M[src, tgt] = corr(src(t), tgt(t+lag)).
+    """Legacy API shim для lagged directed correlation."""
+    return connectivity.lagged_directed_correlation(df, lag=lag, **kwargs)
 
-    Логический фикс: используем shift и совместный dropna, чтобы не рассинхронизировать время.
-    """
-    lag = int(max(1, lag))
-    cols = list(df.columns)
-    m = len(cols)
-    out = np.full((m, m), np.nan, dtype=float)
-    np.fill_diagonal(out, 0.0)
 
-    for i, src in enumerate(cols):
-        x = df[src]
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
-            y = df[tgt].shift(-lag)  # y(t+lag) выравниваем с x(t)
-            pair = pd.concat([x, y], axis=1).dropna()
-            if pair.shape[0] <= 3:
-                continue
-            xv = pair.iloc[:, 0].values
-            yv = pair.iloc[:, 1].values
-            if np.nanstd(xv) == 0 or np.nanstd(yv) == 0:
-                out[i, j] = np.nan
-            else:
-                out[i, j] = float(np.corrcoef(xv, yv)[0, 1])
-    return out
+def h2_matrix(df: pd.DataFrame, **kwargs) -> np.ndarray:
+    """Legacy API shim: H² = corr²."""
+    return np.asarray(connectivity.correlation_matrix(df, **kwargs), dtype=float) ** 2
 
-def h2_matrix(df: pd.DataFrame, **kwargs) -> np.ndarray: return correlation_matrix(df)**2
-def lagged_directed_h2(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray: return lagged_directed_correlation(df, lag)**2
+
+def lagged_directed_h2(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
+    """Legacy API shim: lagged directed H²."""
+    return np.asarray(connectivity.lagged_directed_correlation(df, lag=lag, **kwargs), dtype=float) ** 2
+
 
 def coherence_matrix(data: pd.DataFrame, **kwargs):
-    """Средняя когерентность между всеми парами.
+    """Legacy API shim для когерентности."""
+    return connectivity.coherence_matrix(data, **kwargs)
 
-    ВАЖНО: ряды должны быть синхронизированы по общему индексу.
-    Нельзя делать dropna() по каждому столбцу отдельно — иначе получишь "когерентность"
-    между разными моментами времени при разнесённых NaN.
-    """
-    fs = float(kwargs.get("fs", 1.0))
-    fs = fs if np.isfinite(fs) and fs > 0 else 1.0
-    N = data.shape[1]
-    coh = np.full((N, N), np.nan, dtype=float)
-    np.fill_diagonal(coh, 1.0)
-
-    for i in range(N):
-        for j in range(i + 1, N):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] <= 3:
-                continue
-
-            s1 = _as_float64_1d(pair.iloc[:, 0].values)
-            s2 = _as_float64_1d(pair.iloc[:, 1].values)
-            n = int(min(s1.size, s2.size))
-            if n <= 3:
-                continue
-            s1 = s1[:n]
-            s2 = s2[:n]
-
-            try:
-                nperseg = int(max(8, min(64, n // 2)))
-                _, Cxy = signal.coherence(s1, s2, fs=fs, nperseg=nperseg, detrend="constant")
-                if Cxy.size == 0:
-                    continue
-                Cxy = np.clip(np.asarray(Cxy, dtype=np.float64), 0.0, 1.0)
-                Cxy[~np.isfinite(Cxy)] = np.nan
-                coh[i, j] = coh[j, i] = float(np.nanmean(Cxy)) if np.isfinite(Cxy).any() else np.nan
-            except Exception:
-                coh[i, j] = coh[j, i] = np.nan
-
-    return coh
-
-def _knn_entropy(X, k=DEFAULT_K_MI):
-    """Вычисляет энтропию для 1D-массива с помощью KNN."""
-    N = len(X)
-    if N <= k: return 0.0
-    tree = cKDTree(X.reshape(-1, 1))
-    d, _ = tree.query(X.reshape(-1, 1), k=k + 1, p=np.inf)
-    # Расстояние до k-го соседа
-    r = d[:, k]
-    # digamma(N) - digamma(k) + d*log(2*r_k) - это для d-мерного пространства
-    # Для 1D: digamma(N) - digamma(k) + E[log(2r_k)]
-    return digamma(N) - digamma(k) + np.mean(np.log(2 * r + 1e-10)) 
-
-
-def _neighbor_counts_with_fallback(tree: cKDTree, points: np.ndarray, eps: np.ndarray) -> np.ndarray:
-    """Подсчёт соседей в радиусе eps для каждой точки с fallback для старого SciPy.
-
-    Возвращает количество соседей без учёта самой точки (len(list)-1).
-    """
-    try:
-        # Современный SciPy: batch-подсчёт для массива точек и массива радиусов.
-        neighbors = tree.query_ball_point(points, r=eps, p=np.inf)
-        return np.array([max(0, len(lst) - 1) for lst in neighbors], dtype=float)
-    except (TypeError, ValueError):
-        # Старый SciPy может не поддерживать массив r/или batch-формат.
-        n = int(points.shape[0])
-        return np.fromiter(
-            (max(0, len(tree.query_ball_point(points[i], r=float(eps[i]), p=np.inf)) - 1) for i in range(n)),
-            dtype=float,
-            count=n,
-        )
-
-
-def _knn_mutual_info(X, Y, k=DEFAULT_K_MI):
-    """KSG-оценка взаимной информации I(X;Y) через kNN (max-норма).
-
-    Оптимизация:
-    - используем batch query_ball_point, чтобы уменьшить Python-цикл;
-    - сохраняем fallback на поэлементный подсчёт для старых версий SciPy.
-    """
-    X = np.asarray(X, dtype=np.float64).ravel()
-    Y = np.asarray(Y, dtype=np.float64).ravel()
-    N = int(min(X.size, Y.size))
-    if N <= k or N <= 3:
-        return 0.0
-    X = X[:N]
-    Y = Y[:N]
-
-    XY = np.c_[X, Y]
-    tree_XY = cKDTree(XY)
-    d, _ = tree_XY.query(XY, k=int(k) + 1, p=np.inf)
-    eps = np.nextafter(d[:, int(k)], 0.0)
-
-    tree_X = cKDTree(X.reshape(-1, 1))
-    tree_Y = cKDTree(Y.reshape(-1, 1))
-
-    nx = _neighbor_counts_with_fallback(tree_X, X.reshape(-1, 1), eps)
-    ny = _neighbor_counts_with_fallback(tree_Y, Y.reshape(-1, 1), eps)
-
-    raw_mi = digamma(N) + digamma(int(k)) - np.mean(digamma(nx + 1.0) + digamma(ny + 1.0))
-    if not np.isfinite(raw_mi):
-        return float("nan")
-    return float(max(0.0, raw_mi))
 
 def mutual_info_matrix(data: pd.DataFrame, k=DEFAULT_K_MI, **kwargs):
-    """Матрица взаимной информации (KSG kNN).
+    """Legacy API shim для mutual information matrix."""
+    return connectivity.mutual_info_matrix(data, k=k, **kwargs)
 
-    Важно: используем совместный dropna по паре, чтобы не рассинхронизировать время.
-    """
-    cols = list(data.columns)
-    n_vars = len(cols)
-    mi = np.zeros((n_vars, n_vars), dtype=float)
-
-    for i in range(n_vars):
-        for j in range(i + 1, n_vars):
-            pair = data.iloc[:, [i, j]].dropna()
-            if pair.shape[0] <= k:
-                mi[i, j] = mi[j, i] = np.nan
-                continue
-            s1 = pair.iloc[:, 0].values
-            s2 = pair.iloc[:, 1].values
-            val = _knn_mutual_info(s1, s2, k=k)
-            mi[i, j] = mi[j, i] = val
-
-    return mi
-
-def _knn_conditional_mutual_info(X, Y, Z, k=DEFAULT_K_MI):
-    """KSG-оценка условной взаимной информации I(X;Y|Z) через kNN (max-норма).
-
-    Важно:
-    - строгий eps (nextafter) для ties;
-    - исключаем саму точку;
-    - используем ψ(n+1).
-    """
-    X = np.asarray(X, dtype=np.float64).ravel()
-    Y = np.asarray(Y, dtype=np.float64).ravel()
-    Z = np.asarray(Z, dtype=np.float64)
-    if Z.ndim == 1:
-        Z = Z.reshape(-1, 1)
-    N = int(min(X.size, Y.size, Z.shape[0]))
-    if N <= k or N <= 3:
-        return 0.0
-    X = X[:N]
-    Y = Y[:N]
-    Z = Z[:N, :]
-
-    XZ = np.c_[X, Z]
-    YZ = np.c_[Y, Z]
-    XYZ = np.c_[X, Y, Z]
-
-    tree_XYZ = cKDTree(XYZ)
-    d, _ = tree_XYZ.query(XYZ, k=int(k) + 1, p=np.inf)
-    eps = d[:, int(k)]
-    eps = np.nextafter(eps, 0.0)
-
-    tree_XZ = cKDTree(XZ)
-    tree_YZ = cKDTree(YZ)
-    tree_Z = cKDTree(Z)
-
-    nxz = _neighbor_counts_with_fallback(tree_XZ, XZ, eps)
-    nyz = _neighbor_counts_with_fallback(tree_YZ, YZ, eps)
-    nz = _neighbor_counts_with_fallback(tree_Z, Z, eps)
-
-    cmi = digamma(int(k)) - np.mean(digamma(nxz + 1.0) + digamma(nyz + 1.0) - digamma(nz + 1.0))
-    if not np.isfinite(cmi):
-        return float("nan")
-    return float(max(0.0, cmi))
 
 def mutual_info_matrix_partial(
     data: pd.DataFrame,
-    control: Optional[List[str]] = None,
     k=DEFAULT_K_MI,
+    control: Optional[list[str]] = None,
     **kwargs,
-):
-    """Матрица условной взаимной информации I(X;Y|Z) (KSG kNN).
+) -> np.ndarray:
+    """Legacy API shim для partial mutual information."""
+    return connectivity.mutual_info_matrix_partial(data, k=k, control=control, **kwargs)
 
-    Если control=None: Z = все остальные переменные.
-    Важно: формируем sub-таблицу и делаем dropna ОДИН РАЗ (иначе рассинхрон).
-    """
-    cols = list(data.columns)
-    N = len(cols)
-    pmi = np.zeros((N, N), dtype=float)
-
-    for i in range(N):
-        for j in range(i + 1, N):
-            xi, xj = cols[i], cols[j]
-            Z_cols = control if control is not None else [c for c in cols if c not in (xi, xj)]
-            Z_cols = [c for c in Z_cols if c in data.columns and c not in (xi, xj)]
-
-            if not Z_cols:
-                pair = data[[xi, xj]].dropna()
-                if pair.shape[0] <= k:
-                    val = np.nan
-                else:
-                    val = _knn_mutual_info(pair[xi].values, pair[xj].values, k=k)
-            else:
-                sub = data[[xi, xj] + Z_cols].dropna()
-                if sub.shape[0] <= k:
-                    val = np.nan
-                else:
-                    X = sub[xi].values
-                    Y = sub[xj].values
-                    Z = sub[Z_cols].values
-                    val = _knn_conditional_mutual_info(X, Y, Z, k=k)
-
-            pmi[i, j] = pmi[j, i] = val
-
-    return pmi
 
 def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwargs) -> np.ndarray:
-    n = df.shape[1]
-    G = np.full((n, n), 1.0)
-    cols = df.columns.tolist()
-    # matrix[src, tgt] = pvalue(src -> tgt)
-    for src in range(n):
-        for tgt in range(n):
-            if src == tgt:
-                G[src, tgt] = 0.0
-                continue
-            data_pair = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
-            if len(data_pair) > lags * 2 + 5:
-                try:
-                    tests = grangercausalitytests(data_pair, maxlag=lags)
-                    G[src, tgt] = tests[lags][0]['ssr_ftest'][1]
-                except (np.linalg.LinAlgError, ValueError):
-                    G[src, tgt] = np.nan
-    return G
+    """Legacy API shim для Granger full."""
+    return connectivity.granger_matrix(df, lag=lags, **kwargs)
 
-def _load_pyinform():
-    """Ленивая загрузка pyinform без падения всего приложения."""
-    if not PYINFORM_AVAILABLE:
-        logging.warning(
-            "[PyInform] pyinform не установлен: TE будет посчитан через fallback (дискретизация + эмпирические вероятности).",
-        )
-        return None
-    return importlib.import_module("pyinform")
-
-
-
-def _transfer_entropy_discrete(source_d: np.ndarray, target_d: np.ndarray, k: int = 1) -> float:
-    """Эмпирическая transfer entropy для дискретных целочисленных рядов.
-
-    Конвенция: TE(source -> target).
-    Реализация: sum p(x_{t}|x_{t-k:t-1}, y_{t-k:t-1}) * log( p(x_t|x_past,y_past) / p(x_t|x_past) )
-    """
-    try:
-        k = int(k)
-        if k < 1:
-            k = 1
-        source_d = np.asarray(source_d, dtype=int).ravel()
-        target_d = np.asarray(target_d, dtype=int).ravel()
-        n = min(source_d.size, target_d.size)
-        if n <= k + 1:
-            return float("nan")
-        source_d = source_d[:n]
-        target_d = target_d[:n]
-        n_eff = n - k
-
-        c_xyz = Counter()
-        c_xx = Counter()
-        c_xpast_ypast = Counter()
-        c_xpast = Counter()
-
-        for t in range(k, n):
-            x_next = int(target_d[t])
-            x_past = tuple(int(v) for v in target_d[t - k : t])
-            y_past = tuple(int(v) for v in source_d[t - k : t])
-
-            c_xyz[(x_next, x_past, y_past)] += 1
-            c_xx[(x_next, x_past)] += 1
-            c_xpast_ypast[(x_past, y_past)] += 1
-            c_xpast[x_past] += 1
-
-        te = 0.0
-        for (x_next, x_past, y_past), c in c_xyz.items():
-            denom_xy = c_xpast_ypast.get((x_past, y_past), 0)
-            denom_x = c_xpast.get(x_past, 0)
-            if denom_xy <= 0 or denom_x <= 0:
-                continue
-            p1 = c / denom_xy  # p(x_next | x_past, y_past)
-            p0 = c_xx.get((x_next, x_past), 0) / denom_x  # p(x_next | x_past)
-            if p0 <= 0 or p1 <= 0:
-                continue
-            te += (c / n_eff) * float(np.log(p1 / p0))
-
-        # численная защита
-        if not np.isfinite(te):
-            return float("nan")
-        return float(max(0.0, te))
-    except Exception:
-        return float("nan")
-
-
-def compute_TE(source: np.ndarray, target: np.ndarray, lag: int = 1, bins: int = DEFAULT_BINS):
-    """Transfer Entropy (дискретная).
-
-    Семантика параметра lag: длина истории k (как в pyinform.transfer_entropy k=...).
-
-    Логические фиксы:
-    - дискретизация через квантильные бины (устойчивее, чем min/max линейка);
-    - перед бинингом z-score (масштаб-инвариантность);
-    - маленький детерминированный jitter при ties (квантизация/повторы значений).
-    """
-    try:
-        def _zscore_1d(x: np.ndarray) -> np.ndarray:
-            x = np.asarray(x, dtype=np.float64).ravel()
-            if x.size == 0:
-                return x
-            m = np.nanmean(x)
-            s = np.nanstd(x)
-            if not np.isfinite(s) or s <= 0:
-                return x - m
-            return (x - m) / s
-
-        def _add_tiny_jitter(x: np.ndarray) -> np.ndarray:
-            # детерминированный jitter для борьбы с ties (важно для kNN/квантилей)
-            x = np.asarray(x, dtype=np.float64)
-            if x.size <= 3:
-                return x
-            # если много повторов — чуть шевелим
-            uniq = np.unique(x[np.isfinite(x)])
-            if uniq.size < max(3, int(0.2 * x.size)):
-                rng = np.random.default_rng(0)
-                scale = (np.nanstd(x) if np.nanstd(x) > 0 else 1.0) * 1e-10
-                x = x + rng.normal(0.0, scale, size=x.shape)
-            return x
-
-        def discretize_quantile(series: np.ndarray, num_bins: int) -> np.ndarray:
-            s = np.asarray(series, dtype=np.float64).ravel()
-            if s.size == 0:
-                return np.array([], dtype=int)
-            s = _add_tiny_jitter(_zscore_1d(s))
-            if not np.isfinite(s).all():
-                s = s[np.isfinite(s)]
-            if s.size == 0:
-                return np.array([], dtype=int)
-            if float(np.nanmin(s)) == float(np.nanmax(s)):
-                return np.zeros(int(series.size), dtype=int)
-
-            q = np.linspace(0.0, 1.0, int(num_bins) + 1)
-            edges = np.quantile(s, q)
-            # убираем дубли рёбер (если данных мало/много ties)
-            edges = np.unique(edges)
-            if edges.size <= 2:
-                return np.zeros(int(series.size), dtype=int)
-
-            # делаем края "открытыми" справа
-            edges[-1] = np.nextafter(edges[-1], edges[-1] + 1.0)
-            disc = np.digitize(_add_tiny_jitter(_zscore_1d(np.asarray(series))), bins=edges[1:-1], right=False)
-            disc = np.clip(disc, 0, int(num_bins) - 1)
-            return disc.astype(int)
-
-        source_discrete = discretize_quantile(source, bins)
-        target_discrete = discretize_quantile(target, bins)
-
-        pyinform = _load_pyinform()
-        k = int(max(1, lag))
-        if pyinform is not None:
-            return float(pyinform.transfer_entropy(source_discrete, target_discrete, k=k))
-
-        return _transfer_entropy_discrete(source_discrete, target_discrete, k=k)
-
-    except Exception as e:
-        logging.error(f"[TE] Ошибка вычисления: {e}")
-        return float("nan")
 
 def TE_matrix(df: pd.DataFrame, lag: int = 1, bins: int = DEFAULT_BINS, **kwargs):
-    """
-    Строит матрицу Transfer Entropy для всех пар.
+    """Legacy API shim для TE full."""
+    return connectivity.transfer_entropy_matrix(df, lag=lag, bins=bins, **kwargs)
 
-    Конвенция для направленных матриц: M[src, tgt] = мера src → tgt.
-    """
-    n = df.shape[1]
-    te_matrix = np.zeros((n, n))
-
-    for src in range(n):
-        for tgt in range(n):
-            if src == tgt:
-                continue
-
-            pair = df.iloc[:, [src, tgt]].dropna()
-            if len(pair) <= lag:
-                te_matrix[src, tgt] = np.nan
-                continue
-            s_src = pair.iloc[:, 0].values
-            s_tgt = pair.iloc[:, 1].values
-            te_matrix[src, tgt] = compute_TE(s_src, s_tgt, lag=lag, bins=bins)
-
-    return te_matrix
 
 def TE_matrix_partial(
     df: pd.DataFrame,
     lag: int = 1,
-    control: Optional[List[str]] = None,
     bins: int = DEFAULT_BINS,
+    control: Optional[list[str]] = None,
+    **kwargs,
 ) -> np.ndarray:
-    """
-    Приближённая "partial" Transfer Entropy.
+    """Legacy API shim для TE partial."""
+    return connectivity.transfer_entropy_matrix_partial(df, lag=lag, bins=bins, control=control, **kwargs)
 
-    Практичная аппроксимация:
-      1) линейно вычитаем влияние контрольных переменных из src и tgt (остатки OLS);
-      2) считаем обычный TE между остатками.
 
-    Конвенция: M[src, tgt] = мера src → tgt.
-    """
-    cols = list(df.columns)
-    N = len(cols)
-    M = np.zeros((N, N))
+def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
+    """Legacy API shim: исторически возвращался dict, сейчас не используется."""
+    return {"maxlag": int(maxlag), "columns": list(df.columns)}
 
-    def _residualize(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-        if X.size == 0:
-            return y
-        X_aug = np.c_[np.ones(len(X)), X]
-        beta, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
-        return y - X_aug @ beta
 
-    for i, src in enumerate(cols):
-        for j, tgt in enumerate(cols):
-            if i == j:
-                continue
+def granger_matrix(df: pd.DataFrame, granger_dict_result: dict | None = None) -> np.ndarray:
+    """Legacy API shim для матрицы Granger (игнорирует устаревший dict-аргумент)."""
+    lag = int((granger_dict_result or {}).get("maxlag", DEFAULT_MAX_LAG))
+    return connectivity.granger_matrix(df, lag=lag)
 
-            ctrl_cols = control if control is not None else [c for c in cols if c not in (src, tgt)]
-            ctrl_cols = [c for c in ctrl_cols if c in df.columns]
 
-            use_cols = [src, tgt] + ctrl_cols
-            sub = df[use_cols].dropna()
-            if sub.shape[0] <= lag + 1:
-                M[i, j] = np.nan
-                continue
-
-            s_src = sub[src].values
-            s_tgt = sub[tgt].values
-            X_ctrl = sub[ctrl_cols].values if ctrl_cols else np.empty((len(sub), 0))
-
-            try:
-                s_src_r = _residualize(s_src, X_ctrl)
-                s_tgt_r = _residualize(s_tgt, X_ctrl)
-                M[i, j] = compute_TE(s_src_r, s_tgt_r, lag=lag, bins=bins)
-            except Exception:
-                M[i, j] = np.nan
-
-    return M
+def granger_matrix_partial(df: pd.DataFrame, maxlag=DEFAULT_MAX_LAG, control=None) -> np.ndarray:
+    """Legacy API shim для partial Granger."""
+    return connectivity.granger_matrix_partial(df, lag=int(max(1, maxlag)), control=control)
 
 
 def AH_matrix(df: pd.DataFrame, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU,
@@ -767,187 +350,6 @@ def compute_partial_AH_matrix(data: pd.DataFrame,
 
 def directional_AH_matrix(df: pd.DataFrame, maxlags: int = 5, **kwargs) -> np.ndarray:
     return AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU, pairs=kwargs.get("pairs"))
-
-def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
-    results = {}
-    cols = list(df.columns)
-    for i, tgt in enumerate(cols):
-        for j, src in enumerate(cols):
-            if i == j:
-                continue
-            sub = df[[tgt, src]].dropna()
-            if len(sub) < (maxlag + 10):
-                results[f"{src}->{tgt}"] = None
-                continue
-            try:
-                tests = grangercausalitytests(sub, maxlag=maxlag)
-            except Exception as e:
-                logging.error(f"[Granger] Ошибка Granger для {src}->{tgt}: {e}")
-                results[f"{src}->{tgt}"] = None
-                continue 
-            results[f"{src}->{tgt}"] = tests # Сохраняем РЕЗУЬТАТ
-    return results
-
-# эта матрица НЕ ТА ЖЕ ЧТО В МАППИНГЕ
-def _compute_granger_matrix_internal(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG) -> np.ndarray:
-    n = df.shape[1]
-    G = np.zeros((n, n))
-    cols = df.columns.tolist()
-    # matrix[src, tgt] = pvalue(src -> tgt)
-    for src in range(n):
-        for tgt in range(n):
-            if src == tgt:
-                G[src, tgt] = 0.0
-                continue
-            sub = df[[cols[tgt], cols[src]]].dropna()  # [target, source]
-            try:
-                tests = grangercausalitytests(sub, maxlag=lags)
-                pvals = [tests[l][0]['ssr_ftest'][1] for l in tests]
-                G[src, tgt] = min(pvals)
-            except Exception as e:
-                logging.error(f"[Granger-Internal] Ошибка Granger для {cols[src]}->{cols[tgt]}: {e}")
-                G[src, tgt] = np.nan
-    return G
-
-
-def compute_partial_granger_matrix(data: pd.DataFrame, lags=DEFAULT_MAX_LAG) -> np.ndarray:
-    """
-    контроль остальных переменных, грейндж
-    """
-    df = data.dropna(axis=0, how='any')
-    N = df.shape[1]
-    if N < 3:
-        return _compute_granger_matrix_internal(data, lags=lags)
-    pg_matrix = np.zeros((N, N))
-    T = len(df)
-    p = lags
-    if T <= p:
-        return pg_matrix
-    arr = df.values
-    try:
-        model_full = VAR(arr)
-        res_full = model_full.fit(p, ic=None)
-    except Exception as e:
-        logging.error(f"VAR fit error (partial Granger): {e}")
-        return pg_matrix
-    sigma_full = np.cov(res_full.resid, rowvar=False)
-    for i in range(N):
-        reduced_arr = np.delete(arr, i, axis=1)
-        try:
-            model_red = VAR(reduced_arr)
-            res_red = model_red.fit(p, ic=None)
-            sigma_red = np.cov(res_red.resid, rowvar=False)
-        except Exception as e:
-            for j in range(N):
-                if j != i:
-                    pg_matrix[i, j] = np.nan 
-            continue
-        for j in range(N):
-            if i == j:
-                pg_matrix[i, j] = 0.0
-            else:
-                idx_j = j - 1 if i < j else j
-                var_full = sigma_full[j, j] if sigma_full.shape[0] > j else np.var(res_full.resid[:, j])
-                var_red = sigma_red[idx_j, idx_j] if sigma_red.shape[0] > idx_j else np.var(res_red.resid[:, idx_j])
-                if var_full <= 0 or var_red <= 0:
-                    gc_val = np.nan 
-                else:
-                    gc_val = np.log(var_red / var_full)
-                    if gc_val < 0:
-                        gc_val = 0.0
-                pg_matrix[i, j] = gc_val
-    return pg_matrix
-
-def p_to_score(p: float, eps: float = 1e-300) -> float:
-    """Convert p-value to comparable strength score: -log10(p). Higher = stronger."""
-    if p is None or (isinstance(p, float) and np.isnan(p)):
-        return np.nan
-    p = float(p)
-    if p <= 0:
-        p = eps
-    return float(-np.log10(p))
-
-
-def granger_matrix(df: pd.DataFrame, granger_dict_result: dict) -> np.ndarray:
-    cols = list(df.columns)
-    n_vars = len(cols)
-    G = np.ones((n_vars, n_vars))
-    for i, tgt in enumerate(cols):
-        for j, src in enumerate(cols):
-            if i == j:
-                G[i, j] = 0
-            else:
-                key = f"{src}->{tgt}"
-                if granger_dict_result.get(key) is None:
-                    G[i, j] = np.nan
-                else:
-                    test_dict = granger_dict_result[key]
-                    bp = 1.0 
-                    found_valid_p = False 
-                    for lag_val, dct in test_dict.items():
-                        if isinstance(dct, list) and len(dct) > 0 and 'ssr_ftest' in dct[0]:
-                            F, pval, _, _ = dct[0]['ssr_ftest']
-                            if not np.isnan(pval): 
-                                bp = min(bp, pval)
-                                found_valid_p = True
-                    G[i, j] = bp if found_valid_p else np.nan 
-    return G
-
-
-
-def remove_linear_dependency(sub: pd.DataFrame, src: str, tgt: str, control_cols: list) -> tuple[np.ndarray, np.ndarray]:
-    """Удаляет линейную компоненту контролей из src/tgt и возвращает остатки (src_res, tgt_res)."""
-    if not control_cols:
-        r1 = sub[src].to_numpy(dtype=float)
-        r2 = sub[tgt].to_numpy(dtype=float)
-        return r1, r2
-
-    X = sub[control_cols].to_numpy(dtype=float)
-    y_src = sub[src].to_numpy(dtype=float)
-    y_tgt = sub[tgt].to_numpy(dtype=float)
-
-    mdl_src = LinearRegression().fit(X, y_src)
-    mdl_tgt = LinearRegression().fit(X, y_tgt)
-
-    r1 = y_src - mdl_src.predict(X)
-    r2 = y_tgt - mdl_tgt.predict(X)
-    return r1, r2
-
-def granger_matrix_partial(df: pd.DataFrame, maxlag=DEFAULT_MAX_LAG, control=None) -> np.ndarray:
-    """Conditional Granger causality p-values via multivariate VAR.
-
-    Конвенция: G[src, tgt] = pvalue( src -> tgt ), т.е. тест "src НЕ вызывает tgt".
-    control: список контролей (без src/tgt). Если None — все остальные переменные.
-    """
-    columns = list(df.columns)
-    n = len(columns)
-    G = np.full((n, n), np.nan, dtype=float)
-    np.fill_diagonal(G, 0.0)
-
-    for src_i, src in enumerate(columns):
-        for tgt_j, tgt in enumerate(columns):
-            if src_i == tgt_j:
-                continue
-
-            control_cols = control if control is not None else [c for c in columns if c not in (src, tgt)]
-            control_cols = [c for c in control_cols if c in df.columns and c not in (src, tgt)]
-            use_cols = [tgt, src] + control_cols  # порядок важен только для удобства
-            sub = df[use_cols].dropna()
-
-            # минимум наблюдений: грубо (кол-во параметров VAR растёт с p и k)
-            p = int(max(1, maxlag))
-            k_vars = len(use_cols)
-            if sub.shape[0] < max(30, 5 * p * k_vars):
-                continue
-
-            try:
-                res = VAR(sub).fit(maxlags=p, ic=None, trend="c")
-                test = res.test_causality(caused=tgt, causing=[src], kind="f")
-                G[src_i, tgt_j] = float(test.pvalue) if np.isfinite(test.pvalue) else np.nan
-            except Exception:
-                G[src_i, tgt_j] = np.nan
-
-    return G
 
 def plt_fft_analysis(series: pd.Series, *, fs: float = 1.0):
     """Быстрый FFT-анализ.
@@ -1247,6 +649,7 @@ def _metric_ah_directed(data: pd.DataFrame, lag: int = 1, control=None, **kwargs
     """Направленный AH как влияние src(t) -> tgt(t+lag) через сдвинутую матрицу признаков."""
     lag = int(max(1, lag))
     cols = list(data.columns)
+    n = len(cols)
     shifted = pd.DataFrame(index=data.index)
     for col in cols:
         shifted[col] = pd.to_numeric(data[col], errors="coerce").shift(-lag)
@@ -1256,14 +659,16 @@ def _metric_ah_directed(data: pd.DataFrame, lag: int = 1, control=None, **kwargs
         aligned[f"tgt::{col}"] = shifted[col]
     aligned = aligned.dropna(axis=0, how="any")
     if aligned.empty:
-        return np.zeros((len(cols), len(cols)), dtype=float)
-    ah_raw = AH_matrix(aligned, pairs=None)
-    out = np.zeros((len(cols), len(cols)), dtype=float)
-    for i in range(len(cols)):
-        for j in range(len(cols)):
+        return np.zeros((n, n), dtype=float)
+    # Считаем AH только для перекрёстных пар src[i] -> tgt[j], а не все (2N)².
+    cross_pairs = [(i, n + j) for i in range(n) for j in range(n) if i != j]
+    ah_raw = AH_matrix(aligned, pairs=cross_pairs)
+    out = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        for j in range(n):
             if i == j:
                 continue
-            out[i, j] = float(ah_raw[i, len(cols) + j])
+            out[i, j] = float(ah_raw[i, n + j])
     return out
 
 
@@ -1449,9 +854,8 @@ def _pairwise_partial_value(
         c = float(np.corrcoef(rx, ry)[0, 1])
         return float(c * c)
     if metric == "mi":
-        a = rx.reshape(-1, 1)
-        b = ry.reshape(-1, 1)
-        return float(_knn_mutual_info(a, b, k=DEFAULT_K_MI))
+        # Используем единую реализацию MI из connectivity для согласованности сигнатур.
+        return float(connectivity._knn_mutual_info(rx, ry, k=DEFAULT_K_MI))
     return np.nan
 
 
@@ -1657,6 +1061,7 @@ def analyze_sliding_windows_with_metric(
     *,
     lag: int = 1,
     pairs: Optional[list[tuple[int, int]]] = None,
+    cache: Optional[dict] = None,
     start_min: int | None = None,
     start_max: int | None = None,
     max_windows: int = 400,
@@ -1721,8 +1126,14 @@ def analyze_sliding_windows_with_metric(
         if end > n:
             return int(start), int(end), float("nan"), None
         chunk = data.iloc[start:end]
+        cache_key = (variant, int(lag), int(start), int(end))
         try:
-            mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)), pairs=pairs)
+            if cache is not None and cache_key in cache:
+                mat = cache[cache_key]
+            else:
+                mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)), pairs=pairs)
+                if cache is not None:
+                    cache[cache_key] = mat
             score = _lag_quality(variant, mat)
             score_f = float(score) if np.isfinite(score) else float("nan")
             return int(start), int(end), score_f, (mat if return_matrices else None)
@@ -2129,6 +1540,8 @@ class BigMasterTool:
         self.variant_lags: dict = {}
         self.window_analysis: dict = {}
         self.config: AnalysisConfig = config or AnalysisConfig(enable_experimental=enable_experimental)
+        # Пробрасываем master_seed в модуль метрик для воспроизводимости стохастики.
+        _set_connectivity_seed(int(self.config.master_seed))
 
         # Коллбек прогресса/этапов для UI/CLI.
         # Сигнатура: cb(stage: str, progress: float|None, meta: dict)
@@ -2687,6 +2100,17 @@ class BigMasterTool:
                 control_pca_k=int(kwargs.get("control_pca_k", 0) or 0),
             )
 
+        # Shared dict-кеш матриц для переиспользования между scan и window mode.
+        _matrix_cache: dict[tuple[str, int, int, int], np.ndarray | None] = {}
+
+        def _cached_compute_at_lag(d: pd.DataFrame, lag: int, start: int = 0, end: int = -1) -> np.ndarray | None:
+            key = (variant, int(lag), int(start), int(end))
+            if key in _matrix_cache:
+                return _matrix_cache[key]
+            mat = _compute_at_lag(d, lag)
+            _matrix_cache[key] = mat
+            return mat
+
         def _store_contract(mat_obj: np.ndarray | None) -> None:
             try:
                 contract.output_shape = tuple(np.asarray(mat_obj).shape) if mat_obj is not None else (0, 0)
@@ -2823,6 +2247,7 @@ class BigMasterTool:
                     start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                     return_matrices=True,
                     pairs=pairs_idx,
+                    cache=_matrix_cache,
                     n_jobs=scan_n_jobs,
                     parallel_backend=scan_backend,
                 )
@@ -2854,6 +2279,7 @@ class BigMasterTool:
                         start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
                         return_matrices=False,
                         pairs=pairs_idx,
+                        cache=_matrix_cache,
                         n_jobs=scan_n_jobs,
                         parallel_backend=scan_backend,
                     )
@@ -2882,7 +2308,7 @@ class BigMasterTool:
                 xs, ys = [], []
                 ticks = []
                 for lag in lag_grid:
-                    mat_l = _compute_at_lag(df, int(lag))
+                    mat_l = _cached_compute_at_lag(df, int(lag), start=0, end=-1)
                     q = _lag_quality(variant, mat_l)
                     xs.append(int(lag))
                     ys.append(float(q) if np.isfinite(q) else float("nan"))
@@ -2931,6 +2357,7 @@ class BigMasterTool:
                         max_windows=int(per_combo_max_windows),
                         return_matrices=(cube_matrix_mode == "all"),
                         pairs=pairs_idx,
+                        cache=_matrix_cache,
                         # Избегаем nested-parallel: здесь параллелим по combos,
                         # а внутри прохода по окнам работаем последовательно.
                         n_jobs=1,
@@ -3189,7 +2616,7 @@ class BigMasterTool:
 
             for w, lag in combos:
                 stride = int(stride_override) if stride_override is not None else int(max(1, int(w) // 5))
-                w_info = analyze_sliding_windows_with_metric(df, variant, window_size=int(w), stride=int(stride), lag=int(lag), pairs=pairs_idx)
+                w_info = analyze_sliding_windows_with_metric(df, variant, window_size=int(w), stride=int(stride), lag=int(lag), pairs=pairs_idx, cache=_matrix_cache)
                 bw = w_info.get("best_window") if w_info else None
                 q = float(bw.get("metric", float("nan"))) if bw else float("nan")
                 grid.append({"window_size": int(w), "lag": int(lag), "best_metric": q, "best_start": (bw.get("start") if bw else None)})
@@ -3231,7 +2658,7 @@ class BigMasterTool:
 
         for w in window_sizes:
             stride = int(stride_override) if stride_override is not None else int(max(1, w // 5))
-            w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag, pairs=pairs_idx)
+            w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag, pairs=pairs_idx, cache=_matrix_cache)
             if not w_info:
                 continue
             # Лучшее окно для данного w
