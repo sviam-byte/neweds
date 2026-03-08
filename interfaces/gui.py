@@ -615,8 +615,14 @@ class App(tk.Tk):
                 v.set(value)
 
         def _set_default_methods() -> None:
-            """Включить быстрый дефолт из самых дешевых и часто полезных методов."""
-            default = {"correlation_full", "mutinf_full", "granger_full"}
+            """Включить безопасный дефолт для больших данных.
+
+            По умолчанию стартуем только с correlation_full:
+            это самый устойчивый и дешёвый режим для .h5/.mat и широких
+            временных рядов. Тяжёлые/капризные методы пользователь включает
+            уже осознанно.
+            """
+            default = {"correlation_full"}
             for name, v in self.method_vars.items():
                 v.set(name in default)
 
@@ -640,7 +646,7 @@ class App(tk.Tk):
 
         methods = sorted(method_mapping.keys())
 
-        default_on = {"correlation_full", "mutinf_full", "granger_full"}
+        default_on = {"correlation_full"}
 
         for i, m in enumerate(methods):
             var = tk.BooleanVar(value=(m in default_on))
