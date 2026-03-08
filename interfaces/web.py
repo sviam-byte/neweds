@@ -430,17 +430,27 @@ def main() -> None:
             st.markdown("**Большие данные (HDF5 / wide CSV)**")
             st.caption("Для нейровизуализации (700K+ вокселей): сколько оставить и как выбрать.")
             feature_limit = int(st.number_input(
-                "Макс. вокселей/каналов (0=дефолт 500)",
-                min_value=0, max_value=100000, value=500, step=50,
-                help="HDF5 4D файлы: из 700K вокселей оставляем top-K. Для скорости: 200–500. Для качества: 1000–2000.",
+                "Макс. вокселей/каналов (0=без дополнительного post-cap)",
+                min_value=0, max_value=100000, value=0, step=50,
+                help="0 = не делать дополнительный post-cap после безопасной H5-загрузки. Для spatial-режима лучше оставить 0.",
             ))
             feature_sampling = st.selectbox(
                 "Метод отбора вокселей",
-                ["variance (самые изменчивые)", "activity (макс. сумма)", "random"],
+                ["spatial (фиксированные 3D-блоки)", "variance (самые изменчивые)", "activity (макс. сумма)", "random"],
                 index=0,
             )
-            _fs_map = {"variance": "variance", "activity": "activity", "random": "random"}
+            _fs_map = {"spatial": "spatial", "variance": "variance", "activity": "activity", "random": "random"}
             feature_sampling_val = _fs_map.get(feature_sampling.split()[0], "variance")
+            # Явно задаём размер spatial-блока, чтобы режим был детерминированным
+            # и воспроизводимым в межсубъектных сравнениях.
+            h5_spatial_bin = int(st.number_input(
+                "Размер spatial-блока для H5",
+                min_value=2,
+                max_value=16,
+                value=5,
+                step=1,
+                help="Для межсубъектного сравнения лучше фиксированный bin size, например 5.",
+            ))
             time_stride = int(st.number_input(
                 "Шаг по времени (1=все точки, 2=каждый 2-й, ...)",
                 min_value=1, max_value=100, value=1, step=1,
@@ -685,6 +695,7 @@ def main() -> None:
                             qc_enabled=bool(qc_enabled),
                             feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
                             feature_sampling=str(feature_sampling_val),
+                            h5_spatial_bin=int(h5_spatial_bin),
                             time_stride=(int(time_stride) if int(time_stride) > 1 else None),
                         )
                         window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
@@ -902,6 +913,7 @@ def main() -> None:
                     qc_enabled=bool(qc_enabled),
                     feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
                     feature_sampling=str(feature_sampling_val),
+                    h5_spatial_bin=int(h5_spatial_bin),
                     time_stride=(int(time_stride) if int(time_stride) > 1 else None),
                 )
 

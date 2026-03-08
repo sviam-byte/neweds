@@ -1630,7 +1630,7 @@ class BigMasterTool:
         # Пробрасываем параметры больших данных в RAW-загрузку,
         # чтобы HDF5 4D файлы не пытались загрузить все 700K+ вокселей.
         _big_data_keys = (
-            "feature_limit", "feature_sampling", "feature_seed",
+            "feature_limit", "feature_sampling", "feature_seed", "h5_spatial_bin",
             "time_start", "time_end", "time_stride",
             "dtype", "auto_float32",
         )
