@@ -87,6 +87,27 @@ def plot_connectome(
     legend_text: str = "",
 ) -> BytesIO:
     """Generate a connectome graph for a connectivity matrix and return PNG buffer."""
+    if matrix is None or not isinstance(matrix, np.ndarray) or matrix.ndim != 2 or matrix.size == 0:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.text(
+            0.5,
+            0.5,
+            "Connectome unavailable\n(no matrix data)",
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="gray",
+        )
+        ax.set_title(f"Connectome: {method_name}")
+        ax.axis("off")
+
+        buf = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
     n = matrix.shape[0]
 
     # Для больших матриц connectome-граф нечитаем и тратит минуты на O(N²) цикл.

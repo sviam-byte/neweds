@@ -1819,7 +1819,7 @@ class BigMasterTool:
                 if meta.get("window") is not None:
                     self.window_analysis[variant] = meta["window"]
             except Exception as e:
-                logging.error("Ошибка в методе %s: %s", variant, e)
+                logging.exception("Ошибка метода %s", variant)
                 self.results[variant] = None
                 self.results_meta[variant] = {"error": str(e)}
 
@@ -1897,7 +1897,7 @@ class BigMasterTool:
                 if meta.get("window") is not None:
                     self.window_analysis[variant] = meta["window"]
             except Exception as e:
-                logging.error("Ошибка %s: %s", variant, e)
+                logging.exception("Ошибка метода %s", variant)
                 self.results[variant] = None
                 self.results_meta[variant] = {"error": str(e)}
 

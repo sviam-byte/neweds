@@ -730,6 +730,19 @@ class HTMLReportGenerator:
             chosen_lag = getattr(self.tool, "variant_lags", {}).get(variant, 1)
 
             meta = getattr(self.tool, "results_meta", {}).get(variant, {}) or {}
+
+            if mat is None:
+                err = html.escape(str(meta.get("error", "unknown error")))
+                sections.append(
+                    f"<section class='card' id='{anchor}'>"
+                    f"<h2>{html.escape(info['title'])}</h2>"
+                    f"<div class='muted'>{html.escape(info.get('meaning', ''))}</div>"
+                    f"<div class='meta'><b>Статус:</b> метод не дал матрицу результата.</div>"
+                    f"<div class='meta'><b>Ошибка:</b> {err}</div>"
+                    f"</section>"
+                )
+                continue
+
             meta_lines = []
             if meta.get("partial"):
                 p = meta["partial"]

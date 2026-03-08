@@ -597,7 +597,11 @@ def main() -> None:
 
 
     all_methods = STABLE_METHODS + EXPERIMENTAL_METHODS
-    selected_methods = st.multiselect("Выберите методы", all_methods, default=STABLE_METHODS[:2])
+    selected_methods = st.multiselect(
+        "Выберите методы",
+        all_methods,
+        default=["correlation_full"],
+    )
 
     with st.expander("План запуска (что будет сделано)", expanded=False):
         st.write({
