@@ -6,6 +6,9 @@
 """
 
 import logging
+import os
+from pathlib import Path
+
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -507,11 +510,128 @@ def h5_4d_to_spatial_bins(
     df.attrs["bin_size"] = int(bin_size)
     return df
 
+def _build_aggregated_h5_path(
+    source_path: str,
+    *,
+    output_dir: str | None = None,
+    bin_size: int = 5,
+    aggregation: str = "mean",
+) -> str:
+    """Строит путь для сохранения агрегированного H5."""
+    src = Path(source_path)
+    root = Path(output_dir) if output_dir else (src.parent / "results" / "aggregated_h5")
+    folder = root / f"spatialbin_b{int(bin_size)}_{aggregation}"
+    folder.mkdir(parents=True, exist_ok=True)
+    return str(folder / f"{src.stem}.h5")
+
+
+def save_aggregated_h5(
+    out_path: str,
+    df: pd.DataFrame,
+    *,
+    source_path: str,
+    bin_size: int,
+    original_shape: tuple[int, ...] | list[int] | None = None,
+    aggregation: str = "mean",
+) -> str:
+    """Сохраняет агрегированные spatial-bins в отдельный H5."""
+    import h5py
+
+    out_path = str(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    coords = df.attrs.get("coords")
+    if isinstance(coords, pd.DataFrame):
+        coords_df = coords.copy()
+    elif isinstance(coords, list):
+        coords_df = pd.DataFrame(coords)
+    else:
+        coords_df = pd.DataFrame()
+
+    with h5py.File(out_path, "w") as f:
+        g_agg = f.create_group("agg")
+        g_meta = f.create_group("meta")
+
+        arr = df.to_numpy(dtype=np.float32, copy=False)
+        g_agg.create_dataset("timeseries", data=arr, compression="gzip")
+
+        if not coords_df.empty:
+            xyz_cols = [c for c in ["x", "y", "z"] if c in coords_df.columns]
+            if len(xyz_cols) == 3:
+                g_agg.create_dataset(
+                    "bin_xyz",
+                    data=coords_df[xyz_cols].to_numpy(dtype=np.float32, copy=False),
+                    compression="gzip",
+                )
+
+            count_col = "n_voxels"
+            if count_col in coords_df.columns:
+                g_agg.create_dataset(
+                    "bin_counts",
+                    data=coords_df[count_col].to_numpy(dtype=np.int32, copy=False),
+                    compression="gzip",
+                )
+
+            bound_cols = [c for c in ["bin_x0", "bin_x1", "bin_y0", "bin_y1", "bin_z0", "bin_z1"] if c in coords_df.columns]
+            if len(bound_cols) == 6:
+                g_agg.create_dataset(
+                    "bin_bounds",
+                    data=coords_df[bound_cols].to_numpy(dtype=np.int32, copy=False),
+                    compression="gzip",
+                )
+
+        g_meta.attrs["representation"] = "spatial_bins"
+        g_meta.attrs["aggregation"] = str(aggregation)
+        g_meta.attrs["bin_size"] = int(bin_size)
+        g_meta.attrs["source_file"] = str(source_path)
+        g_meta.attrs["orientation"] = "time_by_bins"
+        if original_shape is not None:
+            g_meta.attrs["original_shape"] = list(original_shape)
+
+    return out_path
+
+
+def load_aggregated_h5(filepath: str) -> pd.DataFrame:
+    """Читает ранее сохранённый aggregated H5 и возвращает DataFrame T×K."""
+    import h5py
+
+    with h5py.File(filepath, "r") as f:
+        arr = np.asarray(f["agg/timeseries"], dtype=np.float32)
+
+        cols = [f"bin_{i}" for i in range(arr.shape[1])]
+        df = pd.DataFrame(arr, columns=cols)
+
+        coords_df = pd.DataFrame()
+        if "agg/bin_xyz" in f:
+            xyz = np.asarray(f["agg/bin_xyz"])
+            coords_df["x"] = xyz[:, 0]
+            coords_df["y"] = xyz[:, 1]
+            coords_df["z"] = xyz[:, 2]
+        if "agg/bin_counts" in f:
+            coords_df["n_voxels"] = np.asarray(f["agg/bin_counts"])
+        if "agg/bin_bounds" in f:
+            bb = np.asarray(f["agg/bin_bounds"])
+            coords_df["bin_x0"] = bb[:, 0]
+            coords_df["bin_x1"] = bb[:, 1]
+            coords_df["bin_y0"] = bb[:, 2]
+            coords_df["bin_y1"] = bb[:, 3]
+            coords_df["bin_z0"] = bb[:, 4]
+            coords_df["bin_z1"] = bb[:, 5]
+
+        if not coords_df.empty:
+            coords_df.insert(0, "voxel_id", cols)
+            df.attrs["coords"] = coords_df
+
+        df.attrs["format"] = "spatial_bins"
+        df.attrs["source_kind"] = "aggregated_h5"
+        return df
+
+
 def _load_h5_neuroimaging(
     filepath: str,
     *,
     feature_limit: int | None = None,
-    feature_sampling: str = "variance",
+    feature_sampling: str = "spatial",
     h5_spatial_bin: int | None = None,
     feature_seed: int = 13,
     time_start: int | None = None,
@@ -621,7 +741,8 @@ def _load_h5_neuroimaging(
     )
 
     var_eps = max(1e-12, float(nonzero_threshold))
-    spatial_mode = str(feature_sampling or "").strip().lower() in {"spatial", "spatial_bin", "bins"} or (
+    feature_mode = str(feature_sampling or "spatial").strip().lower()
+    spatial_mode = feature_mode in {"spatial", "spatial_bin", "bins", "auto", "deterministic"} or (
         h5_spatial_bin is not None and int(h5_spatial_bin) > 1
     )
 
@@ -633,6 +754,7 @@ def _load_h5_neuroimaging(
             eps=var_eps,
             min_voxels_per_bin=1,
         )
+        df_h5.attrs["original_shape"] = list(shape)
         del arr4d
         logging.info(
             "[HDF5] Spatial binning applied directly on 4D volume: %s -> %s (bin=%d)",
@@ -1622,6 +1744,9 @@ def load_or_generate(
     feature_limit: int | None = None,
     feature_sampling: str = "first",
     feature_seed: int = 13,
+    save_aggregated_h5: bool = False,
+    aggregated_h5_dir: str | None = None,
+    reuse_existing_aggregated_h5: bool = True,
     usecols: Any = "auto",
     csv_engine: str = "auto",
     preprocess: bool = True,
@@ -1677,16 +1802,58 @@ def load_or_generate(
         # HDF5 neuroimaging: отдельный путь, т.к. 4D→2D конверсия
         # принципиально отличается от табличного CSV/Excel пайплайна.
         if _fp_low.endswith((".h5", ".hdf5", ".hdf")):
-            df = _load_h5_neuroimaging(
-                filepath,
-                feature_limit=feature_limit,
-                feature_sampling=feature_sampling or "variance",
-                feature_seed=feature_seed,
-                h5_spatial_bin=h5_spatial_bin,
-                time_start=time_start,
-                time_end=time_end,
-                time_stride=time_stride,
-            )
+            h5_feature_sampling = str(feature_sampling or "").strip().lower()
+            if h5_feature_sampling in {"", "first", "auto"}:
+                h5_feature_sampling = "spatial"
+
+            aggregated_path = None
+            if h5_feature_sampling in {"spatial", "spatial_bin", "bins", "deterministic", "auto"}:
+                _bin_size = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 5
+                aggregated_path = _build_aggregated_h5_path(
+                    filepath,
+                    output_dir=aggregated_h5_dir,
+                    bin_size=_bin_size,
+                    aggregation="mean",
+                )
+                if bool(reuse_existing_aggregated_h5) and os.path.exists(aggregated_path):
+                    logging.info("[HDF5] Reusing aggregated H5: %s", aggregated_path)
+                    df = load_aggregated_h5(aggregated_path)
+                    df.attrs["aggregated_h5_path"] = aggregated_path
+                else:
+                    df = _load_h5_neuroimaging(
+                        filepath,
+                        feature_limit=feature_limit,
+                        feature_sampling=h5_feature_sampling,
+                        feature_seed=feature_seed,
+                        h5_spatial_bin=h5_spatial_bin,
+                        time_start=time_start,
+                        time_end=time_end,
+                        time_stride=time_stride,
+                    )
+                    if bool(save_aggregated_h5) and str(getattr(df, "attrs", {}).get("format", "")).lower() == "spatial_bins":
+                        try:
+                            globals()["save_aggregated_h5"](
+                                aggregated_path,
+                                df,
+                                source_path=filepath,
+                                bin_size=_bin_size,
+                                original_shape=getattr(df, "attrs", {}).get("original_shape"),
+                                aggregation="mean",
+                            )
+                            df.attrs["aggregated_h5_path"] = aggregated_path
+                        except Exception as exc:
+                            logging.warning("Failed to save aggregated H5: %s", exc)
+            else:
+                df = _load_h5_neuroimaging(
+                    filepath,
+                    feature_limit=feature_limit,
+                    feature_sampling=h5_feature_sampling,
+                    feature_seed=feature_seed,
+                    h5_spatial_bin=h5_spatial_bin,
+                    time_start=time_start,
+                    time_end=time_end,
+                    time_stride=time_stride,
+                )
         else:
             raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
 

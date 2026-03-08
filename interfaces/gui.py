@@ -81,6 +81,13 @@ class App(tk.Tk):
         self.post_preproc_fill_missing = tk.BooleanVar(value=True)
 
         # Уменьшение размерности (очень большие N): опционально до анализа.
+        # Отдельно: ранняя детерминированная агрегация HDF5/4D ещё ДО общей предобработки.
+        self.input_reduce_h5_early = tk.BooleanVar(value=True)
+        self.input_h5_spatial_bin = tk.IntVar(value=5)
+        self.input_save_aggregated_h5 = tk.BooleanVar(value=True)
+        self.input_reuse_aggregated_h5 = tk.BooleanVar(value=True)
+        self.input_aggregated_h5_dir = tk.StringVar(value="")
+
         self.dimred_enabled = tk.BooleanVar(value=False)
         self.dimred_method = tk.StringVar(value="variance")
         self.dimred_target = tk.IntVar(value=500)
@@ -480,6 +487,37 @@ class App(tk.Tk):
         ttk.Label(pr2, text="local win:").pack(side="left")
         ttk.Entry(pr2, textvariable=self.preproc_outlier_local_median_window, width=5).pack(side="left", padx=(5,10))
 
+        inp = ttk.LabelFrame(frame, text="Ранняя агрегация входа (до предобработки и тяжёлых расчётов)", padding=6)
+        inp.pack(fill="x", pady=6)
+        inp0 = ttk.Frame(inp)
+        inp0.pack(fill="x", pady=2)
+        ttk.Checkbutton(
+            inp0,
+            text="Для HDF5/4D сначала детерминированно агрегировать spatial-блоками",
+            variable=self.input_reduce_h5_early,
+        ).pack(side="left")
+        ttk.Label(inp0, text="Размер блока:").pack(side="left", padx=(10, 5))
+        ttk.Entry(inp0, textvariable=self.input_h5_spatial_bin, width=6).pack(side="left")
+        ttk.Label(inp0, text="(одинаково для всех субъектов)").pack(side="left", padx=(8, 0))
+
+        inp1 = ttk.Frame(inp)
+        inp1.pack(fill="x", pady=2)
+        ttk.Checkbutton(
+            inp1,
+            text="Сохранять агрегированные ряды в отдельный H5",
+            variable=self.input_save_aggregated_h5,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            inp1,
+            text="Переиспользовать уже сохранённый aggregated H5",
+            variable=self.input_reuse_aggregated_h5,
+        ).pack(side="left", padx=(12, 0))
+
+        inp2 = ttk.Frame(inp)
+        inp2.pack(fill="x", pady=2)
+        ttk.Label(inp2, text="Папка aggregated H5:").pack(side="left")
+        ttk.Entry(inp2, textvariable=self.input_aggregated_h5_dir, width=48).pack(side="left", padx=(8, 0), fill="x", expand=True)
+
         dr = ttk.LabelFrame(frame, text="Уменьшение размерности (до анализа, опционально)", padding=6)
         dr.pack(fill="x", pady=6)
 
@@ -736,8 +774,20 @@ class App(tk.Tk):
 
         # Загружаем данные через API движка, а не вручную через tool.data = ...,
         # чтобы не терять служебные артефакты (coords_df, qc_*, data_raw и т.д.).
+        _fp_low = str(fp).lower()
+        _is_h5 = _fp_low.endswith((".h5", ".hdf5", ".hdf"))
+
         tool.load_data_excel(
             fp,
+            feature_sampling=("spatial" if (_is_h5 and self._as_bool(self.input_reduce_h5_early)) else "first"),
+            h5_spatial_bin=(
+                self._as_int(self.input_h5_spatial_bin, 5)
+                if (_is_h5 and self._as_bool(self.input_reduce_h5_early))
+                else None
+            ),
+            save_aggregated_h5=(_is_h5 and self._as_bool(self.input_reduce_h5_early) and self._as_bool(self.input_save_aggregated_h5)),
+            reuse_existing_aggregated_h5=(_is_h5 and self._as_bool(self.input_reduce_h5_early) and self._as_bool(self.input_reuse_aggregated_h5)),
+            aggregated_h5_dir=((self._as_str(self.input_aggregated_h5_dir) or "").strip() or None),
             preprocess=(self._as_bool(self.preproc_enabled) and str(self._as_str(self.preprocess_stage)).strip().lower() in ("pre", "both")),
             log_transform=self._as_bool(self.preproc_log_transform),
             remove_outliers=self._as_bool(self.preproc_remove_outliers),
@@ -760,15 +810,6 @@ class App(tk.Tk):
             season_period=(self._as_int(self.preproc_season_period, 0) if self._as_int(self.preproc_season_period, 0) > 0 else None),
             qc_enabled=True,
         )
-
-        if cfg.auto_difference:
-            from src.analysis import stats as s_stats
-
-            for c in tool.data.columns:
-                if pd.api.types.is_numeric_dtype(tool.data[c]):
-                    _, p = s_stats.test_stationarity(tool.data[c])
-                    if p is not None and p > 0.05:
-                        tool.data[c] = tool.data[c].diff().fillna(0)
 
         w_sizes = None
         txt = (self.window_sizes_text.get() or "").strip()
@@ -1177,6 +1218,12 @@ class App(tk.Tk):
             self.neighbor_radius,
             self.screen_metric,
             self.topk_per_node,
+            # Ранняя агрегация входа.
+            self.input_reduce_h5_early,
+            self.input_h5_spatial_bin,
+            self.input_save_aggregated_h5,
+            self.input_reuse_aggregated_h5,
+            self.input_aggregated_h5_dir,
             # Dimred.
             self.dimred_enabled,
             self.dimred_method,
@@ -1290,6 +1337,15 @@ class App(tk.Tk):
                 "limit": self._as_int(self.cube_gallery_limit, 60),
             },
         }
+        input_aggregation = {
+            "h5_early_reduce": self._as_bool(self.input_reduce_h5_early),
+            "h5_mode": "spatial_bins" if self._as_bool(self.input_reduce_h5_early) else "raw",
+            "h5_spatial_bin": self._as_int(self.input_h5_spatial_bin, 5),
+            "save_aggregated_h5": self._as_bool(self.input_save_aggregated_h5),
+            "reuse_existing_aggregated_h5": self._as_bool(self.input_reuse_aggregated_h5),
+            "aggregated_h5_dir": self._as_str(self.input_aggregated_h5_dir),
+        }
+
         dimred = {
             "enabled": self._as_bool(self.dimred_enabled),
             "method": self._as_str(self.dimred_method),
@@ -1327,6 +1383,7 @@ class App(tk.Tk):
                 "rank_ties": self._as_str(self.post_preproc_rank_ties),
                 "fill_missing": self._as_bool(self.post_preproc_fill_missing),
             },
+            "input_aggregation": input_aggregation,
             "dim_reduction": dimred,
             "scans": scans,
             "pairing": {

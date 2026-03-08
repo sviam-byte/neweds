@@ -53,3 +53,78 @@ def test_read_input_table_mat_nested(tmp_path):
     savemat(fp, {"outer": {"ts": np.arange(6, dtype=float).reshape(2, 3)}})
     df = data_loader.read_input_table(str(fp))
     assert df.shape == (2, 3)
+
+
+def test_load_h5_defaults_to_spatial_bins(tmp_path):
+    """H5 4D inputs should be aggregated deterministically before heavy processing."""
+    import h5py
+    import numpy as np
+
+    fp = tmp_path / "demo.h5"
+    arr = np.zeros((4, 4, 4, 6), dtype=np.float32)
+    arr[0:2, 0:2, 0:2, :] = 1.0
+    arr[2:4, 2:4, 2:4, :] = np.arange(6, dtype=np.float32)
+
+    with h5py.File(fp, "w") as f:
+        f.create_dataset("timeseries", data=arr)
+
+    df = data_loader.load_or_generate(
+        str(fp),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+    )
+    assert df.attrs.get("format") == "spatial_bins"
+    assert df.shape[0] == 6
+    assert df.shape[1] >= 1
+
+
+def test_load_h5_can_save_and_reuse_aggregated_h5(tmp_path):
+    """Loader should persist aggregated H5 and reuse it on subsequent runs."""
+    import h5py
+    import numpy as np
+
+    src = tmp_path / "subj1.h5"
+    arr = np.zeros((4, 4, 4, 5), dtype=np.float32)
+    arr[0:2, 0:2, 0:2, :] = 2.0
+    arr[2:4, 2:4, 2:4, :] = np.arange(5, dtype=np.float32)
+
+    with h5py.File(src, "w") as f:
+        f.create_dataset("timeseries", data=arr)
+
+    out_dir = tmp_path / "results" / "aggregated_h5"
+
+    df_first = data_loader.load_or_generate(
+        str(src),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        feature_sampling="spatial",
+        h5_spatial_bin=2,
+        save_aggregated_h5=True,
+        reuse_existing_aggregated_h5=False,
+        aggregated_h5_dir=str(out_dir),
+    )
+
+    agg_path = df_first.attrs.get("aggregated_h5_path")
+    assert isinstance(agg_path, str) and agg_path.endswith("subj1.h5")
+    assert Path(agg_path).exists()
+
+    df_reused = data_loader.load_or_generate(
+        str(src),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        feature_sampling="spatial",
+        h5_spatial_bin=2,
+        save_aggregated_h5=False,
+        reuse_existing_aggregated_h5=True,
+        aggregated_h5_dir=str(out_dir),
+    )
+
+    assert df_reused.attrs.get("source_kind") == "aggregated_h5"
+    assert df_reused.attrs.get("format") == "spatial_bins"
+    assert df_reused.shape == df_first.shape
