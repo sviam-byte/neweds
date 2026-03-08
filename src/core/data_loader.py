@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .preprocessing import additional_preprocessing
-from statsmodels.tsa.stattools import adfuller
+from ..analysis import stats as analysis_stats
 import numpy as np
 from scipy import stats
 from scipy.io import loadmat
@@ -1639,12 +1639,12 @@ def preprocess_timeseries(
         report.add("[Preprocess] remove seasonality: STL (if period detected)")
         try:
             from statsmodels.tsa.seasonal import STL
-            from ..analysis import stats as analysis_stats
+            from ..analysis import stats as seasonality_stats
         except Exception:
             STL = None
-            analysis_stats = None
+            seasonality_stats = None
 
-        if STL is not None and analysis_stats is not None:
+        if STL is not None and seasonality_stats is not None:
             for col in out.columns:
                 if not pd.api.types.is_numeric_dtype(out[col]):
                     continue
@@ -1654,7 +1654,7 @@ def preprocess_timeseries(
                 per = int(season_period) if season_period is not None and int(season_period) >= 2 else None
                 if per is None:
                     try:
-                        ss = analysis_stats.detect_seasonality(x)
+                        ss = seasonality_stats.detect_seasonality(x)
                         cand = ss.get("acf_period")
                         strength = ss.get("acf_strength")
                         if cand is not None and strength is not None and float(strength) >= 0.2:
@@ -1714,10 +1714,16 @@ def preprocess_timeseries(
             if pd.api.types.is_numeric_dtype(out[col]):
                 series = out[col].dropna()
                 if len(series) > 10:
-                    pvalue = adfuller(series, autolag="AIC")[1]
-                    logging.info(
-                        f"Ряд '{col}' {'стационарен' if pvalue <= 0.05 else 'вероятно нестационарен'} (p-value ADF={pvalue:.3f})."
-                    )
+                    _, pvalue = analysis_stats.test_stationarity(series)
+                    if pvalue is not None:
+                        logging.info(
+                            f"Ряд '{col}' {'стационарен' if pvalue <= 0.05 else 'вероятно нестационарен'} (p-value ADF={pvalue:.3f})."
+                        )
+                    else:
+                        logging.debug(
+                            "ADF skipped for column '%s' (constant/short/degenerate series).",
+                            col,
+                        )
     try:
         if _saved_attrs:
             out.attrs.update(_saved_attrs)

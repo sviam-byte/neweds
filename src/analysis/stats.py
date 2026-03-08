@@ -42,14 +42,34 @@ def _coerce_1d_numeric(series_like) -> np.ndarray:
 
 
 def test_stationarity(series: pd.Series) -> tuple[float | None, float | None]:
-    clean_series = series.dropna()
-    if len(clean_series) < 5:
+    """Возвращает статистику и p-value ADF, либо ``(None, None)``.
+
+    Функция безопасно обрабатывает частые деградации входа: константные,
+    почти константные, короткие и нечисловые ряды.
+    """
+    clean_series = pd.to_numeric(series, errors="coerce").dropna()
+    if len(clean_series) < 8:
         return None, None
+
+    arr = clean_series.to_numpy(dtype=np.float64, copy=False)
+    if arr.size == 0:
+        return None, None
+
+    # ADF статистически не определён на константных/почти константных рядах.
+    if np.allclose(arr, arr[0], equal_nan=True):
+        return None, None
+    if not np.isfinite(arr).all():
+        arr = arr[np.isfinite(arr)]
+        if arr.size < 8:
+            return None, None
+    if np.nanstd(arr) < 1e-12:
+        return None, None
+
     try:
-        res = adfuller(clean_series)
+        res = adfuller(arr, autolag="AIC")
         return float(res[0]), float(res[1])
     except Exception as exc:
-        logging.warning("ADF error: %s", exc)
+        logging.debug("ADF skipped/failed: %s", exc)
         return None, None
 
 
