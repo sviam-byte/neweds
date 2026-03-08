@@ -106,7 +106,11 @@ def _render_validation_tab() -> None:
     # --- Выбор режима ---
     mode = st.radio(
         "Режим",
-        [f"Быстрый ({len(QUICK_SCENARIOS)} сценария × стабильные метрики)", "Полный (7 сценариев × все метрики)", "Выборочный"],
+        [
+            f"Быстрый ({len(QUICK_SCENARIOS)} сценария × стабильные метрики)",
+            f"Полный ({len(ALL_SCENARIOS)} сценариев × все метрики)",
+            "Выборочный",
+        ],
         index=0,
         horizontal=True,
         key="val_mode",
