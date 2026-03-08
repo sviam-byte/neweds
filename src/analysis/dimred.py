@@ -50,7 +50,16 @@ def _spatial_bin(data: pd.DataFrame, coords_df: pd.DataFrame | None, target_n: i
 
     cdf = coords_df.copy()
     cols_low = {c.lower(): c for c in cdf.columns}
-    name_col = cols_low.get("name") or cols_low.get("node")
+    # Поддерживаем несколько схем именования признака, чтобы spatial-режим
+    # работал как для legacy-таблиц (name/node), так и для H5 pipeline,
+    # где идентификатор часто хранится в `voxel_id`.
+    name_col = (
+        cols_low.get("name")
+        or cols_low.get("node")
+        or cols_low.get("voxel_id")
+        or cols_low.get("feature")
+        or cols_low.get("source")
+    )
     if not name_col or not all(k in cols_low for k in ("x", "y", "z")):
         return _variance_select(data, target_n or n_features)
 

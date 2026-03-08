@@ -435,25 +435,99 @@ def h5_4d_to_voxel_wide(
     return df
 
 
+
+
+def h5_4d_to_spatial_bins(
+    arr4d: np.ndarray,
+    *,
+    bin_size: int = 5,
+    eps: float = 1e-12,
+    min_voxels_per_bin: int = 1,
+) -> pd.DataFrame:
+    """Агрегирует 4D массив (X,Y,Z,T) в фиксированные spatial bins и возвращает DataFrame T×K.
+
+    Схема одинакова для всех субъектов при одинаковой геометрии и одинаковом bin_size.
+    Это предпочтительный режим для межсубъектного сравнения, когда важна
+    вычислимость и детерминированность без атласа.
+    """
+    arr4d = np.asarray(arr4d)
+    if arr4d.ndim != 4:
+        raise ValueError(f"h5_4d_to_spatial_bins expects 4D array, got shape={arr4d.shape}")
+
+    b = max(1, int(bin_size))
+    x_dim, y_dim, z_dim, t_dim = [int(v) for v in arr4d.shape]
+
+    reduced_cols: dict[str, np.ndarray] = {}
+    coords_rows: list[dict[str, Any]] = []
+
+    for x0 in range(0, x_dim, b):
+        x1 = min(x0 + b, x_dim)
+        for y0 in range(0, y_dim, b):
+            y1 = min(y0 + b, y_dim)
+            for z0 in range(0, z_dim, b):
+                z1 = min(z0 + b, z_dim)
+
+                block = arr4d[x0:x1, y0:y1, z0:z1, :]
+                flat = block.reshape(-1, t_dim)
+                if flat.size == 0:
+                    continue
+
+                var = np.nanvar(flat, axis=1)
+                keep = np.isfinite(var) & (var > float(eps))
+                if int(np.sum(keep)) < int(max(1, min_voxels_per_bin)):
+                    continue
+
+                ts = np.nanmean(flat[keep], axis=0).astype(np.float32, copy=False)
+                name = f"bin_x{x0}_{x1}_y{y0}_{y1}_z{z0}_{z1}"
+                reduced_cols[name] = ts
+
+                coords_rows.append({
+                    "voxel_id": name,
+                    "x": float((x0 + x1 - 1) / 2.0),
+                    "y": float((y0 + y1 - 1) / 2.0),
+                    "z": float((z0 + z1 - 1) / 2.0),
+                    "bin_x0": int(x0),
+                    "bin_x1": int(x1),
+                    "bin_y0": int(y0),
+                    "bin_y1": int(y1),
+                    "bin_z0": int(z0),
+                    "bin_z1": int(z1),
+                    "n_voxels": int(np.sum(keep)),
+                })
+
+    if not reduced_cols:
+        raise ValueError("No spatial bins survived variance filtering in HDF5 volume")
+
+    df = pd.DataFrame(reduced_cols)
+    df.attrs["coords"] = pd.DataFrame(coords_rows)
+    df.attrs["format"] = "spatial_bins"
+    df.attrs["source_kind"] = "h5_4d_spatial"
+    df.attrs["time_axis"] = 3
+    df.attrs["feature_axis"] = "spatial_bin"
+    df.attrs["bin_size"] = int(bin_size)
+    return df
+
 def _load_h5_neuroimaging(
     filepath: str,
     *,
     feature_limit: int | None = None,
     feature_sampling: str = "variance",
+    h5_spatial_bin: int | None = None,
     feature_seed: int = 13,
     time_start: int | None = None,
     time_end: int | None = None,
     time_stride: int | None = None,
     nonzero_threshold: float = 1e-6,
-    default_feature_limit: int = 500,
+    default_feature_limit: int = 0,
 ) -> pd.DataFrame:
     """Загрузка 4D нейровизуализационного HDF5 (X,Y,Z,T) в DataFrame time×voxel.
 
     Поддерживает формат с dataset shape=(X,Y,Z,T) dtype=float32.
     Возвращает DataFrame shape=(T_eff, N_voxels) с attrs["coords"].
 
-    Если feature_limit не задан, используется default_feature_limit (500).
-    Для 700K+ вокселей subsampling по дисперсии критичен для памяти.
+    При feature_sampling="spatial" (или при заданном h5_spatial_bin>1) применяется
+    прямая детерминированная 3D-агрегация без случайной подвыборки вокселей.
+    Если feature_limit не задан/<=0, дополнительный post-cap не применяется.
     """
     if _h5py is None:
         raise ImportError(
@@ -546,8 +620,29 @@ def _load_h5_neuroimaging(
         arr4d.nbytes / (1024**2),
     )
 
-    # Безопасный pre-cap для GUI: не раздуваем DataFrame до сотен тысяч колонок.
     var_eps = max(1e-12, float(nonzero_threshold))
+    spatial_mode = str(feature_sampling or "").strip().lower() in {"spatial", "spatial_bin", "bins"} or (
+        h5_spatial_bin is not None and int(h5_spatial_bin) > 1
+    )
+
+    if spatial_mode:
+        bin_size = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 5
+        df_h5 = h5_4d_to_spatial_bins(
+            arr4d,
+            bin_size=bin_size,
+            eps=var_eps,
+            min_voxels_per_bin=1,
+        )
+        del arr4d
+        logging.info(
+            "[HDF5] Spatial binning applied directly on 4D volume: %s -> %s (bin=%d)",
+            shape,
+            df_h5.shape,
+            bin_size,
+        )
+        return df_h5
+
+    # Безопасный pre-cap для GUI: не раздуваем DataFrame до сотен тысяч колонок.
     df_h5 = h5_4d_to_voxel_wide(
         arr4d,
         nonzero_mode="var",
@@ -563,7 +658,7 @@ def _load_h5_neuroimaging(
     # Дополнительное ограничение с учётом пользовательского feature_limit.
     k = feature_limit
     if k is None or int(k) <= 0:
-        k = default_feature_limit
+        k = n_selected if int(default_feature_limit or 0) <= 0 else default_feature_limit
     k = int(min(int(k), n_selected))
 
     if n_selected > k:
@@ -1515,6 +1610,7 @@ def load_or_generate(
     header: str = "auto",
     time_col: str = "auto",
     transpose: str = "auto",
+    h5_spatial_bin: int | None = None,
     # Параметры для больших данных и производительности
     dtype: str | None = None,
     # Если dtype=None, то для очень широких/больших таблиц автоматически
@@ -1586,6 +1682,7 @@ def load_or_generate(
                 feature_limit=feature_limit,
                 feature_sampling=feature_sampling or "variance",
                 feature_seed=feature_seed,
+                h5_spatial_bin=h5_spatial_bin,
                 time_start=time_start,
                 time_end=time_end,
                 time_stride=time_stride,
