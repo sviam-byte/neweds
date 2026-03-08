@@ -905,6 +905,20 @@ def main() -> None:
                     time_stride=(int(time_stride) if int(time_stride) > 1 else None),
                 )
 
+                # Явное сообщение об истинной причине, если после импорта/предобработки
+                # не осталось валидных рядов для расчётов.
+                df_loaded = getattr(tool, "data", None)
+                if (
+                    df_loaded is None
+                    or getattr(df_loaded, "empty", False)
+                    or int(getattr(df_loaded, "shape", (0, 0))[1]) == 0
+                ):
+                    st.error(
+                        "После импорта и предобработки не осталось ни одного ряда. "
+                        "Для H5 voxel-data обычно причина в слишком агрессивной фильтрации признаков."
+                    )
+                    st.stop()
+
                 # main windows
                 window_sizes_main = None
                 if use_main_windows:

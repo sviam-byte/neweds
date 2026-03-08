@@ -22,6 +22,14 @@ except ImportError:
     _h5py = None  # type: ignore[assignment]
 
 
+MAX_RAW_VOXELS_FOR_GUI = 5000
+"""Безопасный верхний предел числа сырых voxel-рядов для GUI-пайплайна.
+
+Ограничение применяется на этапе извлечения из 4D H5 до построения полного
+DataFrame time×voxel, чтобы избежать взрывного роста памяти.
+"""
+
+
 @dataclass
 class PreprocessReport:
     """Структурированный отчёт о предобработке временных рядов.
@@ -276,6 +284,7 @@ def voxel_wide_to_timeseries(
     out.columns = voxel_ids
     out.attrs["coords"] = coords
     out.attrs["voxel_time_cols"] = [str(c) for c in time_cols_sorted]
+    out.attrs["format"] = "voxel_wide"
     return out
 
 
@@ -347,6 +356,82 @@ def _mat_to_dataframe(filepath: str) -> pd.DataFrame:
         df.attrs["mat_source"] = str(name)
     except Exception:
         pass
+    return df
+
+
+
+
+def h5_4d_to_voxel_wide(
+    arr4d: np.ndarray,
+    *,
+    nonzero_mode: str = "any",
+    eps: float = 0.0,
+    max_voxels: int | None = None,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Преобразует 4D массив (X,Y,Z,T) в DataFrame формата (T, N_voxels).
+
+    Колонки получают имена с координатами вокселей, а в attrs добавляются
+    метаданные для downstream-пайплайна (`coords`, `format`, `source_kind`).
+
+    Args:
+        arr4d: Входной 4D массив формы (X, Y, Z, T).
+        nonzero_mode: Критерий отбора валидных вокселей:
+            - "any": хотя бы одна точка по времени имеет |value| > eps;
+            - "var": дисперсия ряда > eps.
+        eps: Числовой порог для `nonzero_mode`.
+        max_voxels: Если задан, ограничивает число вокселей случайной подвыборкой.
+        seed: Seed для воспроизводимой подвыборки.
+
+    Returns:
+        DataFrame формы (T, N_voxels).
+
+    Raises:
+        ValueError: если вход не 4D, временная ось слишком короткая
+            или после фильтрации не осталось валидных вокселей.
+    """
+    if not isinstance(arr4d, np.ndarray):
+        arr4d = np.asarray(arr4d)
+
+    if arr4d.ndim != 4:
+        raise ValueError(f"h5_4d_to_voxel_wide expects 4D array, got shape={arr4d.shape}")
+
+    x, y, z, t = arr4d.shape
+    if t < 2:
+        raise ValueError(f"Invalid time axis length: {t}")
+
+    # View без копии: (voxels, time).
+    flat = arr4d.reshape(x * y * z, t)
+
+    mode = str(nonzero_mode or "any").strip().lower()
+    if mode == "any":
+        keep_mask = np.any(np.abs(flat) > float(eps), axis=1)
+    elif mode == "var":
+        keep_mask = np.nanvar(flat, axis=1) > float(eps)
+    else:
+        raise ValueError(f"Unknown nonzero_mode: {nonzero_mode}")
+
+    keep_idx = np.flatnonzero(keep_mask)
+    if keep_idx.size == 0:
+        raise ValueError("No nonzero/valid voxels found in 4D H5 dataset")
+
+    if max_voxels is not None and keep_idx.size > int(max_voxels):
+        rng = np.random.default_rng(int(seed))
+        keep_idx = np.sort(rng.choice(keep_idx, size=int(max_voxels), replace=False))
+
+    kept = flat[keep_idx, :]
+    xs, ys, zs = np.unravel_index(keep_idx, (x, y, z))
+    colnames = [f"v{i:06d}_x{xi}_y{yi}_z{zi}" for i, (xi, yi, zi) in enumerate(zip(xs, ys, zs))]
+
+    df = pd.DataFrame(kept.T, columns=colnames)
+
+    coords = [(int(xi), int(yi), int(zi)) for xi, yi, zi in zip(xs, ys, zs)]
+    df.attrs["coords"] = coords
+    df.attrs["format"] = "voxel_wide"
+    df.attrs["source_kind"] = "h5_4d"
+    df.attrs["source_shape"] = tuple(arr4d.shape)
+    df.attrs["time_axis"] = 3
+    df.attrs["feature_axis"] = "voxel"
     return df
 
 
@@ -453,100 +538,80 @@ def _load_h5_neuroimaging(
         arr4d = np.moveaxis(arr4d, T_axis, -1)
 
     *spatial, T_actual = arr4d.shape
-    N_total = int(np.prod(spatial))
+    n_total = int(np.prod(spatial))
 
     logging.info(
         "[HDF5] Spatial=%s T=%d, total voxels=%d, array=%.1f MB",
-        spatial, T_actual, N_total,
+        spatial, T_actual, n_total,
         arr4d.nbytes / (1024**2),
     )
 
-    # Reshape в (N_voxels, T)
-    voxel_time = arr4d.reshape(N_total, T_actual)
-    # Освобождаем 4D view — reshape не копирует, но del разрешает GC
+    # Безопасный pre-cap для GUI: не раздуваем DataFrame до сотен тысяч колонок.
+    var_eps = max(1e-12, float(nonzero_threshold))
+    df_h5 = h5_4d_to_voxel_wide(
+        arr4d,
+        nonzero_mode="var",
+        eps=var_eps,
+        max_voxels=MAX_RAW_VOXELS_FOR_GUI,
+        seed=int(feature_seed),
+    )
     del arr4d
 
-    # Координатная сетка
-    grids = np.meshgrid(
-        *[np.arange(s, dtype=np.int32) for s in spatial],
-        indexing="ij",
-    )
-    coords_flat = np.column_stack([g.ravel() for g in grids])  # (N_total, 3)
+    n_selected = int(df_h5.shape[1])
+    logging.info("[HDF5] Pre-capped voxel rows for GUI: %d (limit=%d)", n_selected, MAX_RAW_VOXELS_FOR_GUI)
 
-    # Маска: убираем нулевые и константные воксели.
-    # ВАЖНО: НЕ создаём np.abs(voxel_time) — это +3.4 ГБ временная копия.
-    # Вместо этого: var > 0 уже означает «не всё нули и не константа».
-    # Для дополнительной проверки «хотя бы одно ненулевое» — чанковый проход.
-    CHUNK = 100_000
-    voxel_var = np.empty(N_total, dtype=np.float64)
-    nonzero_mask = np.empty(N_total, dtype=bool)
-    for c0 in range(0, N_total, CHUNK):
-        c1 = min(c0 + CHUNK, N_total)
-        chunk = voxel_time[c0:c1]
-        voxel_var[c0:c1] = np.var(chunk, axis=1, dtype=np.float64)
-        # Ряд ненулевой = хотя бы одно значение |val| > threshold
-        nonzero_mask[c0:c1] = np.max(np.abs(chunk), axis=1) > nonzero_threshold
-    nonzero_mask &= (voxel_var > 1e-12)
-    n_nonzero = int(nonzero_mask.sum())
-
-    logging.info("[HDF5] Nonzero + varying voxels: %d / %d", n_nonzero, N_total)
-
-    if n_nonzero == 0:
-        raise ValueError(
-            f"Все воксели нулевые или константные в {filepath}"
-        )
-
-    voxel_time = voxel_time[nonzero_mask]
-    coords_flat = coords_flat[nonzero_mask]
-    voxel_var = voxel_var[nonzero_mask]
-
-    # Ограничение числа вокселей (критично для памяти/вычислений)
+    # Дополнительное ограничение с учётом пользовательского feature_limit.
     k = feature_limit
-    if k is None or k <= 0:
+    if k is None or int(k) <= 0:
         k = default_feature_limit
-    k = int(min(k, n_nonzero))
+    k = int(min(int(k), n_selected))
 
-    if n_nonzero > k:
+    if n_selected > k:
         mode = str(feature_sampling or "variance").strip().lower()
-        if mode in {"variance", "var", "topvar"}:
-            top_idx = np.argpartition(voxel_var, -k)[-k:]
-            top_idx = top_idx[np.argsort(-voxel_var[top_idx])]
-        elif mode in {"random", "rand"}:
+        if mode in {"random", "rand"}:
             rng = np.random.default_rng(int(feature_seed))
-            top_idx = np.sort(rng.choice(n_nonzero, size=k, replace=False))
+            idx = np.sort(rng.choice(n_selected, size=k, replace=False))
+        elif mode in {"variance", "var", "topvar"}:
+            vals = df_h5.to_numpy(dtype=np.float64, copy=False)
+            v = np.nanvar(vals, axis=0)
+            idx = np.argpartition(v, -k)[-k:]
+            idx = idx[np.argsort(-v[idx])]
         elif mode in {"activity", "act"}:
-            activity = np.sum(np.abs(voxel_time), axis=1, dtype=np.float64)
-            top_idx = np.argpartition(activity, -k)[-k:]
-            top_idx = top_idx[np.argsort(-activity[top_idx])]
+            vals = df_h5.to_numpy(dtype=np.float64, copy=False)
+            a = np.nansum(np.abs(vals), axis=0)
+            idx = np.argpartition(a, -k)[-k:]
+            idx = idx[np.argsort(-a[idx])]
         else:
-            top_idx = np.arange(k)
+            idx = np.arange(k, dtype=int)
 
-        voxel_time = voxel_time[top_idx]
-        coords_flat = coords_flat[top_idx]
-        logging.info("[HDF5] Subsampled: %d -> %d voxels (mode=%s)", n_nonzero, k, mode)
+        df_h5 = df_h5.iloc[:, idx].copy()
+        coords_attr = df_h5.attrs.get("coords")
+        if isinstance(coords_attr, list):
+            df_h5.attrs["coords"] = [coords_attr[i] for i in idx]
+        logging.info("[HDF5] Subsampled after pre-cap: %d -> %d voxels (mode=%s)", n_selected, k, mode)
 
-    # Строим voxel IDs
-    n_voxels = voxel_time.shape[0]
-    i_str = np.char.zfill(np.arange(n_voxels, dtype=np.int64).astype(str), 4)
-    xs = coords_flat[:, 0].astype(str)
-    ys = coords_flat[:, 1].astype(str)
-    zs = coords_flat[:, 2].astype(str) if coords_flat.shape[1] > 2 else np.full(n_voxels, "0")
-    voxel_ids = [
-        f"v{i_str[i]}_x{xs[i]}_y{ys[i]}_z{zs[i]}" for i in range(n_voxels)
-    ]
+    # Нормализуем attrs['coords'] к DataFrame для совместимости с остальным кодом.
+    coords_attr = df_h5.attrs.get("coords")
+    if isinstance(coords_attr, list):
+        coords_df = pd.DataFrame(coords_attr, columns=["x", "y", "z"])
+        coords_df.insert(0, "voxel_id", [str(c) for c in df_h5.columns])
+        df_h5.attrs["coords"] = coords_df
+    elif isinstance(coords_attr, pd.DataFrame):
+        # Гарантируем наличие voxel_id и согласованность порядка с колонками.
+        coords_df = coords_attr.copy()
+        if "voxel_id" not in coords_df.columns or len(coords_df) != len(df_h5.columns):
+            coords_df = pd.DataFrame(
+                {
+                    "voxel_id": [str(c) for c in df_h5.columns],
+                    "x": [np.nan] * len(df_h5.columns),
+                    "y": [np.nan] * len(df_h5.columns),
+                    "z": [np.nan] * len(df_h5.columns),
+                }
+            )
+        df_h5.attrs["coords"] = coords_df
 
-    # DataFrame координат (совместим с voxel_wide_to_timeseries)
-    coords_dict = {"voxel_id": voxel_ids, "x": coords_flat[:, 0].astype(int), "y": coords_flat[:, 1].astype(int)}
-    if coords_flat.shape[1] > 2:
-        coords_dict["z"] = coords_flat[:, 2].astype(int)
-    coords_df = pd.DataFrame(coords_dict)
-
-    # DataFrame time×voxel
-    out = pd.DataFrame(voxel_time.T, columns=voxel_ids, dtype=np.float32)
-    out.attrs["coords"] = coords_df
-
-    logging.info("[HDF5] Output DataFrame: %s (%.1f MB)", out.shape, out.memory_usage(deep=True).sum() / (1024**2))
-    return out
+    logging.info("[HDF5] Output DataFrame: %s (%.1f MB)", df_h5.shape, df_h5.memory_usage(deep=True).sum() / (1024**2))
+    return df_h5
 
 def read_input_table(
     filepath: str,
@@ -980,13 +1045,39 @@ def preprocess_timeseries(
 
     report.add("[Preprocess] enabled")
 
+    input_format = str(_saved_attrs.get("format") or "").strip().lower()
+    source_kind = str(_saved_attrs.get("source_kind") or "").strip().lower()
+    has_voxel_coords = _saved_attrs.get("coords") is not None
+
+    is_voxel_like = (
+        input_format == "voxel_wide"
+        or source_kind == "h5_4d"
+        or bool(has_voxel_coords)
+    )
+
+    if is_voxel_like:
+        report.add("[Preprocess] voxel-like input detected: disabling unique-ratio filter")
+
     before_cols = list(out.columns)
-    out = additional_preprocessing(out)
+    out = additional_preprocessing(
+        out,
+        skip_unique_filter=is_voxel_like,
+        low_variance_eps=1e-12,
+    )
     after_cols = list(out.columns)
+
     dropped = [c for c in before_cols if c not in after_cols]
     if dropped:
         report.dropped_columns.extend(dropped)
-        report.add(f"[Preprocess] dropped near-constant columns: {dropped}")
+        report.add(f"[Preprocess] dropped degenerate columns: {dropped[:100]}")
+        if len(dropped) > 100:
+            report.add(f"[Preprocess] ... and {len(dropped) - 100} more dropped columns")
+
+    if out.shape[1] == 0:
+        raise ValueError(
+            "All features were removed during preprocessing. "
+            "Likely cause: too aggressive filtering on voxel/H5 data."
+        )
 
     out = out.fillna(out.mean(numeric_only=True))
     report.add("[Preprocess] fillna: column means")
