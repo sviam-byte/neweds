@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import logging
 import os
 import sys
@@ -363,6 +364,7 @@ def main() -> None:
                 print(f"[ERROR] {f}: {row['error']}")
                 logging.debug(traceback.format_exc())
             manifest_rows.append(row)
+            gc.collect()
 
         manifest_csv = os.path.join(root_out, "batch_manifest.csv")
         _write_batch_manifest(manifest_rows, manifest_csv)

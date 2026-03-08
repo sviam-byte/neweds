@@ -360,14 +360,14 @@ def _load_h5_neuroimaging(
     time_end: int | None = None,
     time_stride: int | None = None,
     nonzero_threshold: float = 1e-6,
-    default_feature_limit: int = 5000,
+    default_feature_limit: int = 500,
 ) -> pd.DataFrame:
     """Загрузка 4D нейровизуализационного HDF5 (X,Y,Z,T) в DataFrame time×voxel.
 
     Поддерживает формат с dataset shape=(X,Y,Z,T) dtype=float32.
     Возвращает DataFrame shape=(T_eff, N_voxels) с attrs["coords"].
 
-    Если feature_limit не задан, используется default_feature_limit (5000).
+    Если feature_limit не задан, используется default_feature_limit (500).
     Для 700K+ вокселей subsampling по дисперсии критичен для памяти.
     """
     if _h5py is None:
@@ -463,6 +463,8 @@ def _load_h5_neuroimaging(
 
     # Reshape в (N_voxels, T)
     voxel_time = arr4d.reshape(N_total, T_actual)
+    # Освобождаем 4D view — reshape не копирует, но del разрешает GC
+    del arr4d
 
     # Координатная сетка
     grids = np.meshgrid(
@@ -471,10 +473,20 @@ def _load_h5_neuroimaging(
     )
     coords_flat = np.column_stack([g.ravel() for g in grids])  # (N_total, 3)
 
-    # Маска: убираем нулевые и константные воксели
-    voxel_var = np.var(voxel_time, axis=1, dtype=np.float64)
-    voxel_abs_sum = np.sum(np.abs(voxel_time), axis=1, dtype=np.float64)
-    nonzero_mask = (voxel_abs_sum > nonzero_threshold) & (voxel_var > 1e-12)
+    # Маска: убираем нулевые и константные воксели.
+    # ВАЖНО: НЕ создаём np.abs(voxel_time) — это +3.4 ГБ временная копия.
+    # Вместо этого: var > 0 уже означает «не всё нули и не константа».
+    # Для дополнительной проверки «хотя бы одно ненулевое» — чанковый проход.
+    CHUNK = 100_000
+    voxel_var = np.empty(N_total, dtype=np.float64)
+    nonzero_mask = np.empty(N_total, dtype=bool)
+    for c0 in range(0, N_total, CHUNK):
+        c1 = min(c0 + CHUNK, N_total)
+        chunk = voxel_time[c0:c1]
+        voxel_var[c0:c1] = np.var(chunk, axis=1, dtype=np.float64)
+        # Ряд ненулевой = хотя бы одно значение |val| > threshold
+        nonzero_mask[c0:c1] = np.max(np.abs(chunk), axis=1) > nonzero_threshold
+    nonzero_mask &= (voxel_var > 1e-12)
     n_nonzero = int(nonzero_mask.sum())
 
     logging.info("[HDF5] Nonzero + varying voxels: %d / %d", n_nonzero, N_total)
@@ -512,9 +524,6 @@ def _load_h5_neuroimaging(
         voxel_time = voxel_time[top_idx]
         coords_flat = coords_flat[top_idx]
         logging.info("[HDF5] Subsampled: %d -> %d voxels (mode=%s)", n_nonzero, k, mode)
-
-    # Освобождаем 4D массив
-    del arr4d
 
     # Строим voxel IDs
     n_voxels = voxel_time.shape[0]
