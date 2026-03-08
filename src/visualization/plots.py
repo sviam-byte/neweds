@@ -22,7 +22,12 @@ def plot_heatmap(
     vmax=None,
 ) -> BytesIO:
     """Generate a heatmap image and return it as an in-memory PNG buffer."""
-    fig, ax = plt.subplots(figsize=(4, 3.2))
+    n = matrix.shape[0] if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2 else 0
+    # Для больших матриц увеличиваем figsize, убираем тики, снижаем DPI
+    large = n > 100
+    figsize = (6, 5) if large else (4, 3.2)
+    dpi = 80 if large else 150
+    fig, ax = plt.subplots(figsize=figsize)
 
     if matrix is None or not isinstance(matrix, np.ndarray) or matrix.size == 0:
         ax.text(0.5, 0.5, "Error\n(No Data)", ha="center", va="center", color="red", fontsize=12)
@@ -34,10 +39,14 @@ def plot_heatmap(
         ax.set_title(title, fontsize=10)
 
         if labels:
-            ax.set_xticks(range(len(labels)))
-            ax.set_yticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_yticklabels(labels)
+            if len(labels) <= 30:
+                ax.set_xticks(range(len(labels)))
+                ax.set_yticks(range(len(labels)))
+                ax.set_xticklabels(labels, rotation=45, ha="right")
+                ax.set_yticklabels(labels)
+            else:
+                ax.set_xticks([])
+                ax.set_yticks([])
 
         if annotate and matrix.shape[0] < 10:
             min_val = vmin if vmin is not None else np.nanmin(matrix)
@@ -63,7 +72,7 @@ def plot_heatmap(
 
     buf = BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
+    plt.savefig(buf, format="png", dpi=dpi)
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -79,6 +88,21 @@ def plot_connectome(
 ) -> BytesIO:
     """Generate a connectome graph for a connectivity matrix and return PNG buffer."""
     n = matrix.shape[0]
+
+    # Для больших матриц connectome-граф нечитаем и тратит минуты на O(N²) цикл.
+    if n > 200:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.text(0.5, 0.5, f"Connectome skipped\nN={n} > 200\n(use heatmap)",
+                ha="center", va="center", fontsize=10, color="gray")
+        ax.set_title(f"Connectome: {method_name}")
+        ax.axis("off")
+        buf = BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
     graph = nx.DiGraph() if directed else nx.Graph()
     graph.add_nodes_from(range(n))
 

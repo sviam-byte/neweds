@@ -378,13 +378,22 @@ def compute_partial_AH_matrix(data: pd.DataFrame,
             else:
                 resid_df[col] = y
     else:
-        try:
-            model = VAR(df.values)
-            res_full = model.fit(max_lag, ic=None)
-            resid_df = pd.DataFrame(res_full.resid, columns=df.columns)
-        except Exception as e:
-            logging.error(f"VAR fit error (partial AH, fallback to raw): {e}")
-            resid_df = df 
+        T = int(df.shape[0])
+        # VAR с N переменными требует O(N²·T) памяти и O(N³·T) вычислений.
+        # При N > min(T, 50) это невычислимо / бессмысленно.
+        if N > min(T, 50):
+            logging.warning(
+                "[partial AH] N=%d > min(T=%d, 50), VAR infeasible. Using raw data.", N, T
+            )
+            resid_df = df
+        else:
+            try:
+                model = VAR(df.values)
+                res_full = model.fit(max_lag, ic=None)
+                resid_df = pd.DataFrame(res_full.resid, columns=df.columns)
+            except Exception as e:
+                logging.error(f"VAR fit error (partial AH, fallback to raw): {e}")
+                resid_df = df 
 
     return AH_matrix(resid_df, embed_dim=embed_dim, tau=tau, pairs=pairs)
 

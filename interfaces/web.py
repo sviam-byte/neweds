@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -426,6 +427,26 @@ def main() -> None:
             )
 
         with c2:
+            st.markdown("**Большие данные (HDF5 / wide CSV)**")
+            st.caption("Для нейровизуализации (700K+ вокселей): сколько оставить и как выбрать.")
+            feature_limit = int(st.number_input(
+                "Макс. вокселей/каналов (0=дефолт 500)",
+                min_value=0, max_value=100000, value=500, step=50,
+                help="HDF5 4D файлы: из 700K вокселей оставляем top-K. Для скорости: 200–500. Для качества: 1000–2000.",
+            ))
+            feature_sampling = st.selectbox(
+                "Метод отбора вокселей",
+                ["variance (самые изменчивые)", "activity (макс. сумма)", "random"],
+                index=0,
+            )
+            _fs_map = {"variance": "variance", "activity": "activity", "random": "random"}
+            feature_sampling_val = _fs_map.get(feature_sampling.split()[0], "variance")
+            time_stride = int(st.number_input(
+                "Шаг по времени (1=все точки, 2=каждый 2-й, ...)",
+                min_value=1, max_value=100, value=1, step=1,
+                help="Даунсэмплинг: stride=2 вдвое ускоряет загрузку HDF5.",
+            ))
+
             st.markdown("**Снижение размерности (для больших данных)**")
             dimred_enabled = st.checkbox("Включить DimRed", value=False)
             dimred_method = "variance"
@@ -658,6 +679,9 @@ def main() -> None:
                             remove_seasonality=bool(remove_seasonality),
                             season_period=(None if int(season_period) == 0 else int(season_period)),
                             qc_enabled=bool(qc_enabled),
+                            feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
+                            feature_sampling=str(feature_sampling_val),
+                            time_stride=(int(time_stride) if int(time_stride) > 1 else None),
                         )
                         window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
                         stride_scan = None if int(window_stride_scan) == 0 else int(window_stride_scan)
@@ -766,6 +790,13 @@ def main() -> None:
                         row["status"] = "error"
                         row["error"] = str(exc)
                     manifest_rows.append(row)
+                    # Освобождаем память между файлами: BigMasterTool может удерживать
+                    # гигабайты матриц (results, data_raw, data_normalized).
+                    try:
+                        del tool
+                    except Exception:
+                        pass
+                    gc.collect()
                     prog.progress(int(100 * i / max(1, len(uploaded_files))))
 
             manifest_path = batch_root / "batch_manifest.csv"
@@ -865,6 +896,9 @@ def main() -> None:
                     remove_seasonality=bool(remove_seasonality),
                     season_period=(None if int(season_period) == 0 else int(season_period)),
                     qc_enabled=bool(qc_enabled),
+                    feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
+                    feature_sampling=str(feature_sampling_val),
+                    time_stride=(int(time_stride) if int(time_stride) > 1 else None),
                 )
 
                 # main windows
