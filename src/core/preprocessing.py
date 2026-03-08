@@ -16,7 +16,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 
 # 6.1 Нормализация масштаба
@@ -158,43 +157,68 @@ def remove_ar1(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
 
 # Существующие функции (сохраняем обратную совместимость)
 
-def additional_preprocessing(df: pd.DataFrame, unique_thresh: float = 0.05) -> pd.DataFrame:
+def additional_preprocessing(
+    df: pd.DataFrame,
+    unique_thresh: float = 0.05,
+    *,
+    low_variance_eps: float = 1e-12,
+    skip_unique_filter: bool = False,
+    drop_all_nan: bool = True,
+) -> pd.DataFrame:
     """
     Дополнительная предобработка данных:
-    - Удаление почти константных колонок
-    - Лог-преобразование для снижения асимметрии
+    - Удаление вырожденных колонок (all-NaN, нулевая дисперсия/диапазон)
+    - Опционально: legacy-фильтр по числу уникальных значений
 
     Args:
         df: Исходный DataFrame
-        unique_thresh: Порог уникальности для удаления константных колонок
+        unique_thresh: Порог уникальности для legacy-фильтра
+        low_variance_eps: Порог дисперсии/диапазона для удаления вырожденных колонок
+        skip_unique_filter: Если True, не применять фильтр по unique ratio
+        drop_all_nan: Если True, удалять колонки, где после coercion нет finite-значений
 
     Returns:
         pd.DataFrame: Предобработанный DataFrame
     """
     df = df.copy()
 
-    # Удаляем почти константные колонки
-    for col in df.columns:
-        if len(df[col]) > 0 and pd.api.types.is_numeric_dtype(df[col]):
-            uniq_ratio = df[col].nunique() / len(df[col])
-            if uniq_ratio < unique_thresh:
-                logging.info(
-                    f"[Preproc] Столбец {col} почти константный (uniq_ratio={uniq_ratio:.3f}), удаляем."
-                )
-                df.drop(columns=[col], inplace=True)
+    cols_to_drop: list[str] = []
+    for col in list(df.columns):
+        s = pd.to_numeric(df[col], errors="coerce")
+        vals = s.to_numpy(dtype=np.float64, copy=False)
+        finite = np.isfinite(vals)
+        n_finite = int(finite.sum())
 
-    # Лог-преобразование для снижения асимметрии
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]) and (df[col] > 0).all():
-            skew_before = stats.skew(df[col].dropna())
-            if not np.isnan(skew_before):
-                transformed = np.log(df[col])
-                skew_after = stats.skew(transformed.dropna())
-                if not np.isnan(skew_after) and abs(skew_after) < abs(skew_before):
-                    logging.info(
-                        f"[Preproc] Лог-преобразование для {col}: skew {skew_before:.3f} -> {skew_after:.3f}."
-                    )
-                    df[col] = transformed
+        if drop_all_nan and n_finite == 0:
+            cols_to_drop.append(col)
+            continue
+
+        if n_finite == 0:
+            continue
+
+        finite_vals = vals[finite]
+        var = float(np.nanvar(finite_vals))
+        vrange = float(np.nanmax(finite_vals) - np.nanmin(finite_vals))
+
+        # Для voxel-like рядов используем численно устойчивый критерий вырожденности.
+        is_degenerate = (
+            (not np.isfinite(var))
+            or (var <= float(low_variance_eps))
+            or (vrange <= float(low_variance_eps))
+        )
+        if is_degenerate:
+            cols_to_drop.append(col)
+            continue
+
+        # Legacy-логика: для классических табличных данных можно отсекать
+        # почти-константные признаки по доле уникальных значений.
+        if not skip_unique_filter:
+            uniq_ratio = float(pd.Series(finite_vals).nunique(dropna=True)) / max(1, n_finite)
+            if uniq_ratio < float(unique_thresh):
+                cols_to_drop.append(col)
+
+    if cols_to_drop:
+        df = df.drop(columns=list(dict.fromkeys(cols_to_drop)), errors="ignore")
 
     return df
 
