@@ -223,6 +223,44 @@ def _default_batch_output_root(input_folder: str) -> str:
     return str(Path(SAVE_FOLDER) / "runs" / "time_series_analysis")
 
 
+def _native_pick_path(dialog: str = "file", title: str = "Выбери путь", initialdir: str | None = None) -> str:
+    """Открывает нативный диалог выбора файла/папки и возвращает выбранный путь.
+
+    В headless-средах (или если tkinter недоступен) безопасно возвращает пустую строку,
+    чтобы UI продолжил работу без падения.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_dir = str(Path(initialdir).expanduser()) if initialdir else str(Path.home())
+
+        if dialog == "dir":
+            out = filedialog.askdirectory(title=title, initialdir=start_dir, mustexist=False)
+        else:
+            out = filedialog.askopenfilename(
+                title=title,
+                initialdir=start_dir,
+                filetypes=[("Data", "*.csv *.xlsx *.xls *.parquet *.mat *.h5 *.hdf5"), ("All files", "*.*")],
+            )
+
+        root.destroy()
+        return str(out or "")
+    except Exception:
+        return ""
+
+
+def _show_local_dialog_hint() -> None:
+    """Пояснение про нативные диалоги выбора пути и fallback-режим."""
+    st.caption(
+        "Кнопки выбора открывают системный диалог (tkinter). "
+        "Если диалог недоступен (например, headless/remote), просто введи путь вручную."
+    )
+
+
 def _make_run_dir(stem: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = "".join(ch for ch in (stem or "run") if ch.isalnum() or ch in "-_ ").strip().replace(" ", "_")
@@ -433,20 +471,43 @@ def main() -> None:
     uploaded_files = []
     synth_df: pd.DataFrame | None = None
     synth_name = "synthetic"
+    local_file_path = ""
     batch_input_folder = ""
     batch_output_root = ""
     batch_recursive = True
     batch_skip_existing = True
 
     if source.startswith("Файл"):
-        uploaded_file = st.file_uploader(
-            "Выберите файл",
-            type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
-            max_upload_size=1024,  # Дублируем лимит из .streamlit/config.toml для явного поведения UI.
-        )
+        _show_local_dialog_hint()
+        cf1, cf2 = st.columns([3, 1])
+        with cf1:
+            local_file_path = st.text_input(
+                "Локальный путь к файлу",
+                value=st.session_state.get("local_file_path", ""),
+                key="local_file_path",
+                placeholder=r"D:\data\subject01.h5",
+            )
+        with cf2:
+            if st.button("Выбрать файл…", key="pick_local_file"):
+                picked = _native_pick_path(
+                    "file",
+                    "Выбери входной файл",
+                    st.session_state.get("local_file_path") or str(Path.home()),
+                )
+                if picked:
+                    st.session_state["local_file_path"] = picked
+                    st.rerun()
+
+        with st.expander("Загрузка через браузер (fallback)", expanded=False):
+            uploaded_file = st.file_uploader(
+                "Выберите файл",
+                type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
+                max_upload_size=1024,  # Дублируем лимит из .streamlit/config.toml для явного поведения UI.
+            )
     elif source.startswith("Папка"):
         st.info("Локальный batch-режим: укажи папку с данными и отдельную папку результатов. Файлы будут идти потоково по одному.")
-        c_batch1, c_batch2 = st.columns(2)
+        _show_local_dialog_hint()
+        c_batch1, c_batch2 = st.columns([3, 1])
         with c_batch1:
             batch_input_folder = st.text_input(
                 "Папка с входными файлами",
@@ -455,11 +516,41 @@ def main() -> None:
                 placeholder=r"D:\data\fmri_batch",
             )
         with c_batch2:
+            if st.button("Выбрать папку…", key="pick_input_folder"):
+                picked = _native_pick_path(
+                    "dir",
+                    "Выбери папку с входными файлами",
+                    st.session_state.get("batch_input_folder") or str(Path.home()),
+                )
+                if picked:
+                    st.session_state["batch_input_folder"] = picked
+                    if not st.session_state.get("batch_output_root"):
+                        st.session_state["batch_output_root"] = _default_batch_output_root(picked)
+                    st.rerun()
+
+        c_batch_out1, c_batch_out2 = st.columns(2)
+        with c_batch_out1:
             batch_output_root = st.text_input(
                 "Папка для результатов",
                 value=st.session_state.get("batch_output_root", _default_batch_output_root(st.session_state.get("batch_input_folder", ""))),
                 key="batch_output_root",
             )
+        with c_batch_out2:
+            st.caption("Результаты будут сохранены в структуре time_series_analysis")
+
+        if batch_input_folder.strip():
+            preview_files = _iter_input_files(
+                batch_input_folder.strip(),
+                recursive=bool(st.session_state.get("batch_recursive", True)),
+            )
+            st.caption(f"Найдено файлов: {len(preview_files)}")
+            if preview_files:
+                st.dataframe(
+                    pd.DataFrame({"file": [str(p) for p in preview_files[:30]]}),
+                    use_container_width=True,
+                    height=220,
+                )
+
         c_batch3, c_batch4 = st.columns(2)
         with c_batch3:
             batch_recursive = st.checkbox("Рекурсивно проходить подпапки", value=True, key="batch_recursive")
@@ -1233,19 +1324,27 @@ def main() -> None:
         return
 
     if st.button("Запустить анализ", type="primary"):
-        if source.startswith("Файл") and not uploaded_file:
-            st.error("Файл не загружен!")
+        if source.startswith("Файл") and not str(local_file_path).strip() and not uploaded_file:
+            st.error("Файл не указан: выбери локальный путь или загрузи файл через fallback uploader.")
             return
 
         # Готовим run-dir
-        stem = (Path(uploaded_file.name).stem if uploaded_file else synth_name) or "run"
+        if source.startswith("Файл") and str(local_file_path).strip():
+            stem = Path(str(local_file_path).strip()).stem or "run"
+        else:
+            stem = (Path(uploaded_file.name).stem if uploaded_file else synth_name) or "run"
         run_dir = _make_run_dir(stem)
         _write_json(run_dir / "run_config.json", run_plan)
 
         # Сохраняем входные данные (или синтетические)
         input_path: Path
         try:
-            if uploaded_file:
+            if source.startswith("Файл") and str(local_file_path).strip():
+                input_path = Path(str(local_file_path).strip()).expanduser()
+                if not input_path.exists() or not input_path.is_file():
+                    st.error(f"Файл не найден: {input_path}")
+                    return
+            elif uploaded_file:
                 input_path = run_dir / uploaded_file.name
                 input_path.write_bytes(uploaded_file.getbuffer())
             else:
