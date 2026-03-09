@@ -411,6 +411,19 @@ def main() -> None:
                 outlier_local_median_window = 7
                 check_stat = False
 
+            # --- Общие настройки (вне if/else preprocess) ---
+            enable_experimental = st.checkbox(
+                "Экспериментальные методы (TE, AH, directed dCor, ...)",
+                value=False,
+                help="Включает дополнительные метрики, которые могут быть медленнее или менее стабильны.",
+            )
+            pvalue_correction = st.selectbox(
+                "Поправка на множественные сравнения",
+                ["none", "fdr_bh"],
+                index=0,
+                help="fdr_bh = Benjamini-Hochberg FDR для p-value методов (Granger и т.д.)",
+            )
+
             _out_act = (
                 "mask"
                 if str(outlier_action).startswith("mask")
@@ -455,24 +468,30 @@ def main() -> None:
             )
             _fs_map = {"spatial": "spatial", "variance": "variance", "activity": "activity", "random": "random"}
             feature_sampling_val = _fs_map.get(feature_sampling.split()[0], "variance")
-            # Явно задаём размер spatial-блока, чтобы режим был детерминированным
-            # и воспроизводимым в межсубъектных сравнениях.
-            st.markdown("## Spatial aggregation")
+            # Единый контрол: spatial grid для 4D fMRI (H5).
+            # grid=5 → ~7900 бинов, grid=10 → ~1100, grid=15 → ~390.
+            st.markdown("### Spatial grid (4D fMRI)")
+            st.caption(
+                "Нарезает объём кубами N³ и усредняет вокселы внутри каждого куба. "
+                "grid=10 → ~1100 бинов (рекомендуется). grid=5 → ~7900 (медленно для partial-методов)."
+            )
             spatial_grid_size = int(st.slider(
-                "Spatial bin size (voxels)",
-                min_value=0,
-                max_value=20,
-                value=0,
-                help="0 = disabled",
+                "Grid size (voxels per side)",
+                min_value=3,
+                max_value=25,
+                value=10,
+                help="Размер стороны куба. 10 = хороший баланс разрешения и скорости.",
             ))
+            # h5_spatial_bin наследует spatial_grid_size для единообразия
+            h5_spatial_bin = spatial_grid_size
             spatial_grid_method = st.selectbox(
-                "Aggregation method (4D grid)",
+                "Aggregation (4D grid)",
                 ["mean", "median", "sum"],
             )
 
             st.markdown("### Lazy HDF5 processing")
             lazy_spatial_bin = st.checkbox(
-                "Enable lazy spatial binning (recommended for fMRI)",
+                "Lazy loading (чанками по времени, экономит RAM)",
                 value=True,
             )
             time_chunk = int(st.slider(
@@ -480,15 +499,6 @@ def main() -> None:
                 min_value=10,
                 max_value=200,
                 value=50,
-            ))
-
-            h5_spatial_bin = int(st.number_input(
-                "Размер spatial-блока для H5",
-                min_value=2,
-                max_value=16,
-                value=5,
-                step=1,
-                help="Для межсубъектного сравнения лучше фиксированный bin size, например 5.",
             ))
             time_stride = int(st.number_input(
                 "Шаг по времени (1=все точки, 2=каждый 2-й, ...)",

@@ -49,6 +49,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interactive-config", action="store_true", help="Read run config interactively from stdin")
     p.add_argument("--recursive", action="store_true", help="Recursively scan subdirectories when input_file is a directory")
     p.add_argument("--batch-zip", action="store_true", help="Create a ZIP archive of the whole batch output directory")
+    # HDF5 / fMRI spatial binning
+    p.add_argument("--grid", type=int, default=10,
+                    help="Spatial grid size for 4D HDF5 fMRI (default: 10, gives ~1100 bins for 91x109x91)")
+    p.add_argument("--grid-method", default="mean", choices=["mean", "median", "sum"],
+                    help="Aggregation method within spatial bins")
+    p.add_argument("--lazy", action="store_true",
+                    help="Enable lazy chunked HDF5 loading (lower peak RAM)")
+    p.add_argument("--time-chunk", type=int, default=50,
+                    help="Time chunk size for lazy HDF5 loading")
+    p.add_argument("--time-stride", type=int, default=1,
+                    help="Temporal downsampling stride (1=all, 2=every other, ...)")
     return p
 
 
@@ -110,6 +121,10 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
         enable_experimental=bool(args.experimental),
         auto_difference=bool(args.auto_difference),
         pvalue_correction=args.pvalue_correction,
+        spatial_grid_size=int(getattr(args, "grid", 10)),
+        spatial_grid_method=str(getattr(args, "grid_method", "mean")),
+        lazy_spatial_bin=bool(getattr(args, "lazy", False)),
+        time_chunk=int(getattr(args, "time_chunk", 50)),
     )
 
     def _stage_cb(stage: str, progress, meta: dict):
@@ -246,7 +261,12 @@ def _process_single_file(filepath: str, args: argparse.Namespace, out_dir: str) 
             cube_gallery_limit=spec.cube_gallery_limit,
         )
     else:
-        tool.load_data_excel(filepath)
+        _time_stride = int(getattr(args, "time_stride", 1))
+        tool.load_data_excel(
+            filepath,
+            feature_sampling="spatial",
+            time_stride=(_time_stride if _time_stride > 1 else None),
+        )
         tool.run_all_methods()
 
     name = Path(filepath).stem
