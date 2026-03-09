@@ -1145,8 +1145,15 @@ def main() -> None:
             _append_text(batch_log, f"[START] {datetime.now().isoformat()} | input_root={input_root} | files={len(files)}")
 
             manifest_rows: list[dict] = []
-            prog = st.progress(0)
+            # Два индикатора прогресса: общий по набору и локальный по текущему файлу.
+            overall_box = st.empty()
+            current_box = st.empty()
+            prog_overall = st.progress(0)
+            prog_current = st.progress(0)
             for i, src_path in enumerate(files, start=1):
+                overall_box.markdown(f"**Набор данных:** {i}/{len(files)} — `{Path(src_path).name}`")
+                current_box.markdown("**Этап текущего файла:** подготовка")
+                prog_current.progress(0)
                 p = Path(src_path)
                 try:
                     rel_parent = p.parent.relative_to(input_root) if input_root in p.parents or p.parent == input_root else Path(".")
@@ -1177,7 +1184,7 @@ def main() -> None:
                             }
                             manifest_rows.append(row)
                             _append_text(batch_log, f"[SKIP ] {p}")
-                            prog.progress(int(100 * i / max(1, len(files))))
+                            prog_overall.progress(int(100 * i / max(1, len(files))))
                             continue
                     except Exception:
                         pass
@@ -1197,6 +1204,15 @@ def main() -> None:
                 }
                 tool = None
                 try:
+                    def _batch_stage_cb(stage: str, progress, meta: dict):
+                        """Коллбек движка: обновляет UI-этап и прогресс для текущего файла."""
+                        try:
+                            current_box.markdown(f"**Этап текущего файла:** {stage}")
+                            if progress is not None:
+                                prog_current.progress(int(max(0.0, min(1.0, float(progress))) * 100))
+                        except Exception:
+                            pass
+
                     cfg = engine.AnalysisConfig(
                         max_lag=int(max_lag),
                         p_value_alpha=float(alpha),
@@ -1211,7 +1227,7 @@ def main() -> None:
                         lazy_spatial_bin=bool(lazy_spatial_bin),
                         time_chunk=int(time_chunk),
                     )
-                    tool = engine.BigMasterTool(config=cfg)
+                    tool = engine.BigMasterTool(config=cfg, stage_callback=_batch_stage_cb)
                     tool.load_data_excel(
                         str(src_path),
                         preprocess=bool(preprocess),
@@ -1357,6 +1373,7 @@ def main() -> None:
                         row["error"] = (row["error"] + " | " if row["error"] else "") + f"bundle: {exc}"
 
                     row["status"] = "ok" if not row["error"] else "partial"
+                    prog_current.progress(100)
                     _append_text(batch_log, f"[OK   ] {p} | status={row['status']}")
                 except Exception as exc:
                     row["status"] = "error"
@@ -1371,7 +1388,7 @@ def main() -> None:
                     except Exception:
                         pass
                     gc.collect()
-                    prog.progress(int(100 * i / max(1, len(files))))
+                    prog_overall.progress(int(100 * i / max(1, len(files))))
 
             manifest_df = pd.DataFrame(manifest_rows)
             manifest_df.to_csv(manifest_path, index=False, encoding="utf-8-sig")

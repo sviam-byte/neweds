@@ -54,6 +54,62 @@ class HTMLReportGenerator:
         return self._b64_png(plots.plot_window_cube_3d(points, title))
 
 
+    def _resolve_report_dataframe(self):
+        """Выбирает наиболее подходящий слой рядов для HTML-отчёта.
+
+        Логика нужна для совместимости: разные этапы пайплайна могут менять
+        количество рядов, и визуальный слой отчёта должен по возможности
+        совпадать по размерности с матрицами связности в results.
+        """
+        candidates = []
+        for layer_name in [
+            "data_normalized",
+            "data_dimred",
+            "data_after_autodiff",
+            "data_preprocessed",
+            "data",
+            "data_raw",
+        ]:
+            df = getattr(self.tool, layer_name, None)
+            if df is None or getattr(df, "empty", True):
+                continue
+            try:
+                # Храним: имя слоя, dataframe, число рядов (columns), число точек (rows).
+                candidates.append((layer_name, df, int(df.shape[1]), int(df.shape[0])))
+            except Exception:
+                continue
+
+        if not candidates:
+            return None, "none", []
+
+        expected_n = None
+        for _name, mat in (getattr(self.tool, "results", {}) or {}).items():
+            try:
+                if mat is None:
+                    continue
+                arr = np.asarray(mat)
+                if arr.ndim == 2 and arr.shape[0] == arr.shape[1] and arr.shape[0] > 0:
+                    expected_n = int(arr.shape[0])
+                    break
+            except Exception:
+                continue
+
+        # Приоритет 1: слой с совпадающим количеством рядов относительно results.
+        if expected_n is not None:
+            same_n = [c for c in candidates if c[2] == expected_n]
+            if same_n:
+                # При равенстве берём слой с большим количеством точек.
+                same_n.sort(key=lambda x: (x[3], x[2]), reverse=True)
+                chosen = same_n[0]
+                return chosen[1], chosen[0], candidates
+
+        # Приоритет 2: самый широкий «обработанный» слой; data_raw — fallback.
+        preferred = [c for c in candidates if c[0] != "data_raw"] or candidates
+        preferred.sort(key=lambda x: (x[2], x[3]), reverse=True)
+        chosen = preferred[0]
+        return chosen[1], chosen[0], candidates
+
+
     def _render_autocorr_section(self) -> str:
         """HTML-блок про автокорреляцию (акцент на лаг-1 и лаг-p).
 
@@ -432,7 +488,9 @@ class HTMLReportGenerator:
         graph_threshold = kwargs.get("graph_threshold", 0.2)
         p_alpha = kwargs.get("p_alpha", 0.05)
 
-        df = self.tool.data_normalized if not self.tool.data_normalized.empty else self.tool.data
+        df, report_layer, report_candidates = self._resolve_report_dataframe()
+        if df is None:
+            raise ValueError("No data available for HTML report")
         # Предрасчёт компактных pairwise-таблиц для UI/секции отчёта.
         try:
             self.tool.build_pairwise_summaries(p_alpha=float(p_alpha))
@@ -562,6 +620,20 @@ class HTMLReportGenerator:
                 prep_lines.append(
                     f"<b>DimRed</b>: {method} ({n_before} → {n_after}), solver={solver}, приоритет={priority}{ev_txt}"
                 )
+
+            try:
+                cand_txt = " • ".join(
+                    f"{name}: {n_t}×{n_s}" for name, _df, n_s, n_t in report_candidates
+                )
+                prep_lines.append(
+                    "<b>HTML source</b>: "
+                    + html.escape(str(report_layer))
+                    + f" ({int(df.shape[0])} точек × {int(df.shape[1])} рядов)"
+                )
+                if cand_txt:
+                    prep_lines.append("<b>Слои-кандидаты</b>: " + html.escape(cand_txt))
+            except Exception:
+                pass
 
             prep_html = "<div class='meta'>" + "<br/>".join(prep_lines) + "</div>" if prep_lines else ""
 
