@@ -278,7 +278,7 @@ class AnalysisConfig:
     spatial_bin_method: str = "mean"
 
     # Пространственная агрегация 4D fMRI (X,Y,Z,T) на этапе HDF5-загрузки.
-    spatial_grid_size: int = 0
+    spatial_grid_size: int = 10
     spatial_grid_method: str = "mean"
     lazy_spatial_bin: bool = False
     time_chunk: int = 50
