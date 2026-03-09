@@ -1506,10 +1506,8 @@ def preprocess_timeseries(
 
         if bool(ar_diagnostics):
             phi1_list = []
-            r1_list = []
-            rp_list = []
-            lb1_list = []
-            lbp_list = []
+            corr_lists_by_lag = {int(k): [] for k in range(1, p_order + 1)}
+            lb_lists_by_lag = {int(k): [] for k in range(1, p_order + 1)}
 
             # Сохраним 3 примера: максимальная |phi1| (до очистки).
             top = []  # list[tuple[abs_phi, col, phi1]]
@@ -1517,22 +1515,24 @@ def preprocess_timeseries(
                 x = out[col].astype(float).to_numpy(copy=False)
                 x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
                 phi1 = _phi1_ols(x)
-                r1 = _safe_corr_at_lag(x, 1)
-                rp = _safe_corr_at_lag(x, p_order)
-                lb1 = _ljung_box_p(x, 1)
-                lbp = _ljung_box_p(x, p_order)
+                corr_by_lag_cur = {}
+                lb_by_lag_cur = {}
+                for lag_k in range(1, p_order + 1):
+                    rk = _safe_corr_at_lag(x, lag_k)
+                    lbk = _ljung_box_p(x, lag_k)
+                    corr_by_lag_cur[int(lag_k)] = rk
+                    lb_by_lag_cur[int(lag_k)] = lbk
 
                 if np.isfinite(phi1):
                     phi1_list.append(float(phi1))
                     top.append((abs(float(phi1)), col, float(phi1)))
-                if np.isfinite(r1):
-                    r1_list.append(float(r1))
-                if np.isfinite(rp):
-                    rp_list.append(float(rp))
-                if np.isfinite(lb1):
-                    lb1_list.append(float(lb1))
-                if np.isfinite(lbp):
-                    lbp_list.append(float(lbp))
+                for lag_k in range(1, p_order + 1):
+                    rk = corr_by_lag_cur.get(int(lag_k))
+                    lbk = lb_by_lag_cur.get(int(lag_k))
+                    if np.isfinite(rk):
+                        corr_lists_by_lag[int(lag_k)].append(float(rk))
+                    if np.isfinite(lbk):
+                        lb_lists_by_lag[int(lag_k)].append(float(lbk))
 
             top.sort(reverse=True, key=lambda t: t[0])
             top = top[:3]
@@ -1550,23 +1550,48 @@ def preprocess_timeseries(
                     "p75": float(np.nanpercentile(a, 75)),
                 }
 
+            corr_summary_by_lag = {
+                f"lag{int(k)}": _summary(vals) for k, vals in corr_lists_by_lag.items()
+            }
+            lb_summary_by_lag = {
+                f"lag{int(k)}": _summary(vals) for k, vals in lb_lists_by_lag.items()
+            }
+            frac_lb_bad_by_lag = {
+                f"lag{int(k)}": (
+                    float(np.mean(np.asarray(vals, dtype=float) < 0.05))
+                    if vals else float("nan")
+                )
+                for k, vals in lb_lists_by_lag.items()
+            }
+
             ac_note["before"] = {
                 "phi1": _summary(phi1_list),
-                "corr_lag1": _summary(r1_list),
-                "corr_lagp": _summary(rp_list),
-                "ljungbox_p_lag1": _summary(lb1_list),
-                "ljungbox_p_lagp": _summary(lbp_list),
-                "frac_lb_p_lt_0_05_lag1": float(np.mean(np.asarray(lb1_list) < 0.05)) if lb1_list else float("nan"),
-                "frac_lb_p_lt_0_05_lagp": float(np.mean(np.asarray(lbp_list) < 0.05)) if lbp_list else float("nan"),
+                "corr_lag1": corr_summary_by_lag.get("lag1", {"n": 0}),
+                "corr_lagp": corr_summary_by_lag.get(f"lag{int(p_order)}", {"n": 0}),
+                "ljungbox_p_lag1": lb_summary_by_lag.get("lag1", {"n": 0}),
+                "ljungbox_p_lagp": lb_summary_by_lag.get(f"lag{int(p_order)}", {"n": 0}),
+                "frac_lb_p_lt_0_05_lag1": frac_lb_bad_by_lag.get("lag1", float("nan")),
+                "frac_lb_p_lt_0_05_lagp": frac_lb_bad_by_lag.get(f"lag{int(p_order)}", float("nan")),
+                "corr_by_lag": corr_summary_by_lag,
+                "ljungbox_p_by_lag": lb_summary_by_lag,
+                "frac_lb_p_lt_0_05_by_lag": frac_lb_bad_by_lag,
             }
 
             # Сохраним сами ряды для примеров (до очистки).
             ex = {}
             for _, col, phi1 in top:
                 try:
+                    xb = out[col].astype(float).to_numpy(copy=False)
+                    xb = np.nan_to_num(xb, nan=0.0, posinf=0.0, neginf=0.0)
                     ex[str(col)] = {
                         "phi1": float(phi1),
                         "before": out[col].astype(float).to_numpy(copy=True).tolist(),
+                        "before_corr_lag1": _safe_corr_at_lag(xb, 1),
+                        "before_corr_lagp": _safe_corr_at_lag(xb, p_order),
+                        "before_corr_by_lag": {
+                            f"lag{int(k)}": _safe_corr_at_lag(xb, int(k))
+                            for k in range(1, p_order + 1)
+                        },
                     }
                 except Exception:
                     pass
@@ -1615,29 +1640,29 @@ def preprocess_timeseries(
         if bool(ar_diagnostics):
             cols_diag2 = cols_diag
             phi1_list = []
-            r1_list = []
-            rp_list = []
-            lb1_list = []
-            lbp_list = []
+            corr_lists_by_lag = {int(k): [] for k in range(1, p_order + 1)}
+            lb_lists_by_lag = {int(k): [] for k in range(1, p_order + 1)}
 
             for col in cols_diag2:
                 x = out[col].astype(float).to_numpy(copy=False)
                 x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
                 phi1 = _phi1_ols(x)
-                r1 = _safe_corr_at_lag(x, 1)
-                rp = _safe_corr_at_lag(x, p_order)
-                lb1 = _ljung_box_p(x, 1)
-                lbp = _ljung_box_p(x, p_order)
+                corr_by_lag_cur = {}
+                lb_by_lag_cur = {}
+                for lag_k in range(1, p_order + 1):
+                    rk = _safe_corr_at_lag(x, lag_k)
+                    lbk = _ljung_box_p(x, lag_k)
+                    corr_by_lag_cur[int(lag_k)] = rk
+                    lb_by_lag_cur[int(lag_k)] = lbk
                 if np.isfinite(phi1):
                     phi1_list.append(float(phi1))
-                if np.isfinite(r1):
-                    r1_list.append(float(r1))
-                if np.isfinite(rp):
-                    rp_list.append(float(rp))
-                if np.isfinite(lb1):
-                    lb1_list.append(float(lb1))
-                if np.isfinite(lbp):
-                    lbp_list.append(float(lbp))
+                for lag_k in range(1, p_order + 1):
+                    rk = corr_by_lag_cur.get(int(lag_k))
+                    lbk = lb_by_lag_cur.get(int(lag_k))
+                    if np.isfinite(rk):
+                        corr_lists_by_lag[int(lag_k)].append(float(rk))
+                    if np.isfinite(lbk):
+                        lb_lists_by_lag[int(lag_k)].append(float(lbk))
 
             def _summary(vals: list[float]) -> dict:
                 if not vals:
@@ -1651,14 +1676,31 @@ def preprocess_timeseries(
                     "p75": float(np.nanpercentile(a, 75)),
                 }
 
+            corr_summary_by_lag = {
+                f"lag{int(k)}": _summary(vals) for k, vals in corr_lists_by_lag.items()
+            }
+            lb_summary_by_lag = {
+                f"lag{int(k)}": _summary(vals) for k, vals in lb_lists_by_lag.items()
+            }
+            frac_lb_bad_by_lag = {
+                f"lag{int(k)}": (
+                    float(np.mean(np.asarray(vals, dtype=float) < 0.05))
+                    if vals else float("nan")
+                )
+                for k, vals in lb_lists_by_lag.items()
+            }
+
             ac_note["after"] = {
                 "phi1": _summary(phi1_list),
-                "corr_lag1": _summary(r1_list),
-                "corr_lagp": _summary(rp_list),
-                "ljungbox_p_lag1": _summary(lb1_list),
-                "ljungbox_p_lagp": _summary(lbp_list),
-                "frac_lb_p_lt_0_05_lag1": float(np.mean(np.asarray(lb1_list) < 0.05)) if lb1_list else float("nan"),
-                "frac_lb_p_lt_0_05_lagp": float(np.mean(np.asarray(lbp_list) < 0.05)) if lbp_list else float("nan"),
+                "corr_lag1": corr_summary_by_lag.get("lag1", {"n": 0}),
+                "corr_lagp": corr_summary_by_lag.get(f"lag{int(p_order)}", {"n": 0}),
+                "ljungbox_p_lag1": lb_summary_by_lag.get("lag1", {"n": 0}),
+                "ljungbox_p_lagp": lb_summary_by_lag.get(f"lag{int(p_order)}", {"n": 0}),
+                "frac_lb_p_lt_0_05_lag1": frac_lb_bad_by_lag.get("lag1", float("nan")),
+                "frac_lb_p_lt_0_05_lagp": frac_lb_bad_by_lag.get(f"lag{int(p_order)}", float("nan")),
+                "corr_by_lag": corr_summary_by_lag,
+                "ljungbox_p_by_lag": lb_summary_by_lag,
+                "frac_lb_p_lt_0_05_by_lag": frac_lb_bad_by_lag,
             }
 
             # допишем примеры "после"
@@ -1673,6 +1715,10 @@ def preprocess_timeseries(
                             xa = np.nan_to_num(xa, nan=0.0, posinf=0.0, neginf=0.0)
                             item["after_corr_lag1"] = _safe_corr_at_lag(xa, 1)
                             item["after_corr_lagp"] = _safe_corr_at_lag(xa, p_order)
+                            item["after_corr_by_lag"] = {
+                                f"lag{int(k)}": _safe_corr_at_lag(xa, int(k))
+                                for k in range(1, p_order + 1)
+                            }
                     except Exception:
                         pass
             ac_note["examples"] = ex
@@ -1685,6 +1731,25 @@ def preprocess_timeseries(
                 amed = float(a.get("median")) if a.get("median") is not None else float("nan")
                 if np.isfinite(bmed) and np.isfinite(amed):
                     ac_note["lag1_reduction_median"] = float(1.0 - (abs(amed) / max(1e-12, abs(bmed))))
+            except Exception:
+                pass
+
+            # И то же самое по всем лагам 1..p.
+            try:
+                before_corr = (ac_note.get("before") or {}).get("corr_by_lag") or {}
+                after_corr = (ac_note.get("after") or {}).get("corr_by_lag") or {}
+                lag_reduction = {}
+                for lag_k in range(1, p_order + 1):
+                    kb = f"lag{int(lag_k)}"
+                    b = before_corr.get(kb) or {}
+                    a = after_corr.get(kb) or {}
+                    bmed = float(b.get("median")) if b.get("median") is not None else float("nan")
+                    amed = float(a.get("median")) if a.get("median") is not None else float("nan")
+                    if np.isfinite(bmed) and np.isfinite(amed):
+                        lag_reduction[kb] = float(1.0 - (abs(amed) / max(1e-12, abs(bmed))))
+                    else:
+                        lag_reduction[kb] = float("nan")
+                ac_note["lag_reduction_median_by_lag"] = lag_reduction
             except Exception:
                 pass
 

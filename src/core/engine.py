@@ -9,6 +9,7 @@
 """
 
 import argparse
+import html
 import datetime as _dt
 import importlib
 import importlib.util
@@ -1621,6 +1622,115 @@ class BigMasterTool:
         except Exception:
             # UI не должен валить вычисления.
             return
+
+    def _build_ar_diagnostics_dataframe(self) -> pd.DataFrame:
+        """Собирает lag-wise AR-диагностику из preprocessing_report.notes['autocorr']."""
+        try:
+            rep = getattr(self, "preprocessing_report", None)
+            notes = getattr(rep, "notes", {}) if rep is not None else {}
+            ac = (notes or {}).get("autocorr") or {}
+            before = ac.get("before") or {}
+            after = ac.get("after") or {}
+
+            corr_b = before.get("corr_by_lag") or {}
+            corr_a = after.get("corr_by_lag") or {}
+            lb_b = before.get("ljungbox_p_by_lag") or {}
+            lb_a = after.get("ljungbox_p_by_lag") or {}
+            frac_b = before.get("frac_lb_p_lt_0_05_by_lag") or {}
+            frac_a = after.get("frac_lb_p_lt_0_05_by_lag") or {}
+            red = ac.get("lag_reduction_median_by_lag") or {}
+
+            keys = set(corr_b.keys()) | set(corr_a.keys()) | set(lb_b.keys()) | set(lb_a.keys()) | set(frac_b.keys()) | set(frac_a.keys()) | set(red.keys())
+            if not keys:
+                return pd.DataFrame()
+
+            def _lag_num(k: str) -> int:
+                try:
+                    return int(str(k).replace("lag", "").strip())
+                except Exception:
+                    return 10**9
+
+            rows = []
+            for lag_key in sorted(keys, key=_lag_num):
+                cb = corr_b.get(lag_key) or {}
+                ca = corr_a.get(lag_key) or {}
+                lb1 = lb_b.get(lag_key) or {}
+                lb2 = lb_a.get(lag_key) or {}
+                rows.append({
+                    "lag": _lag_num(lag_key),
+                    "corr_before_n": cb.get("n"),
+                    "corr_before_mean": cb.get("mean"),
+                    "corr_before_median": cb.get("median"),
+                    "corr_before_p25": cb.get("p25"),
+                    "corr_before_p75": cb.get("p75"),
+                    "corr_after_n": ca.get("n"),
+                    "corr_after_mean": ca.get("mean"),
+                    "corr_after_median": ca.get("median"),
+                    "corr_after_p25": ca.get("p25"),
+                    "corr_after_p75": ca.get("p75"),
+                    "ljungbox_p_before_mean": lb1.get("mean"),
+                    "ljungbox_p_before_median": lb1.get("median"),
+                    "ljungbox_p_after_mean": lb2.get("mean"),
+                    "ljungbox_p_after_median": lb2.get("median"),
+                    "frac_lb_p_lt_0_05_before": frac_b.get(lag_key),
+                    "frac_lb_p_lt_0_05_after": frac_a.get(lag_key),
+                    "lag_reduction_median": red.get(lag_key),
+                })
+            return pd.DataFrame(rows)
+        except Exception:
+            return pd.DataFrame()
+
+    def _render_ar_diagnostics_html(self) -> str:
+        """HTML-блок lag-wise AR-диагностики для включения в отчёты."""
+        try:
+            rep = getattr(self, "preprocessing_report", None)
+            notes = getattr(rep, "notes", {}) if rep is not None else {}
+            ac = (notes or {}).get("autocorr") or {}
+            if not ac:
+                return ""
+
+            ar_df = self._build_ar_diagnostics_dataframe()
+            if ar_df.empty:
+                return ""
+
+            phi1_before = ((ac.get("before") or {}).get("phi1") or {}).get("median")
+            phi1_after = ((ac.get("after") or {}).get("phi1") or {}).get("median")
+            lag1_reduction = ac.get("lag1_reduction_median")
+
+            def _fmt(x, nd=4):
+                try:
+                    if x is None:
+                        return "NaN"
+                    v = float(x)
+                    return "NaN" if not np.isfinite(v) else f"{v:.{nd}f}"
+                except Exception:
+                    return html.escape(str(x))
+
+            table_df = ar_df[[
+                "lag",
+                "corr_before_median",
+                "corr_after_median",
+                "lag_reduction_median",
+                "frac_lb_p_lt_0_05_before",
+                "frac_lb_p_lt_0_05_after",
+            ]].copy()
+            table_html = table_df.to_html(index=False, border=0, classes=["tsa-table"])
+
+            return (
+                "<section id='ar_diag'>"
+                "<h2>AR(p) / Autocorrelation diagnostics</h2>"
+                "<p>"
+                f"<b>Median phi1 before:</b> {_fmt(phi1_before)}<br>"
+                f"<b>Median phi1 after:</b> {_fmt(phi1_after)}<br>"
+                f"<b>Lag-1 median reduction:</b> {_fmt(lag1_reduction)}"
+                "</p>"
+                "<p>Таблица ниже показывает по лагам 1..p медианную автокорреляцию до/после, "
+                "снижение и долю рядов с Ljung–Box p&lt;0.05.</p>"
+                f"{table_html}"
+                "</section>"
+            )
+        except Exception:
+            return ""
 
     def load_data_excel(self, filepath: str, **kwargs) -> pd.DataFrame:
         """Загружает данные, чистит их и опционально устраняет нестационарность."""
