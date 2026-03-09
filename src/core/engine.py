@@ -1644,6 +1644,7 @@ class BigMasterTool:
             "spatial_grid_size", "spatial_grid_method", "lazy_spatial_bin", "time_chunk",
             "time_start", "time_end", "time_stride",
             "dtype", "auto_float32",
+            "save_aggregated_h5", "aggregated_h5_dir", "reuse_existing_aggregated_h5",
         )
         _big_data_kwargs = {k: kwargs[k] for k in _big_data_keys if k in kwargs}
         try:
@@ -1660,6 +1661,11 @@ class BigMasterTool:
         except Exception:
             self.data_raw = pd.DataFrame()
 
+        # spatial_bin_* относится к пост-загрузочному биннингу каналов и не
+        # должно уходить в load_or_generate(), где есть только spatial_grid_* для HDF5.
+        spatial_bin_size = int(kwargs.pop("spatial_bin_size", getattr(self.config, "spatial_bin_size", 1)) or 1)
+        spatial_bin_method = str(kwargs.pop("spatial_bin_method", getattr(self.config, "spatial_bin_method", "mean")))
+
         # 2) Основной путь загрузки (с учётом выбранных опций) + структурированный отчёт.
         self._stage("Загрузка + предобработка", 0.15)
         df_out = load_or_generate(filepath, return_report=True, **kwargs)
@@ -1670,9 +1676,7 @@ class BigMasterTool:
         # Опциональная пространственная агрегация каналов (channel binning).
         # Выполняем после базовой загрузки/очистки, но до последующих этапов
         # (QC, автодифф, расчёты), чтобы снизить размерность на ранней стадии.
-        spatial_bin_size = int(kwargs.get("spatial_bin_size", getattr(self.config, "spatial_bin_size", 1)) or 1)
         if spatial_bin_size > 1:
-            spatial_bin_method = str(kwargs.get("spatial_bin_method", getattr(self.config, "spatial_bin_method", "mean")))
             self.data, spatial_desc = spatial_bin_channels(
                 self.data,
                 bin_size=spatial_bin_size,
