@@ -92,7 +92,9 @@ def _preset_payload(name: str) -> dict:
             "include_fft_plots": False, "save_series_bundle": True,
             "spatial_grid_size": 12, "spatial_grid_method": "mean", "lazy_spatial_bin": True,
             "time_chunk": 25, "time_stride": 2, "feature_limit": 0, "dimred_enabled": False,
-            "batch_recursive": True, "batch_skip_existing": True,
+            # Batch-safe дефолты: без рекурсии и с фокусом на HDF5-файлы.
+            "batch_recursive": False, "batch_skip_existing": True,
+            "batch_allowed_exts": [".h5", ".hdf5"],
         },
     }
     return presets.get(name, presets["Default stable"]).copy()
@@ -193,25 +195,51 @@ def _append_text(path: Path, text: str) -> None:
         fh.write(text.rstrip() + "\n")
 
 
-def _iter_input_files(folder: str, recursive: bool = True) -> list[Path]:
-    """Возвращает поддерживаемые входные файлы из папки для batch-режима."""
+def _normalize_exts(exts: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Нормализует список расширений к виду ('.h5', '.csv').
+
+    Пустой/некорректный ввод приводит к SUPPORTED_INPUT_EXTS.
+    """
+    if not exts:
+        return SUPPORTED_INPUT_EXTS
+
+    normalized: list[str] = []
+    for ext in exts:
+        value = str(ext or "").strip().lower()
+        if not value:
+            continue
+        if not value.startswith("."):
+            value = f".{value}"
+        if value in SUPPORTED_INPUT_EXTS and value not in normalized:
+            normalized.append(value)
+    return tuple(normalized or SUPPORTED_INPUT_EXTS)
+
+
+def _iter_input_files(
+    folder: str,
+    recursive: bool = False,
+    allowed_exts: list[str] | tuple[str, ...] | None = None,
+) -> list[Path]:
+    """Возвращает поддерживаемые входные файлы для batch-режима.
+
+    По умолчанию обход НЕ рекурсивный. Через ``allowed_exts`` можно заранее
+    ограничить набор форматов (например, только HDF5).
+    """
     root = Path(folder).expanduser()
-    if not root.exists():
+    if not root.exists() or not root.is_dir():
         return []
+
+    exts = _normalize_exts(allowed_exts)
     found: list[Path] = []
-    if recursive:
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            # Не обрабатываем артефакты уже созданных запусков.
-            if "time_series_analysis" in {part.lower() for part in p.parts}:
-                continue
-            if p.suffix.lower() in SUPPORTED_INPUT_EXTS:
-                found.append(p)
-    else:
-        for p in root.iterdir():
-            if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_EXTS:
-                found.append(p)
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    for p in iterator:
+        if not p.is_file():
+            continue
+        # Не обрабатываем артефакты уже созданных запусков.
+        if "time_series_analysis" in {part.lower() for part in p.parts}:
+            continue
+        if p.suffix.lower() in exts:
+            found.append(p)
     return sorted(found)
 
 
@@ -259,6 +287,17 @@ def _show_local_dialog_hint() -> None:
         "Кнопки выбора открывают системный диалог (tkinter). "
         "Если диалог недоступен (например, headless/remote), просто введи путь вручную."
     )
+
+
+def _consume_pending_widget_value(widget_key: str) -> None:
+    """Переносит отложенное значение в ключ виджета до его создания.
+
+    Это защищает от ошибки Streamlit, когда код пытается менять значение
+    уже созданного widget-key в том же rerun.
+    """
+    pending_key = f"__pending_{widget_key}"
+    if pending_key in st.session_state:
+        st.session_state[widget_key] = st.session_state.pop(pending_key)
 
 
 def _make_run_dir(stem: str) -> Path:
@@ -460,6 +499,11 @@ def main() -> None:
                 _apply_preset_to_session(preset_name)
                 st.rerun()
 
+    # Применяем отложенные значения до создания соответствующих виджетов.
+    _consume_pending_widget_value("ui_local_file_path")
+    _consume_pending_widget_value("ui_batch_input_folder")
+    _consume_pending_widget_value("ui_batch_output_root")
+
     source = st.radio(
         "Источник данных",
         ["Файл (CSV/XLSX/MAT/Parquet)", "Папка (batch, потоково)", "Синтетика (формулы)", "Синтетика (пресеты)", "Валидация метрик"],
@@ -474,8 +518,9 @@ def main() -> None:
     local_file_path = ""
     batch_input_folder = ""
     batch_output_root = ""
-    batch_recursive = True
+    batch_recursive = False
     batch_skip_existing = True
+    batch_allowed_exts = [".h5", ".hdf5"]
 
     if source.startswith("Файл"):
         _show_local_dialog_hint()
@@ -483,8 +528,8 @@ def main() -> None:
         with cf1:
             local_file_path = st.text_input(
                 "Локальный путь к файлу",
-                value=st.session_state.get("local_file_path", ""),
-                key="local_file_path",
+                value=st.session_state.get("ui_local_file_path", st.session_state.get("local_file_path", "")),
+                key="ui_local_file_path",
                 placeholder=r"D:\data\subject01.h5",
             )
         with cf2:
@@ -492,10 +537,10 @@ def main() -> None:
                 picked = _native_pick_path(
                     "file",
                     "Выбери входной файл",
-                    st.session_state.get("local_file_path") or str(Path.home()),
+                    st.session_state.get("ui_local_file_path") or str(Path.home()),
                 )
                 if picked:
-                    st.session_state["local_file_path"] = picked
+                    st.session_state["__pending_ui_local_file_path"] = picked
                     st.rerun()
 
         with st.expander("Загрузка через браузер (fallback)", expanded=False):
@@ -511,8 +556,8 @@ def main() -> None:
         with c_batch1:
             batch_input_folder = st.text_input(
                 "Папка с входными файлами",
-                value=st.session_state.get("batch_input_folder", ""),
-                key="batch_input_folder",
+                value=st.session_state.get("ui_batch_input_folder", st.session_state.get("batch_input_folder", "")),
+                key="ui_batch_input_folder",
                 placeholder=r"D:\data\fmri_batch",
             )
         with c_batch2:
@@ -520,28 +565,46 @@ def main() -> None:
                 picked = _native_pick_path(
                     "dir",
                     "Выбери папку с входными файлами",
-                    st.session_state.get("batch_input_folder") or str(Path.home()),
+                    st.session_state.get("ui_batch_input_folder") or str(Path.home()),
                 )
                 if picked:
-                    st.session_state["batch_input_folder"] = picked
-                    if not st.session_state.get("batch_output_root"):
-                        st.session_state["batch_output_root"] = _default_batch_output_root(picked)
+                    st.session_state["__pending_ui_batch_input_folder"] = picked
+                    if not st.session_state.get("ui_batch_output_root"):
+                        st.session_state["__pending_ui_batch_output_root"] = _default_batch_output_root(picked)
                     st.rerun()
 
         c_batch_out1, c_batch_out2 = st.columns(2)
         with c_batch_out1:
             batch_output_root = st.text_input(
                 "Папка для результатов",
-                value=st.session_state.get("batch_output_root", _default_batch_output_root(st.session_state.get("batch_input_folder", ""))),
-                key="batch_output_root",
+                value=st.session_state.get(
+                    "ui_batch_output_root",
+                    st.session_state.get("batch_output_root", _default_batch_output_root(st.session_state.get("batch_input_folder", ""))),
+                ),
+                key="ui_batch_output_root",
             )
         with c_batch_out2:
             st.caption("Результаты будут сохранены в структуре time_series_analysis")
 
+        c_batch3, c_batch4, c_batch5 = st.columns([1, 1, 2])
+        with c_batch3:
+            batch_recursive = st.checkbox("Рекурсивно проходить подпапки", value=False, key="batch_recursive")
+        with c_batch4:
+            batch_skip_existing = st.checkbox("Пропускать уже обработанные файлы", value=True, key="batch_skip_existing")
+        with c_batch5:
+            batch_allowed_exts = st.multiselect(
+                "Какие расширения брать",
+                options=list(SUPPORTED_INPUT_EXTS),
+                default=st.session_state.get("batch_allowed_exts", [".h5", ".hdf5"]),
+                key="batch_allowed_exts",
+                help="Если ничего не выбрано, будет использован полный список поддерживаемых расширений.",
+            )
+
         if batch_input_folder.strip():
             preview_files = _iter_input_files(
                 batch_input_folder.strip(),
-                recursive=bool(st.session_state.get("batch_recursive", True)),
+                recursive=bool(st.session_state.get("batch_recursive", False)),
+                allowed_exts=st.session_state.get("batch_allowed_exts"),
             )
             st.caption(f"Найдено файлов: {len(preview_files)}")
             if preview_files:
@@ -551,11 +614,6 @@ def main() -> None:
                     height=220,
                 )
 
-        c_batch3, c_batch4 = st.columns(2)
-        with c_batch3:
-            batch_recursive = st.checkbox("Рекурсивно проходить подпапки", value=True, key="batch_recursive")
-        with c_batch4:
-            batch_skip_existing = st.checkbox("Пропускать уже обработанные файлы", value=True, key="batch_skip_existing")
     elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
             c0, c1, c2 = st.columns(3)
@@ -630,6 +688,11 @@ def main() -> None:
     elif source.startswith("Валидация"):
         _render_validation_tab()
         return
+
+    # Синхронизация UI-ключей с рабочими ключами для совместимости старой логики.
+    st.session_state["local_file_path"] = local_file_path
+    st.session_state["batch_input_folder"] = batch_input_folder
+    st.session_state["batch_output_root"] = batch_output_root
 
     # === БЛОК 1: ПРЕДОБРАБОТКА (с пояснениями) ===
     with st.expander("🛠️ 1. Подготовка данных (Preprocessing & DimRed)", expanded=False):
@@ -1062,7 +1125,11 @@ def main() -> None:
                 st.error(f"Папка не найдена: {input_root}")
                 return
 
-            files = _iter_input_files(str(input_root), recursive=bool(batch_recursive))
+            files = _iter_input_files(
+                str(input_root),
+                recursive=bool(batch_recursive),
+                allowed_exts=st.session_state.get("batch_allowed_exts"),
+            )
             if not files:
                 st.error("В указанной папке не найдено поддерживаемых файлов.")
                 return
