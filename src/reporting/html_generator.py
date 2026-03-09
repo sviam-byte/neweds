@@ -425,6 +425,7 @@ class HTMLReportGenerator:
         include_matrix_tables = kwargs.get("include_matrix_tables", True)
         include_fft_plots = bool(kwargs.get("include_fft_plots", False))
         include_scans = bool(kwargs.get("include_scans", True))
+        include_ar_diagnostics = bool(kwargs.get("include_ar_diagnostics", True))
         include_series_files = bool(kwargs.get("include_series_files", True))
         series_preview_rows = int(kwargs.get("series_preview_rows", 200))
         harmonic_top_k = int(kwargs.get("harmonic_top_k", 5))
@@ -458,11 +459,16 @@ class HTMLReportGenerator:
                 "<h2 id='what_done'>Что сделано</h2>" + f"<pre>{html.escape(run_summary)}</pre>"
             )
 
-        # Явный блок про автокорреляцию/AR-очистку (если она включалась).
-        try:
-            ac_html = self._render_autocorr_section()
-        except Exception:
-            ac_html = ""
+        # Явный блок про автокорреляцию/AR-очистку (если включено в параметрах отчёта).
+        ac_html = ""
+        if include_ar_diagnostics:
+            try:
+                if hasattr(self.tool, "_render_ar_diagnostics_html"):
+                    ac_html = self.tool._render_ar_diagnostics_html()
+                if not ac_html:
+                    ac_html = self._render_autocorr_section()
+            except Exception:
+                ac_html = ""
         if ac_html:
             toc.append("<li><a href='#autocorr'>Автокорреляция</a></li>")
             sections.append(f"<div id='autocorr'>{ac_html}</div>")

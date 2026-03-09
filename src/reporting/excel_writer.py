@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
+from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 from src.config import is_directed_method, is_pvalue_method
@@ -75,6 +76,7 @@ class ExcelReportWriter:
 
         threshold = kwargs.get("threshold", 0.2)
         p_alpha = kwargs.get("p_value_alpha", 0.05)
+        include_ar_diagnostics = bool(kwargs.get("include_ar_diagnostics", True))
         disable_images = str(os.getenv("TS_TOOL_DISABLE_EXCEL_IMAGES", "0")).strip().lower() in {"1", "true", "yes", "on"}
         max_image_n = int(kwargs.get("excel_max_image_n", os.getenv("TS_TOOL_EXCEL_MAX_IMAGE_N", 300) or 300))
         max_matrix_sheet_n = int(kwargs.get("excel_max_matrix_sheet_n", os.getenv("TS_TOOL_EXCEL_MAX_MATRIX_N", 5000) or 5000))
@@ -139,6 +141,49 @@ class ExcelReportWriter:
             except Exception as exc:
                 ws.append(["connectome_error", str(exc)])
                 warnings.append(f"{variant}: не удалось построить connectome: {exc}")
+
+
+        # AR-диагностика в отдельные листы (если доступна в preprocessing_report.notes).
+        if include_ar_diagnostics:
+            try:
+                ar_df = pd.DataFrame()
+                if hasattr(self.tool, "_build_ar_diagnostics_dataframe"):
+                    ar_df = self.tool._build_ar_diagnostics_dataframe()
+                if isinstance(ar_df, pd.DataFrame) and not ar_df.empty:
+                    ws_ar = wb.create_sheet(title="AR_Diagnostics")
+                    ws_ar.append(list(ar_df.columns))
+                    for row in dataframe_to_rows(ar_df, index=False, header=False):
+                        ws_ar.append(row)
+                    ws_ar.freeze_panes = "A2"
+                    for idx, col in enumerate(ar_df.columns, start=1):
+                        sample = [len(str(col))]
+                        sample.extend(len(str(v)) for v in ar_df[col].head(200).tolist())
+                        ws_ar.column_dimensions[get_column_letter(idx)].width = min(max(12, max(sample) + 2), 28)
+
+                rep = getattr(self.tool, "preprocessing_report", None)
+                notes = getattr(rep, "notes", {}) if rep is not None else {}
+                ac = (notes or {}).get("autocorr") or {}
+                ex = ac.get("examples") or {}
+                ex_rows = []
+                if isinstance(ex, dict):
+                    for name, item in ex.items():
+                        if not isinstance(item, dict):
+                            continue
+                        row = {"series": name, "phi1": item.get("phi1")}
+                        for k, v in (item.get("before_corr_by_lag") or {}).items():
+                            row[f"before_{k}"] = v
+                        for k, v in (item.get("after_corr_by_lag") or {}).items():
+                            row[f"after_{k}"] = v
+                        ex_rows.append(row)
+                if ex_rows:
+                    df_ex = pd.DataFrame(ex_rows)
+                    ws_ex = wb.create_sheet(title="AR_Examples")
+                    ws_ex.append(list(df_ex.columns))
+                    for row in dataframe_to_rows(df_ex, index=False, header=False):
+                        ws_ex.append(row)
+                    ws_ex.freeze_panes = "A2"
+            except Exception as exc:
+                warnings.append(f"AR diagnostics sheets skipped: {exc}")
 
         if warnings:
             ws_warn = wb.create_sheet(title="Warnings")

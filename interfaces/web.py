@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import traceback
 import os
 import sys
 import tempfile
@@ -26,6 +27,113 @@ from src.validation.runner import run_quick_validation, run_full_validation, run
 from src.validation.scenarios import ALL_SCENARIOS, QUICK_SCENARIOS
 
 configure_warnings()
+
+PRESET_NAMES = [
+    "Fast stable",
+    "Default stable",
+    "Heavy research",
+    "fMRI batch safe",
+]
+
+
+def _preset_payload(name: str) -> dict:
+    """Возвращает пресет sane-defaults для типовых запусков."""
+    fast_methods = [
+        m for m in ["correlation_full", "dcor_full", "ordinal_full"]
+        if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
+    ]
+    stable_methods = [
+        m for m in [
+            "correlation_full", "correlation_partial", "coherence_full",
+            "dcor_full", "ordinal_full", "granger_full",
+        ] if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
+    ]
+    all_heavy = [m for m in (STABLE_METHODS + EXPERIMENTAL_METHODS) if m not in {"te_partial"}]
+
+    presets = {
+        "Fast stable": {
+            "selected_methods": fast_methods, "enable_experimental": False,
+            "remove_ar1": True, "remove_ar_order": 2, "ar_diagnostics": True,
+            "lag_selection_mode_ui": "fixed", "lag": 1, "max_lag": 3,
+            "use_main_windows": False, "window_sizes_text": "128,256", "window_stride_main": 0,
+            "window_policy": "best", "include_scans": False,
+            "scan_lag": False, "scan_window_pos": False, "scan_window_size": False, "scan_cube": False,
+            "output_mode": "html", "include_diagnostics": True, "include_matrix_tables": False,
+            "include_fft_plots": False, "save_series_bundle": True, "time_stride": 1,
+        },
+        "Default stable": {
+            "selected_methods": stable_methods, "enable_experimental": False,
+            "remove_ar1": True, "remove_ar_order": 2, "ar_diagnostics": True,
+            "lag_selection_mode_ui": "fixed", "lag": 1, "max_lag": 5,
+            "use_main_windows": False, "window_sizes_text": "128,256", "window_stride_main": 0,
+            "window_policy": "best", "include_scans": False,
+            "scan_lag": False, "scan_window_pos": False, "scan_window_size": False, "scan_cube": False,
+            "output_mode": "both", "include_diagnostics": True, "include_matrix_tables": False,
+            "include_fft_plots": False, "save_series_bundle": True, "time_stride": 1,
+        },
+        "Heavy research": {
+            "selected_methods": all_heavy, "enable_experimental": True,
+            "remove_ar1": True, "remove_ar_order": 3, "ar_diagnostics": True,
+            "lag_selection_mode_ui": "optimize", "lag": 1, "max_lag": 8,
+            "use_main_windows": True, "window_sizes_text": "128,256,512", "window_stride_main": 0,
+            "window_policy": "best", "include_scans": True,
+            "scan_lag": True, "scan_window_pos": True, "scan_window_size": True, "scan_cube": False,
+            "output_mode": "both", "include_diagnostics": True, "include_matrix_tables": True,
+            "include_fft_plots": True, "save_series_bundle": True, "time_stride": 1,
+        },
+        "fMRI batch safe": {
+            "selected_methods": fast_methods, "enable_experimental": False,
+            "remove_ar1": True, "remove_ar_order": 2, "ar_diagnostics": True,
+            "lag_selection_mode_ui": "fixed", "lag": 1, "max_lag": 3,
+            "use_main_windows": False, "window_sizes_text": "128,256", "window_stride_main": 0,
+            "window_policy": "best", "include_scans": False,
+            "scan_lag": False, "scan_window_pos": False, "scan_window_size": False, "scan_cube": False,
+            "output_mode": "html", "include_diagnostics": True, "include_matrix_tables": False,
+            "include_fft_plots": False, "save_series_bundle": True,
+            "spatial_grid_size": 12, "spatial_grid_method": "mean", "lazy_spatial_bin": True,
+            "time_chunk": 25, "time_stride": 2, "feature_limit": 0, "dimred_enabled": False,
+            "batch_recursive": True, "batch_skip_existing": True,
+        },
+    }
+    return presets.get(name, presets["Default stable"]).copy()
+
+
+def _apply_preset_to_session(name: str) -> None:
+    """Применяет выбранный пресет к session_state."""
+    payload = _preset_payload(name)
+    st.session_state["launch_preset"] = name
+    for k, v in payload.items():
+        st.session_state[k] = v
+
+
+SUPPORTED_INPUT_EXTS = (".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5")
+
+# Устойчивый дефолт для первого реального прогона без экспериментальных метрик.
+DEFAULT_STABLE_METHODS = [
+    m
+    for m in [
+        "correlation_full",
+        "correlation_partial",
+        "coherence_full",
+        "dcor_full",
+        "ordinal_full",
+        "granger_full",
+    ]
+    if m in STABLE_METHODS
+]
+
+
+def _json_default(obj):
+    """JSON-serializer для numpy/pathlib типов в run-артефактах."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
 
 
 def _parse_int_list_text(text: str) -> list[int] | None:
@@ -67,6 +175,52 @@ def _zip_tree(src_dir: Path, zip_path: Path) -> Path:
             if pp.is_file():
                 zf.write(pp, arcname=str(pp.relative_to(src_dir)))
     return zip_path
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    """Пишет JSON на диск с единым форматированием."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+
+
+def _append_text(path: Path, text: str) -> None:
+    """Добавляет строку в лог-файл, создавая директорию при необходимости."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(text.rstrip() + "\n")
+
+
+def _iter_input_files(folder: str, recursive: bool = True) -> list[Path]:
+    """Возвращает поддерживаемые входные файлы из папки для batch-режима."""
+    root = Path(folder).expanduser()
+    if not root.exists():
+        return []
+    found: list[Path] = []
+    if recursive:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            # Не обрабатываем артефакты уже созданных запусков.
+            if "time_series_analysis" in {part.lower() for part in p.parts}:
+                continue
+            if p.suffix.lower() in SUPPORTED_INPUT_EXTS:
+                found.append(p)
+    else:
+        for p in root.iterdir():
+            if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_EXTS:
+                found.append(p)
+    return sorted(found)
+
+
+def _default_batch_output_root(input_folder: str) -> str:
+    """Строит дефолтный путь для batch-результатов рядом с входной папкой."""
+    folder = Path(input_folder).expanduser() if input_folder else Path(SAVE_FOLDER)
+    if folder.exists() and folder.is_dir():
+        return str(folder / "time_series_analysis")
+    return str(Path(SAVE_FOLDER) / "runs" / "time_series_analysis")
 
 
 def _make_run_dir(stem: str) -> Path:
@@ -253,9 +407,24 @@ def main() -> None:
     st.title("Анализ Связности Временных Рядов")
     st.caption(f"Локальная версия. Результаты сохраняются в папку: {SAVE_FOLDER}")
 
+    with st.expander("🚀 Пресеты запуска", expanded=True):
+        cpr1, cpr2 = st.columns([2, 1])
+        with cpr1:
+            cur = st.session_state.get("launch_preset", "Default stable")
+            preset_name = st.selectbox(
+                "Готовый профиль",
+                PRESET_NAMES,
+                index=(PRESET_NAMES.index(cur) if cur in PRESET_NAMES else PRESET_NAMES.index("Default stable")),
+                key="launch_preset",
+            )
+        with cpr2:
+            if st.button("Применить пресет", key="apply_launch_preset"):
+                _apply_preset_to_session(preset_name)
+                st.rerun()
+
     source = st.radio(
         "Источник данных",
-        ["Файл (CSV/XLSX/MAT/Parquet)", "Пакет файлов", "Синтетика (формулы)", "Синтетика (пресеты)", "Валидация метрик"],
+        ["Файл (CSV/XLSX/MAT/Parquet)", "Папка (batch, потоково)", "Синтетика (формулы)", "Синтетика (пресеты)", "Валидация метрик"],
         index=0,
         horizontal=True,
     )
@@ -264,6 +433,10 @@ def main() -> None:
     uploaded_files = []
     synth_df: pd.DataFrame | None = None
     synth_name = "synthetic"
+    batch_input_folder = ""
+    batch_output_root = ""
+    batch_recursive = True
+    batch_skip_existing = True
 
     if source.startswith("Файл"):
         uploaded_file = st.file_uploader(
@@ -271,14 +444,27 @@ def main() -> None:
             type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
             max_upload_size=1024,  # Дублируем лимит из .streamlit/config.toml для явного поведения UI.
         )
-    elif source.startswith("Пакет"):
-        uploaded_files = st.file_uploader(
-            "Выберите несколько файлов",
-            type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
-            accept_multiple_files=True,
-            max_upload_size=1024,
-        ) or []
-        st.caption("Файлы будут обработаны по одному. Для каждого входа создаётся отдельная папка результата и общий ZIP.")
+    elif source.startswith("Папка"):
+        st.info("Локальный batch-режим: укажи папку с данными и отдельную папку результатов. Файлы будут идти потоково по одному.")
+        c_batch1, c_batch2 = st.columns(2)
+        with c_batch1:
+            batch_input_folder = st.text_input(
+                "Папка с входными файлами",
+                value=st.session_state.get("batch_input_folder", ""),
+                key="batch_input_folder",
+                placeholder=r"D:\data\fmri_batch",
+            )
+        with c_batch2:
+            batch_output_root = st.text_input(
+                "Папка для результатов",
+                value=st.session_state.get("batch_output_root", _default_batch_output_root(st.session_state.get("batch_input_folder", ""))),
+                key="batch_output_root",
+            )
+        c_batch3, c_batch4 = st.columns(2)
+        with c_batch3:
+            batch_recursive = st.checkbox("Рекурсивно проходить подпапки", value=True, key="batch_recursive")
+        with c_batch4:
+            batch_skip_existing = st.checkbox("Пропускать уже обработанные файлы", value=True, key="batch_skip_existing")
     elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
             c0, c1, c2 = st.columns(3)
@@ -453,7 +639,32 @@ def main() -> None:
             )
 
             log_transform = st.checkbox("Лог-преобразование (только >0)", value=False)
-            remove_ar1 = st.checkbox("Убрать AR(1) (прибл. prewhitening)", value=False)
+            st.markdown("### AR(p) / prewhitening")
+            if "remove_ar1" not in st.session_state:
+                st.session_state["remove_ar1"] = True
+            if "remove_ar_order" not in st.session_state:
+                st.session_state["remove_ar_order"] = 2
+            if "ar_diagnostics" not in st.session_state:
+                st.session_state["ar_diagnostics"] = True
+            remove_ar1 = st.checkbox(
+                "Убирать AR(p) перед анализом",
+                value=bool(st.session_state.get("remove_ar1", True)),
+                key="remove_ar1",
+                help="По умолчанию включено. Это один из главных способов убрать ложную связность из-за автокорреляции.",
+            )
+            remove_ar_order = int(st.number_input(
+                "Порядок AR(p)",
+                min_value=1, max_value=10,
+                value=int(st.session_state.get("remove_ar_order", 2)),
+                step=1,
+                key="remove_ar_order",
+                help="p=1 = AR(1), p=2/3 — более строгий вариант для более длинной памяти.",
+            ))
+            ar_diagnostics = st.checkbox(
+                "Сохранять AR-диагностику до/после очистки",
+                value=bool(st.session_state.get("ar_diagnostics", True)),
+                key="ar_diagnostics",
+            )
             remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
             season_period = st.number_input("Период сезонности (0=авто)", min_value=0, max_value=1000000, value=0, step=1)
             qc_enabled = st.checkbox(
@@ -572,27 +783,33 @@ def main() -> None:
 
     # === БЛОК 2: ПАРАМЕТРЫ СВЯЗНОСТИ ===
     with st.expander("⚙️ 2. Параметры связности (Lags & Windows)", expanded=True):
-        tabs = st.tabs(["Основное", "Сканирование (Advanced)", "Топология графа"])
+        tabs = st.tabs(["Main estimation", "Diagnostic scans", "Топология графа"])
 
         with tabs[0]:
-            st.write("Базовые настройки для расчета одной итоговой матрицы.")
+            st.write("Настройки, которые влияют на основную итоговую матрицу связности.")
             col_lag, col_thr = st.columns(2)
             with col_lag:
-                lag_mode = st.radio("Подбор лага (задержки)", ["Автоматически (Optimize)", "Фиксированный"], horizontal=True)
+                preset_lag_mode = st.session_state.get("lag_selection_mode_ui", "fixed")
+                lag_mode = st.radio(
+                    "Режим лага для основного расчёта",
+                    ["Автоматически (Optimize)", "Фиксированный"],
+                    horizontal=True,
+                    index=0 if preset_lag_mode == "optimize" else 1,
+                )
                 if lag_mode.startswith("Фикс"):
                     lag_selection = "fixed"
-                    lag = st.slider("Лаг (точек)", 1, 50, 1)
-                    max_lag = st.slider("max_lag (для сканов/ограничений)", 1, 200, 12)
+                    lag = st.slider("Лаг (точек)", 1, 50, int(st.session_state.get("lag", 1)), key="lag")
+                    max_lag = max(1, int(st.session_state.get("max_lag", 12)))
                 else:
                     lag_selection = "optimize"
-                    max_lag = st.slider("Максимальный лаг для поиска", 1, 20, 3, help="Проверим лаги от 1 до N и выберем лучший")
+                    max_lag = st.slider("Максимальный лаг для поиска", 1, 20, int(st.session_state.get("max_lag", 3)), key="max_lag", help="Проверим лаги от 1 до N и выберем лучший")
                     lag = 1
 
-                use_main_windows = st.checkbox("Использовать окна в основном расчёте", value=False)
-                window_policy = st.selectbox("Политика окон (main)", ["best", "mean"], index=0)
-                window_sizes_text = st.text_input("main window_sizes", value="256,512")
-                window_stride_main = st.number_input("stride (main, 0=auto)", min_value=0, max_value=100000, value=0, step=1)
-                window_cube_level = st.selectbox("Main window×lag×position (legacy)", ["off", "basic", "full"], index=0)
+                use_main_windows = st.checkbox("Использовать окна в основном расчёте", value=bool(st.session_state.get("use_main_windows", False)), key="use_main_windows")
+                window_policy = st.selectbox("Агрегация по окнам", ["best", "mean"], index=0 if str(st.session_state.get("window_policy", "best")) == "best" else 1, key="window_policy")
+                window_sizes_text = st.text_input("Размеры окон (через запятую)", value=str(st.session_state.get("window_sizes_text", "128,256")), key="window_sizes_text")
+                window_stride_main = st.number_input("Шаг окна (main, 0=auto)", min_value=0, max_value=100000, value=int(st.session_state.get("window_stride_main", 0)), step=1, key="window_stride_main")
+                window_cube_level = st.selectbox("Legacy window×lag×position", ["off", "basic", "full"], index=0)
                 window_cube_eval_limit = st.number_input("Main-cube eval_limit", min_value=20, max_value=5000, value=120, step=10)
 
             with col_thr:
@@ -608,7 +825,14 @@ def main() -> None:
                 threshold = float(graph_threshold)
 
         with tabs[1]:
-            st.info("Сканирование строит графики того, как меняется связь в зависимости от параметров. Это долго, но полезно.")
+            st.info("Это не основной расчёт, а диагностические sweep/scans по окнам/лагам. Они заметно тяжелее.")
+            if "include_scans" not in st.session_state:
+                st.session_state["include_scans"] = bool(include_scans)
+            include_scans = st.checkbox("Включить диагностические scans", value=bool(st.session_state.get("include_scans", False)), key="include_scans")
+            scan_lag = st.checkbox("Scan по лагам", value=bool(st.session_state.get("scan_lag", False)), key="scan_lag")
+            scan_window_pos = st.checkbox("Scan по позициям окна", value=bool(st.session_state.get("scan_window_pos", False)), key="scan_window_pos")
+            scan_window_size = st.checkbox("Scan по размерам окна", value=bool(st.session_state.get("scan_window_size", False)), key="scan_window_size")
+            scan_cube = st.checkbox("Scan cube", value=bool(st.session_state.get("scan_cube", False)), key="scan_cube")
             if include_scans:
                 st.markdown("**1. Скользящее окно (динамика во времени)**")
                 win_range = st.slider("Диапазон размеров окна", 32, 512, (96, 192), step=32)
@@ -617,15 +841,11 @@ def main() -> None:
                 window_size_default = st.number_input("window_size (для scan_window_pos)", min_value=2, max_value=1000000, value=128, step=1)
 
                 st.markdown("**2. Скан по лагам**")
-                scan_lag = st.checkbox("Проверить влияние лага (кривая качества)", value=True)
                 lag_min = st.number_input("lag_min", min_value=1, max_value=2000, value=1, step=1)
                 lag_max = st.number_input("lag_max", min_value=1, max_value=2000, value=min(2, int(max_lag)), step=1)
                 lag_step = st.number_input("lag_step", min_value=1, max_value=2000, value=1, step=1)
 
                 st.markdown("**3. 4D Куб (Window × Lag × Time)**")
-                scan_cube = st.checkbox("Построить 3D-карту устойчивости", value=False, help="Очень ресурсоемко!")
-                scan_window_pos = st.checkbox("scan_window_pos", value=True)
-                scan_window_size = st.checkbox("scan_window_size", value=True)
                 window_start_min = st.number_input("window_start_min (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
                 window_start_max = st.number_input("window_start_max (0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
                 window_stride_scan = st.number_input("window_stride (scan, 0=auto)", min_value=0, max_value=10_000_000, value=0, step=1)
@@ -666,14 +886,35 @@ def main() -> None:
 
 
     all_methods = STABLE_METHODS + EXPERIMENTAL_METHODS
+    if "selected_methods" not in st.session_state or not st.session_state.get("selected_methods"):
+        st.session_state["selected_methods"] = list(DEFAULT_STABLE_METHODS)
     selected_methods = st.multiselect(
         "Выберите методы",
         all_methods,
-        default=["correlation_full"],
+        default=st.session_state.get("selected_methods", DEFAULT_STABLE_METHODS),
+        key="selected_methods",
     )
 
-    with st.expander("План запуска (что будет сделано)", expanded=False):
-        st.write({
+    with st.expander("Быстрые кнопки", expanded=False):
+        cqb1, cqb2, cqb3, cqb4 = st.columns(4)
+        with cqb1:
+            if st.button("Только fast stable"):
+                st.session_state["selected_methods"] = _preset_payload("Fast stable")["selected_methods"]
+                st.rerun()
+        with cqb2:
+            if st.button("Только default stable"):
+                st.session_state["selected_methods"] = _preset_payload("Default stable")["selected_methods"]
+                st.rerun()
+        with cqb3:
+            if st.button("Все stable"):
+                st.session_state["selected_methods"] = list(STABLE_METHODS)
+                st.rerun()
+        with cqb4:
+            if st.button("Все методы"):
+                st.session_state["selected_methods"] = list(all_methods)
+                st.rerun()
+
+    run_plan = {
             "preprocess": preprocess,
             "fill_missing": fill_missing,
             "remove_outliers": remove_outliers,
@@ -689,6 +930,8 @@ def main() -> None:
             "normalize_mode": normalize_mode,
             "rank_ties": rank_ties,
             "remove_ar1": bool(remove_ar1),
+            "remove_ar_order": int(remove_ar_order),
+            "ar_diagnostics": bool(ar_diagnostics),
             "remove_seasonality": bool(remove_seasonality),
             "season_period": (None if int(season_period)==0 else int(season_period)),
             "qc_enabled": bool(qc_enabled),
@@ -698,208 +941,295 @@ def main() -> None:
             "spatial_grid_method": str(spatial_grid_method),
             "lazy_spatial_bin": bool(lazy_spatial_bin),
             "time_chunk": int(time_chunk),
-        })
+            "time_stride": int(time_stride),
+            "selected_methods": list(selected_methods),
+            "lag_selection": str(lag_selection),
+            "lag": int(lag),
+            "max_lag": int(max_lag),
+            "use_main_windows": bool(use_main_windows),
+            "lag_selection_mode_ui": ("optimize" if lag_selection == "optimize" else "fixed"),
+            "window_sizes_text": str(window_sizes_text),
+            "window_policy": str(window_policy),
+            "include_scans": bool(include_scans),
+            "output_mode": str(output_mode),
+            "save_series_bundle": bool(save_series_bundle),
+            "launch_preset": st.session_state.get("launch_preset", "Default stable"),
+        }
 
-    if source.startswith("Пакет"):
+    with st.expander("План запуска (что будет сделано)", expanded=False):
+        st.write(run_plan)
+
+    if source.startswith("Папка"):
         st.subheader("Пакетная обработка")
-        if not uploaded_files:
-            st.info("Загрузи несколько файлов для пакетного расчёта.")
+        if not batch_input_folder.strip():
+            st.info("Укажи папку с входными файлами.")
             return
 
         if st.button("Запустить пакетный анализ", type="primary"):
-            batch_root = _make_run_dir("batch_web")
+            input_root = Path(batch_input_folder).expanduser()
+            if not input_root.exists() or not input_root.is_dir():
+                st.error(f"Папка не найдена: {input_root}")
+                return
+
+            files = _iter_input_files(str(input_root), recursive=bool(batch_recursive))
+            if not files:
+                st.error("В указанной папке не найдено поддерживаемых файлов.")
+                return
+
+            batch_root = Path(batch_output_root.strip() or _default_batch_output_root(str(input_root))).expanduser()
+            batch_root.mkdir(parents=True, exist_ok=True)
+
+            manifest_path = batch_root / "batch_manifest.csv"
+            manifest_jsonl = batch_root / "batch_manifest.jsonl"
+            batch_log = batch_root / "batch_log.txt"
+            run_config_path = batch_root / "run_config.json"
+            _write_json(run_config_path, run_plan)
+            _append_text(batch_log, f"[START] {datetime.now().isoformat()} | input_root={input_root} | files={len(files)}")
+
             manifest_rows: list[dict] = []
             prog = st.progress(0)
-            with tempfile.TemporaryDirectory(prefix="tsa_web_batch_") as tmpdir:
-                tmpdir_p = Path(tmpdir)
-                for i, uf in enumerate(uploaded_files, start=1):
-                    src_path = _save_uploaded_file(uf, tmpdir_p)
-                    stem = _safe_slug(Path(src_path).stem)
-                    run_dir = batch_root / stem
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    row = {
-                        "input_file": getattr(uf, "name", src_path.name),
-                        "status": "error",
-                        "run_dir": str(run_dir),
-                        "excel_path": "",
-                        "html_path": "",
-                        "series_path": "",
-                        "error": "",
-                    }
+            for i, src_path in enumerate(files, start=1):
+                p = Path(src_path)
+                try:
+                    rel_parent = p.parent.relative_to(input_root) if input_root in p.parents or p.parent == input_root else Path(".")
+                except Exception:
+                    rel_parent = Path(".")
+                safe_rel = str(rel_parent).replace("..", "_up_").replace(":", "_").replace("\\", "__").replace("/", "__")
+                stem = p.stem if safe_rel in {"", "."} else f"{safe_rel}__{p.stem}"
+                safe_stem = _safe_slug(stem)
+                run_dir = batch_root / safe_stem
+                status_json = run_dir / "status.json"
+
+                if bool(batch_skip_existing) and status_json.exists():
                     try:
-                        cfg = engine.AnalysisConfig(
-                            max_lag=int(max_lag),
-                            p_value_alpha=float(alpha),
-                            graph_threshold=float(threshold),
-                            enable_experimental=bool(enable_experimental),
-                            auto_difference=bool(check_stat),
-                            pvalue_correction=str(pvalue_correction),
-                            spatial_bin_size=int(spatial_bin_size),
-                            spatial_bin_method=str(spatial_bin_method),
-                            spatial_grid_size=int(spatial_grid_size),
-                            spatial_grid_method=str(spatial_grid_method),
-                            lazy_spatial_bin=bool(lazy_spatial_bin),
-                            time_chunk=int(time_chunk),
-                        )
-                        tool = engine.BigMasterTool(config=cfg)
-                        tool.load_data_excel(
-                            str(src_path),
-                            preprocess=bool(preprocess),
-                            fill_missing=bool(fill_missing),
-                            normalize=bool(normalize),
-                            normalize_mode=str(normalize_mode),
-                            rank_ties=str(rank_ties),
-                            remove_outliers=bool(remove_outliers),
-                            outlier_rule=str(outlier_rule),
-                            outlier_action=str(outlier_action).split()[0],
-                            outlier_z=float(outlier_z),
-                            outlier_k=float(outlier_k),
-                            outlier_p_low=float(outlier_p_low),
-                            outlier_p_high=float(outlier_p_high),
-                            outlier_hampel_window=int(outlier_hampel_window),
-                            outlier_jump_thr=(None if float(outlier_jump_thr) == 0.0 else float(outlier_jump_thr)),
-                            outlier_local_median_window=int(outlier_local_median_window),
-                            log_transform=log_transform,
-                            remove_ar1=bool(remove_ar1),
-                            remove_seasonality=bool(remove_seasonality),
-                            season_period=(None if int(season_period) == 0 else int(season_period)),
-                            qc_enabled=bool(qc_enabled),
-                            feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
-                            feature_sampling=str(feature_sampling_val),
-                            h5_spatial_bin=int(h5_spatial_bin),
-                            spatial_grid_size=int(spatial_grid_size),
-                            spatial_grid_method=str(spatial_grid_method),
-                            lazy_spatial_bin=bool(lazy_spatial_bin),
-                            time_chunk=int(time_chunk),
-                            time_stride=(int(time_stride) if int(time_stride) > 1 else None),
-                            spatial_bin_size=int(spatial_bin_size),
-                            spatial_bin_method=str(spatial_bin_method),
-                        )
-                        window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
-                        stride_scan = None if int(window_stride_scan) == 0 else int(window_stride_scan)
-                        stride_main = None if int(window_stride_main) == 0 else int(window_stride_main)
-                        run_window_stride = stride_scan if stride_scan is not None else stride_main
-                        method_options = None
-                        if method_options_text.strip():
-                            try:
-                                method_options = json.loads(method_options_text)
-                                if not isinstance(method_options, dict):
-                                    method_options = None
-                            except Exception:
-                                method_options = None
-                        w_grid = list(range(int(window_min), int(window_max) + 1, max(1, int(window_step))))
-                        tool.run_selected_methods(
-                            selected_methods,
-                            max_lag=int(max_lag),
-                            lag_selection=lag_selection,
-                            lag=int(lag),
-                            control_strategy=(
-                                "none"
-                                if control_strategy == "нет"
-                                else (
-                                    "global_mean"
-                                    if control_strategy == "глобальный сигнал"
-                                    else ("global_mean_trend_pca" if "PCA" in control_strategy else "global_mean_trend")
-                                )
-                            ),
-                            control_pca_k=int(control_pca_k or 0),
-                            window_sizes=window_sizes_main,
-                            window_stride=run_window_stride,
-                            window_policy=window_policy,
-                            window_cube_level=window_cube_level,
-                            window_cube_eval_limit=int(window_cube_eval_limit),
-                            method_options=method_options,
-                            dimred_enabled=bool(dimred_enabled),
-                            dimred_method=str(dimred_method).split()[0],
-                            dimred_target=int(dimred_target),
-                            dimred_target_var=(float(dimred_target_var) if float(dimred_target_var) > 0 else None),
-                            dimred_priority=str(dimred_priority),
-                            dimred_pca_solver=str(dimred_pca_solver),
-                            scan_window_pos=(bool(scan_window_pos) if include_scans else False),
-                            scan_window_size=(bool(scan_window_size) if include_scans else False),
-                            scan_lag=(bool(scan_lag) if include_scans else False),
-                            scan_cube=(bool(scan_cube) if include_scans else False),
-                            window_sizes_grid=w_grid,
-                            window_min=int(window_min),
-                            window_max=int(window_max),
-                            window_step=int(window_step),
-                            window_size=int(window_size_default),
-                            window_start_min=int(window_start_min),
-                            window_start_max=int(window_start_max),
-                            window_max_windows=int(window_max_windows),
-                            lag_min=int(lag_min),
-                            lag_max=int(lag_max),
-                            lag_step=int(lag_step),
-                            cube_combo_limit=int(cube_combo_limit),
-                            cube_eval_limit=int(cube_eval_limit),
-                            cube_matrix_mode=str(cube_matrix_mode),
-                            cube_matrix_limit=int(cube_matrix_limit),
-                            cube_gallery_mode=str(cube_gallery_mode),
-                            cube_gallery_k=int(cube_gallery_k),
-                            cube_gallery_limit=int(cube_gallery_limit),
-                        )
-                        if calc_topology:
-                            try:
-                                tool.calculate_graph_metrics(threshold=float(graph_threshold))
-                            except Exception as exc:
-                                row["error"] = f"graph_metrics: {exc}"
-                        series_path = run_dir / f"{stem}_series.xlsx"
-                        if bool(save_series_bundle):
-                            try:
-                                tool.export_series_bundle(str(series_path))
-                            except Exception as exc:
-                                row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
-                        excel_path = run_dir / f"{stem}_full.xlsx"
-                        html_path = run_dir / f"{stem}_report.html"
-                        if output_mode in {"excel", "both"}:
-                            tool.export_big_excel(str(excel_path), threshold=threshold, p_value_alpha=alpha)
-                            row["excel_path"] = str(excel_path)
-                        if output_mode in {"html", "both"}:
-                            tool.export_html_report(
-                                str(html_path),
-                                graph_threshold=threshold,
-                                p_alpha=alpha,
-                                include_diagnostics=include_diagnostics,
-                                include_scans=include_scans,
-                                include_matrix_tables=include_matrix_tables,
-                                include_fft_plots=include_fft_plots,
-                                harmonic_top_k=int(harmonic_top_k),
-                                include_series_files=True,
-                            )
-                            row["html_path"] = str(html_path)
-                        if series_path.exists():
-                            row["series_path"] = str(series_path)
+                        prev = json.loads(status_json.read_text(encoding="utf-8"))
+                        prev_status = str(prev.get("status", "")).lower()
+                        if prev_status in {"ok", "partial", "skipped"}:
+                            row = {
+                                "index": i,
+                                "input_file": str(p),
+                                "relative_parent": str(rel_parent),
+                                "run_dir": str(run_dir),
+                                "status": "skipped",
+                                "excel_path": prev.get("excel_path", ""),
+                                "html_path": prev.get("html_path", ""),
+                                "series_path": prev.get("series_path", ""),
+                                "status_json": str(status_json),
+                                "error": "",
+                            }
+                            manifest_rows.append(row)
+                            _append_text(batch_log, f"[SKIP ] {p}")
+                            prog.progress(int(100 * i / max(1, len(files))))
+                            continue
+                    except Exception:
+                        pass
+
+                run_dir.mkdir(parents=True, exist_ok=True)
+                row = {
+                    "index": i,
+                    "input_file": str(p),
+                    "relative_parent": str(rel_parent),
+                    "run_dir": str(run_dir),
+                    "status": "error",
+                    "excel_path": "",
+                    "html_path": "",
+                    "series_path": "",
+                    "status_json": str(status_json),
+                    "error": "",
+                }
+                tool = None
+                try:
+                    cfg = engine.AnalysisConfig(
+                        max_lag=int(max_lag),
+                        p_value_alpha=float(alpha),
+                        graph_threshold=float(threshold),
+                        enable_experimental=bool(enable_experimental),
+                        auto_difference=bool(check_stat),
+                        pvalue_correction=str(pvalue_correction),
+                        spatial_bin_size=int(spatial_bin_size),
+                        spatial_bin_method=str(spatial_bin_method),
+                        spatial_grid_size=int(spatial_grid_size),
+                        spatial_grid_method=str(spatial_grid_method),
+                        lazy_spatial_bin=bool(lazy_spatial_bin),
+                        time_chunk=int(time_chunk),
+                    )
+                    tool = engine.BigMasterTool(config=cfg)
+                    tool.load_data_excel(
+                        str(src_path),
+                        preprocess=bool(preprocess),
+                        fill_missing=bool(fill_missing),
+                        normalize=bool(normalize),
+                        normalize_mode=str(normalize_mode),
+                        rank_ties=str(rank_ties),
+                        remove_outliers=bool(remove_outliers),
+                        outlier_rule=str(outlier_rule),
+                        outlier_action=str(outlier_action).split()[0],
+                        outlier_z=float(outlier_z),
+                        outlier_k=float(outlier_k),
+                        outlier_p_low=float(outlier_p_low),
+                        outlier_p_high=float(outlier_p_high),
+                        outlier_hampel_window=int(outlier_hampel_window),
+                        outlier_jump_thr=(None if float(outlier_jump_thr) == 0.0 else float(outlier_jump_thr)),
+                        outlier_local_median_window=int(outlier_local_median_window),
+                        check_stationarity=bool(check_stat),
+                        log_transform=bool(log_transform),
+                        remove_ar1=bool(remove_ar1),
+                        remove_ar_order=int(remove_ar_order),
+                        ar_diagnostics=bool(ar_diagnostics),
+                        remove_seasonality=bool(remove_seasonality),
+                        season_period=(None if int(season_period) == 0 else int(season_period)),
+                        qc_enabled=bool(qc_enabled),
+                        feature_limit=int(feature_limit),
+                        feature_sampling=str(feature_sampling_val),
+                        spatial_grid_size=int(spatial_grid_size),
+                        spatial_grid_method=str(spatial_grid_method),
+                        lazy_spatial_bin=bool(lazy_spatial_bin),
+                        time_chunk=int(time_chunk),
+                        time_stride=int(time_stride),
+                        h5_spatial_bin=int(h5_spatial_bin),
+                    )
+
+                    window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
+                    run_window_stride = int(window_stride_main) if int(window_stride_main) > 0 else 0
+                    method_options = None
+                    if method_options_text.strip():
                         try:
-                            tool.export_connectivity_bundle(
-                                str(run_dir),
-                                name_prefix=stem,
-                                include_scan_matrices=bool(include_scans),
+                            method_options = json.loads(method_options_text)
+                        except Exception:
+                            method_options = None
+                    w_grid = list(range(int(window_min), int(window_max) + 1, max(1, int(window_step))))
+
+                    tool.run_selected_methods(
+                        selected_methods,
+                        max_lag=int(max_lag),
+                        lag_selection=lag_selection,
+                        lag=int(lag),
+                        control_strategy=(
+                            "none"
+                            if control_strategy == "нет"
+                            else (
+                                "global_mean"
+                                if control_strategy == "глобальный сигнал"
+                                else ("global_mean_trend_pca" if "PCA" in control_strategy else "global_mean_trend")
                             )
+                        ),
+                        control_pca_k=int(control_pca_k or 0),
+                        window_sizes=window_sizes_main,
+                        window_stride=run_window_stride,
+                        window_policy=window_policy,
+                        window_cube_level=window_cube_level,
+                        window_cube_eval_limit=int(window_cube_eval_limit),
+                        method_options=method_options,
+                        dimred_enabled=bool(dimred_enabled),
+                        dimred_method=str(dimred_method).split()[0],
+                        dimred_target=int(dimred_target),
+                        dimred_target_var=(float(dimred_target_var) if float(dimred_target_var) > 0 else None),
+                        dimred_priority=str(dimred_priority),
+                        dimred_pca_solver=str(dimred_pca_solver),
+                        scan_window_pos=(bool(scan_window_pos) if include_scans else False),
+                        scan_window_size=(bool(scan_window_size) if include_scans else False),
+                        scan_lag=(bool(scan_lag) if include_scans else False),
+                        scan_cube=(bool(scan_cube) if include_scans else False),
+                        window_sizes_grid=w_grid,
+                        window_min=int(window_min),
+                        window_max=int(window_max),
+                        window_step=int(window_step),
+                        window_size=int(window_size_default),
+                        window_start_min=int(window_start_min),
+                        window_start_max=int(window_start_max),
+                        window_max_windows=int(window_max_windows),
+                        lag_min=int(lag_min),
+                        lag_max=int(lag_max),
+                        lag_step=int(lag_step),
+                        cube_combo_limit=int(cube_combo_limit),
+                        cube_eval_limit=int(cube_eval_limit),
+                        cube_matrix_mode=str(cube_matrix_mode),
+                        cube_matrix_limit=int(cube_matrix_limit),
+                        cube_gallery_mode=str(cube_gallery_mode),
+                        cube_gallery_k=int(cube_gallery_k),
+                        cube_gallery_limit=int(cube_gallery_limit),
+                    )
+
+                    if calc_topology:
+                        try:
+                            tool.calculate_graph_metrics(threshold=float(graph_threshold))
                         except Exception as exc:
-                            row["error"] = (row["error"] + " | " if row["error"] else "") + f"bundle: {exc}"
-                        row["status"] = "ok" if not row["error"] else "partial"
+                            row["error"] = f"graph_metrics: {exc}"
+
+                    series_path = run_dir / f"{safe_stem}_series.xlsx"
+                    if bool(save_series_bundle):
+                        try:
+                            tool.export_series_bundle(str(series_path))
+                        except Exception as exc:
+                            row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
+
+                    excel_path = run_dir / f"{safe_stem}_full.xlsx"
+                    html_path = run_dir / f"{safe_stem}_report.html"
+                    if output_mode in {"excel", "both"}:
+                        tool.export_big_excel(
+                            str(excel_path),
+                            threshold=threshold,
+                            p_value_alpha=alpha,
+                            include_ar_diagnostics=True,
+                        )
+                        row["excel_path"] = str(excel_path)
+                    if output_mode in {"html", "both"}:
+                        tool.export_html_report(
+                            str(html_path),
+                            graph_threshold=threshold,
+                            p_alpha=alpha,
+                            include_diagnostics=include_diagnostics,
+                            include_scans=include_scans,
+                            include_ar_diagnostics=True,
+                            include_matrix_tables=include_matrix_tables,
+                            include_fft_plots=include_fft_plots,
+                            harmonic_top_k=int(harmonic_top_k),
+                            include_series_files=True,
+                        )
+                        row["html_path"] = str(html_path)
+                    if series_path.exists():
+                        row["series_path"] = str(series_path)
+                    try:
+                        tool.export_connectivity_bundle(
+                            str(run_dir),
+                            name_prefix=safe_stem,
+                            include_scan_matrices=bool(include_scans),
+                        )
                     except Exception as exc:
-                        row["status"] = "error"
-                        row["error"] = str(exc)
+                        row["error"] = (row["error"] + " | " if row["error"] else "") + f"bundle: {exc}"
+
+                    row["status"] = "ok" if not row["error"] else "partial"
+                    _append_text(batch_log, f"[OK   ] {p} | status={row['status']}")
+                except Exception as exc:
+                    row["status"] = "error"
+                    row["error"] = str(exc)
+                    _append_text(batch_log, f"[ERROR] {p} | {exc}")
+                    _append_text(batch_log, traceback.format_exc())
+                finally:
+                    _write_json(status_json, row)
                     manifest_rows.append(row)
-                    # Освобождаем память между файлами: BigMasterTool может удерживать
-                    # гигабайты матриц (results, data_raw, data_normalized).
                     try:
                         del tool
                     except Exception:
                         pass
                     gc.collect()
-                    prog.progress(int(100 * i / max(1, len(uploaded_files))))
+                    prog.progress(int(100 * i / max(1, len(files))))
 
-            manifest_path = batch_root / "batch_manifest.csv"
             manifest_df = pd.DataFrame(manifest_rows)
             manifest_df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
-            zip_path = _zip_tree(batch_root, batch_root.with_suffix(".zip"))
-            st.success("Пакетный расчёт завершён")
+            with manifest_jsonl.open("w", encoding="utf-8") as fh:
+                for row in manifest_rows:
+                    fh.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
+
+            _append_text(batch_log, f"[DONE ] {datetime.now().isoformat()} | root={batch_root}")
+            st.success("Пакетный потоковый расчёт завершён")
             st.code(str(batch_root))
             st.dataframe(manifest_df, use_container_width=True)
             st.download_button("Скачать manifest.csv", manifest_path.read_bytes(), manifest_path.name)
-            st.download_button("Скачать ZIP результатов", zip_path.read_bytes(), zip_path.name)
+            if batch_root.exists():
+                zip_path = _zip_tree(batch_root, batch_root.with_suffix(".zip"))
+                st.download_button("Скачать ZIP результатов", zip_path.read_bytes(), zip_path.name)
+            return
         return
 
     if st.button("Запустить анализ", type="primary"):
@@ -910,6 +1240,7 @@ def main() -> None:
         # Готовим run-dir
         stem = (Path(uploaded_file.name).stem if uploaded_file else synth_name) or "run"
         run_dir = _make_run_dir(stem)
+        _write_json(run_dir / "run_config.json", run_plan)
 
         # Сохраняем входные данные (или синтетические)
         input_path: Path
@@ -999,6 +1330,8 @@ def main() -> None:
                     outlier_local_median_window=int(outlier_local_median_window),
                     log_transform=log_transform,
                     remove_ar1=bool(remove_ar1),
+                    remove_ar_order=int(remove_ar_order),
+                    ar_diagnostics=bool(ar_diagnostics),
                     remove_seasonality=bool(remove_seasonality),
                     season_period=(None if int(season_period) == 0 else int(season_period)),
                     qc_enabled=bool(qc_enabled),
@@ -1009,7 +1342,7 @@ def main() -> None:
                     spatial_grid_method=str(spatial_grid_method),
                     lazy_spatial_bin=bool(lazy_spatial_bin),
                     time_chunk=int(time_chunk),
-                    time_stride=(int(time_stride) if int(time_stride) > 1 else None),
+                    time_stride=int(time_stride),
                     spatial_bin_size=int(spatial_bin_size),
                     spatial_bin_method=str(spatial_bin_method),
                 )
@@ -1123,7 +1456,12 @@ def main() -> None:
                 html_path = run_dir / f"{stem}_report.html"
 
                 if output_mode in {"excel", "both"}:
-                    tool.export_big_excel(str(excel_path), threshold=threshold, p_value_alpha=alpha)
+                    tool.export_big_excel(
+                            str(excel_path),
+                            threshold=threshold,
+                            p_value_alpha=alpha,
+                            include_ar_diagnostics=True,
+                        )
 
                 if output_mode in {"html", "both"}:
                     tool.export_html_report(
@@ -1131,6 +1469,7 @@ def main() -> None:
                         graph_threshold=threshold,
                         p_alpha=alpha,
                         include_diagnostics=include_diagnostics,
+                        include_ar_diagnostics=True,
                         include_scans=include_scans,
                         include_matrix_tables=include_matrix_tables,
                         include_fft_plots=include_fft_plots,
@@ -1163,6 +1502,16 @@ def main() -> None:
                 with c3:
                     if series_path.exists():
                         st.download_button("Скачать ряды (xlsx)", series_path.read_bytes(), series_path.name)
+
+                status_payload = {
+                    "input_file": str(input_path),
+                    "run_dir": str(run_dir),
+                    "status": "ok",
+                    "excel_path": str(excel_path) if excel_path.exists() else "",
+                    "html_path": str(html_path) if html_path.exists() else "",
+                    "series_path": str(series_path) if series_path.exists() else "",
+                }
+                _write_json(run_dir / "status.json", status_payload)
 
                 # Ряды раскрываются только по клику
                 with st.expander("Исходные ряды (preview)", expanded=False):
@@ -1213,8 +1562,6 @@ def main() -> None:
 
             except Exception as e:
                 st.error(f"Ошибка выполнения: {e}")
-                import traceback
-
                 st.text(traceback.format_exc())
 
 
