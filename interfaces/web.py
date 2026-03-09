@@ -266,9 +266,18 @@ def main() -> None:
     synth_name = "synthetic"
 
     if source.startswith("Файл"):
-        uploaded_file = st.file_uploader("Выберите файл", type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"])
+        uploaded_file = st.file_uploader(
+            "Выберите файл",
+            type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
+            max_upload_size=1024,  # Дублируем лимит из .streamlit/config.toml для явного поведения UI.
+        )
     elif source.startswith("Пакет"):
-        uploaded_files = st.file_uploader("Выберите несколько файлов", type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"], accept_multiple_files=True) or []
+        uploaded_files = st.file_uploader(
+            "Выберите несколько файлов",
+            type=["csv", "xlsx", "xls", "mat", "parquet", "h5", "hdf5"],
+            accept_multiple_files=True,
+            max_upload_size=1024,
+        ) or []
         st.caption("Файлы будут обработаны по одному. Для каждого входа создаётся отдельная папка результата и общий ZIP.")
     elif source.startswith("Синтетика (формулы)"):
         with st.expander("Синтетика: формулы X/Y/Z", expanded=True):
@@ -435,7 +444,7 @@ def main() -> None:
                 "Bin size (channels per bin)",
                 min_value=1,
                 max_value=500,
-                value=1,
+                value=8,
                 step=1,
             ))
             spatial_bin_method = st.selectbox(
@@ -479,8 +488,9 @@ def main() -> None:
                 "Grid size (voxels per side)",
                 min_value=3,
                 max_value=25,
-                value=10,
-                help="Размер стороны куба. 10 = хороший баланс разрешения и скорости.",
+                value=12,
+                help="Размер стороны куба. 12 = более безопасный старт для больших 4D HDF5; при необходимости потом можно уменьшить до 10.",
+                # Более консервативный дефолт снижает риск OOM на крупных 4D данных.
             ))
             # h5_spatial_bin наследует spatial_grid_size для единообразия
             h5_spatial_bin = spatial_grid_size
@@ -498,7 +508,7 @@ def main() -> None:
                 "Time chunk size",
                 min_value=10,
                 max_value=200,
-                value=50,
+                value=25,
             ))
             time_stride = int(st.number_input(
                 "Шаг по времени (1=все точки, 2=каждый 2-й, ...)",
@@ -539,10 +549,10 @@ def main() -> None:
             st.markdown("**Дополнительные настройки**")
             output_mode = st.selectbox("Режим вывода", ["both", "html", "excel"], index=0)
             include_diagnostics = st.checkbox("HTML: показывать диагностику", value=True)
-            include_scans = st.toggle("Включить сканирование", value=True)
+            include_scans = st.toggle("Включить сканирование", value=False)
             include_matrix_tables = st.checkbox("HTML: показывать таблицу матрицы (текстом)", value=False)
             include_fft_plots = st.checkbox("HTML: FFT-графики", value=True)
-            harmonic_top_k = st.number_input("Гармоники: top_k", min_value=1, max_value=20, value=5)
+            harmonic_top_k = st.number_input("Гармоники: top_k", min_value=1, max_value=20, value=3)
             save_series_bundle = st.checkbox(
                 "Сохранять пакет рядов (raw+clean+QC+coords)",
                 value=True,
@@ -553,7 +563,7 @@ def main() -> None:
             control_strategy = st.selectbox(
                 "Что вычесть перед *_partial",
                 ["нет", "глобальный сигнал", "глобальный + тренд", "глобальный + тренд + PCA"],
-                index=2,
+                index=1,
                 help="Partial считаем на остатках после регрессии на выбранные компоненты контроля.",
             )
             control_pca_k = 0
@@ -575,7 +585,7 @@ def main() -> None:
                     max_lag = st.slider("max_lag (для сканов/ограничений)", 1, 200, 12)
                 else:
                     lag_selection = "optimize"
-                    max_lag = st.slider("Максимальный лаг для поиска", 1, 20, 5, help="Проверим лаги от 1 до N и выберем лучший")
+                    max_lag = st.slider("Максимальный лаг для поиска", 1, 20, 3, help="Проверим лаги от 1 до N и выберем лучший")
                     lag = 1
 
                 use_main_windows = st.checkbox("Использовать окна в основном расчёте", value=False)
@@ -590,7 +600,7 @@ def main() -> None:
                     "Порог значимости графа",
                     0.0,
                     1.0,
-                    0.25,
+                    0.30,
                     0.05,
                     help="Связи слабее этого значения будут считаться шумом",
                 )
@@ -601,15 +611,15 @@ def main() -> None:
             st.info("Сканирование строит графики того, как меняется связь в зависимости от параметров. Это долго, но полезно.")
             if include_scans:
                 st.markdown("**1. Скользящее окно (динамика во времени)**")
-                win_range = st.slider("Диапазон размеров окна", 32, 512, (64, 192), step=32)
+                win_range = st.slider("Диапазон размеров окна", 32, 512, (96, 192), step=32)
                 window_min, window_max = win_range
-                window_step = st.number_input("window_step", min_value=1, max_value=1000000, value=64, step=1)
+                window_step = st.number_input("window_step", min_value=1, max_value=1000000, value=96, step=1)
                 window_size_default = st.number_input("window_size (для scan_window_pos)", min_value=2, max_value=1000000, value=128, step=1)
 
                 st.markdown("**2. Скан по лагам**")
                 scan_lag = st.checkbox("Проверить влияние лага (кривая качества)", value=True)
                 lag_min = st.number_input("lag_min", min_value=1, max_value=2000, value=1, step=1)
-                lag_max = st.number_input("lag_max", min_value=1, max_value=2000, value=min(3, int(max_lag)), step=1)
+                lag_max = st.number_input("lag_max", min_value=1, max_value=2000, value=min(2, int(max_lag)), step=1)
                 lag_step = st.number_input("lag_step", min_value=1, max_value=2000, value=1, step=1)
 
                 st.markdown("**3. 4D Куб (Window × Lag × Time)**")
