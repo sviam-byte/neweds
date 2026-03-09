@@ -273,6 +273,16 @@ class AnalysisConfig:
     # Единый master-seed для воспроизводимых стохастических шагов
     master_seed: int = 12345
 
+    # Пространственная агрегация каналов после загрузки (time×channels -> time×bins).
+    spatial_bin_size: int = 1
+    spatial_bin_method: str = "mean"
+
+    # Пространственная агрегация 4D fMRI (X,Y,Z,T) на этапе HDF5-загрузки.
+    spatial_grid_size: int = 0
+    spatial_grid_method: str = "mean"
+    lazy_spatial_bin: bool = False
+    time_chunk: int = 50
+
 def is_pvalue_method(variant: str) -> bool:
     """Проверяет, является ли метод p-value методом."""
     return variant.lower() in PVAL_METHODS

@@ -149,7 +149,7 @@ from ..visualization import plots
 plt = plots.plt
 
 from .data_loader import load_or_generate, preprocess_timeseries
-from .preprocessing import configure_warnings
+from .preprocessing import configure_warnings, spatial_bin_channels
 
 
 # Метрики
@@ -1626,11 +1626,22 @@ class BigMasterTool:
         """Загружает данные, чистит их и опционально устраняет нестационарность."""
         self._stage("Загрузка данных", 0.0, file=str(filepath))
         qc_enabled = bool(kwargs.pop("qc_enabled", True))
+        # Подмешиваем дефолты из AnalysisConfig для HDF5/spatial-параметров,
+        # если они не переданы напрямую в kwargs.
+        for _k in ("spatial_bin_size", "spatial_bin_method", "spatial_grid_size", "spatial_grid_method", "lazy_spatial_bin", "time_chunk"):
+            if _k not in kwargs:
+                try:
+                    if hasattr(self.config, _k):
+                        kwargs[_k] = getattr(self.config, _k)
+                except Exception:
+                    pass
+
         # 1) Сырой numeric-слепок без предобработки для честного before/after в отчёте.
         # Пробрасываем параметры больших данных в RAW-загрузку,
         # чтобы HDF5 4D файлы не пытались загрузить все 700K+ вокселей.
         _big_data_keys = (
             "feature_limit", "feature_sampling", "feature_seed", "h5_spatial_bin",
+            "spatial_grid_size", "spatial_grid_method", "lazy_spatial_bin", "time_chunk",
             "time_start", "time_end", "time_stride",
             "dtype", "auto_float32",
         )
@@ -1656,6 +1667,27 @@ class BigMasterTool:
             self.data, self.preprocessing_report = df_out
         else:
             self.data, self.preprocessing_report = df_out, None
+        # Опциональная пространственная агрегация каналов (channel binning).
+        # Выполняем после базовой загрузки/очистки, но до последующих этапов
+        # (QC, автодифф, расчёты), чтобы снизить размерность на ранней стадии.
+        spatial_bin_size = int(kwargs.get("spatial_bin_size", getattr(self.config, "spatial_bin_size", 1)) or 1)
+        if spatial_bin_size > 1:
+            spatial_bin_method = str(kwargs.get("spatial_bin_method", getattr(self.config, "spatial_bin_method", "mean")))
+            self.data, spatial_desc = spatial_bin_channels(
+                self.data,
+                bin_size=spatial_bin_size,
+                method=spatial_bin_method,
+            )
+            try:
+                if self.preprocessing_report is not None:
+                    self.preprocessing_report.add(spatial_desc)
+            except Exception:
+                pass
+            try:
+                getattr(self, "log", RunLog()).add(spatial_desc)
+            except Exception:
+                logging.info(spatial_desc)
+
         self.data_preprocessed = self.data.copy()
 
         self._stage("Данные загружены", 0.35, shape=list(self.data.shape))

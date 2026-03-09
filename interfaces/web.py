@@ -416,6 +416,20 @@ def main() -> None:
                 if str(outlier_action).startswith("mask")
                 else ("clip" if str(outlier_action).startswith("clip") else ("median" if str(outlier_action).startswith("median") else "local_median"))
             )
+            # Пространственная агрегация каналов уменьшает размерность до запуска метрик.
+            st.markdown("### Spatial aggregation (channel binning)")
+            spatial_bin_size = int(st.number_input(
+                "Bin size (channels per bin)",
+                min_value=1,
+                max_value=500,
+                value=1,
+                step=1,
+            ))
+            spatial_bin_method = st.selectbox(
+                "Aggregation method",
+                ["mean", "median", "sum"],
+            )
+
             log_transform = st.checkbox("Лог-преобразование (только >0)", value=False)
             remove_ar1 = st.checkbox("Убрать AR(1) (прибл. prewhitening)", value=False)
             remove_seasonality = st.checkbox("Убрать сезонность (STL)", value=False)
@@ -443,6 +457,31 @@ def main() -> None:
             feature_sampling_val = _fs_map.get(feature_sampling.split()[0], "variance")
             # Явно задаём размер spatial-блока, чтобы режим был детерминированным
             # и воспроизводимым в межсубъектных сравнениях.
+            st.markdown("## Spatial aggregation")
+            spatial_grid_size = int(st.slider(
+                "Spatial bin size (voxels)",
+                min_value=0,
+                max_value=20,
+                value=0,
+                help="0 = disabled",
+            ))
+            spatial_grid_method = st.selectbox(
+                "Aggregation method (4D grid)",
+                ["mean", "median", "sum"],
+            )
+
+            st.markdown("### Lazy HDF5 processing")
+            lazy_spatial_bin = st.checkbox(
+                "Enable lazy spatial binning (recommended for fMRI)",
+                value=True,
+            )
+            time_chunk = int(st.slider(
+                "Time chunk size",
+                min_value=10,
+                max_value=200,
+                value=50,
+            ))
+
             h5_spatial_bin = int(st.number_input(
                 "Размер spatial-блока для H5",
                 min_value=2,
@@ -633,6 +672,12 @@ def main() -> None:
             "remove_seasonality": bool(remove_seasonality),
             "season_period": (None if int(season_period)==0 else int(season_period)),
             "qc_enabled": bool(qc_enabled),
+            "spatial_bin_size": int(spatial_bin_size),
+            "spatial_bin_method": str(spatial_bin_method),
+            "spatial_grid_size": int(spatial_grid_size),
+            "spatial_grid_method": str(spatial_grid_method),
+            "lazy_spatial_bin": bool(lazy_spatial_bin),
+            "time_chunk": int(time_chunk),
         })
 
     if source.startswith("Пакет"):
@@ -669,6 +714,12 @@ def main() -> None:
                             enable_experimental=bool(enable_experimental),
                             auto_difference=bool(check_stat),
                             pvalue_correction=str(pvalue_correction),
+                            spatial_bin_size=int(spatial_bin_size),
+                            spatial_bin_method=str(spatial_bin_method),
+                            spatial_grid_size=int(spatial_grid_size),
+                            spatial_grid_method=str(spatial_grid_method),
+                            lazy_spatial_bin=bool(lazy_spatial_bin),
+                            time_chunk=int(time_chunk),
                         )
                         tool = engine.BigMasterTool(config=cfg)
                         tool.load_data_excel(
@@ -696,7 +747,13 @@ def main() -> None:
                             feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
                             feature_sampling=str(feature_sampling_val),
                             h5_spatial_bin=int(h5_spatial_bin),
+                            spatial_grid_size=int(spatial_grid_size),
+                            spatial_grid_method=str(spatial_grid_method),
+                            lazy_spatial_bin=bool(lazy_spatial_bin),
+                            time_chunk=int(time_chunk),
                             time_stride=(int(time_stride) if int(time_stride) > 1 else None),
+                            spatial_bin_size=int(spatial_bin_size),
+                            spatial_bin_method=str(spatial_bin_method),
                         )
                         window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
                         stride_scan = None if int(window_stride_scan) == 0 else int(window_stride_scan)
@@ -885,7 +942,21 @@ def main() -> None:
             except Exception:
                 pass
 
-        tool = engine.BigMasterTool(stage_callback=_stage_cb)
+        cfg = engine.AnalysisConfig(
+            max_lag=int(max_lag),
+            p_value_alpha=float(alpha),
+            graph_threshold=float(threshold),
+            enable_experimental=bool(enable_experimental),
+            auto_difference=bool(check_stat),
+            pvalue_correction=str(pvalue_correction),
+            spatial_bin_size=int(spatial_bin_size),
+            spatial_bin_method=str(spatial_bin_method),
+            spatial_grid_size=int(spatial_grid_size),
+            spatial_grid_method=str(spatial_grid_method),
+            lazy_spatial_bin=bool(lazy_spatial_bin),
+            time_chunk=int(time_chunk),
+        )
+        tool = engine.BigMasterTool(config=cfg, stage_callback=_stage_cb)
 
         with st.spinner("Загрузка и расчёт..."):
             try:
@@ -914,7 +985,13 @@ def main() -> None:
                     feature_limit=(int(feature_limit) if int(feature_limit) > 0 else None),
                     feature_sampling=str(feature_sampling_val),
                     h5_spatial_bin=int(h5_spatial_bin),
+                    spatial_grid_size=int(spatial_grid_size),
+                    spatial_grid_method=str(spatial_grid_method),
+                    lazy_spatial_bin=bool(lazy_spatial_bin),
+                    time_chunk=int(time_chunk),
                     time_stride=(int(time_stride) if int(time_stride) > 1 else None),
+                    spatial_bin_size=int(spatial_bin_size),
+                    spatial_bin_method=str(spatial_bin_method),
                 )
 
                 # Явное сообщение об истинной причине, если после импорта/предобработки

@@ -13,11 +13,13 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .preprocessing import additional_preprocessing
+from .preprocessing import additional_preprocessing, spatial_grid_bin_fmri
 from ..analysis import stats as analysis_stats
 import numpy as np
 from scipy import stats
 from scipy.io import loadmat
+
+from src.io.loaders import load_h5_spatial_binned_lazy
 
 try:
     import h5py as _h5py
@@ -633,6 +635,10 @@ def _load_h5_neuroimaging(
     feature_limit: int | None = None,
     feature_sampling: str = "spatial",
     h5_spatial_bin: int | None = None,
+    spatial_grid_size: int | None = None,
+    spatial_grid_method: str = "mean",
+    lazy_spatial_bin: bool = False,
+    time_chunk: int = 50,
     feature_seed: int = 13,
     time_start: int | None = None,
     time_end: int | None = None,
@@ -714,6 +720,42 @@ def _load_h5_neuroimaging(
 
         T = int(shape[T_axis])
 
+        # Ленивый путь: spatial-агрегация читается чанками по времени,
+        # чтобы не загружать весь 4D объём в память сразу.
+        feature_mode = str(feature_sampling or "spatial").strip().lower()
+        grid_size_eff = int(spatial_grid_size) if spatial_grid_size is not None else 0
+        if grid_size_eff <= 0:
+            grid_size_eff = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 0
+        spatial_mode = feature_mode in {"spatial", "spatial_bin", "bins", "auto", "deterministic"} or (grid_size_eff > 1)
+        if bool(lazy_spatial_bin) and spatial_mode and T_axis == 3:
+            bin_size = grid_size_eff if grid_size_eff > 1 else 5
+            df_lazy = load_h5_spatial_binned_lazy(
+                filepath,
+                dataset=str(ds_name),
+                grid_size=bin_size,
+                method=str(spatial_grid_method or "mean"),
+                time_chunk=int(time_chunk or 50),
+            )
+            # Локальный временной срез применяем уже к агрегированным рядам.
+            t0 = int(time_start) if time_start is not None else 0
+            t1 = int(time_end) if time_end is not None else int(df_lazy.shape[0])
+            ts = int(time_stride) if time_stride is not None and int(time_stride) > 0 else 1
+            t0 = max(0, min(t0, int(df_lazy.shape[0])))
+            t1 = max(t0, min(t1, int(df_lazy.shape[0])))
+            df_lazy = df_lazy.iloc[t0:t1:ts, :].copy()
+            var_eps = max(1e-12, float(nonzero_threshold))
+            if not df_lazy.empty:
+                v = np.nanvar(df_lazy.to_numpy(dtype=np.float64, copy=False), axis=0)
+                keep = np.isfinite(v) & (v > float(var_eps))
+                if keep.any():
+                    df_lazy = df_lazy.loc[:, keep].copy()
+            df_lazy.attrs["original_shape"] = list(shape)
+            df_lazy.attrs["format"] = "spatial_bins"
+            df_lazy.attrs["source_kind"] = "h5_4d_spatial"
+            df_lazy.attrs["spatial_bin_size"] = int(bin_size)
+            df_lazy.attrs["feature_axis"] = "spatial_bin"
+            return df_lazy
+
         # Slicing по времени (до загрузки всего массива в память)
         t0 = int(time_start) if time_start is not None else 0
         t1 = int(time_end) if time_end is not None else T
@@ -742,19 +784,33 @@ def _load_h5_neuroimaging(
 
     var_eps = max(1e-12, float(nonzero_threshold))
     feature_mode = str(feature_sampling or "spatial").strip().lower()
-    spatial_mode = feature_mode in {"spatial", "spatial_bin", "bins", "auto", "deterministic"} or (
-        h5_spatial_bin is not None and int(h5_spatial_bin) > 1
-    )
+    # Совместимость: новый алиас spatial_grid_size/method для 4D fMRI биннинга.
+    grid_size_eff = int(spatial_grid_size) if spatial_grid_size is not None else 0
+    if grid_size_eff <= 0:
+        grid_size_eff = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 0
+
+    spatial_mode = feature_mode in {"spatial", "spatial_bin", "bins", "auto", "deterministic"} or (grid_size_eff > 1)
 
     if spatial_mode:
-        bin_size = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 5
-        df_h5 = h5_4d_to_spatial_bins(
+        # Используем общий helper из preprocessing, чтобы логика spatial-grid была
+        # одинаковой для H5 и потенциальных прямых вызовов из других модулей.
+        bin_size = grid_size_eff if grid_size_eff > 1 else 5
+        df_h5 = spatial_grid_bin_fmri(
             arr4d,
-            bin_size=bin_size,
-            eps=var_eps,
-            min_voxels_per_bin=1,
+            grid_size=bin_size,
+            method=str(spatial_grid_method or "mean"),
         )
+        # Отбрасываем почти-константные бины, чтобы защититься от пустых областей.
+        if not df_h5.empty:
+            v = np.nanvar(df_h5.to_numpy(dtype=np.float64, copy=False), axis=0)
+            keep = np.isfinite(v) & (v > float(var_eps))
+            if keep.any():
+                df_h5 = df_h5.loc[:, keep].copy()
         df_h5.attrs["original_shape"] = list(shape)
+        df_h5.attrs["format"] = "spatial_bins"
+        df_h5.attrs["source_kind"] = "h5_4d_spatial"
+        df_h5.attrs["spatial_bin_size"] = int(bin_size)
+        df_h5.attrs["feature_axis"] = "spatial_bin"
         del arr4d
         logging.info(
             "[HDF5] Spatial binning applied directly on 4D volume: %s -> %s (bin=%d)",
@@ -1739,6 +1795,10 @@ def load_or_generate(
     time_col: str = "auto",
     transpose: str = "auto",
     h5_spatial_bin: int | None = None,
+    spatial_grid_size: int | None = None,
+    spatial_grid_method: str = "mean",
+    lazy_spatial_bin: bool = False,
+    time_chunk: int = 50,
     # Параметры для больших данных и производительности
     dtype: str | None = None,
     # Если dtype=None, то для очень широких/больших таблиц автоматически
@@ -1814,7 +1874,7 @@ def load_or_generate(
 
             aggregated_path = None
             if h5_feature_sampling in {"spatial", "spatial_bin", "bins", "deterministic", "auto"}:
-                _bin_size = int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 5
+                _bin_size = int(spatial_grid_size) if spatial_grid_size is not None and int(spatial_grid_size) > 1 else (int(h5_spatial_bin) if h5_spatial_bin is not None and int(h5_spatial_bin) > 1 else 5)
                 aggregated_path = _build_aggregated_h5_path(
                     filepath,
                     output_dir=aggregated_h5_dir,
@@ -1832,6 +1892,10 @@ def load_or_generate(
                         feature_sampling=h5_feature_sampling,
                         feature_seed=feature_seed,
                         h5_spatial_bin=h5_spatial_bin,
+                        spatial_grid_size=spatial_grid_size,
+                        spatial_grid_method=spatial_grid_method,
+                        lazy_spatial_bin=lazy_spatial_bin,
+                        time_chunk=time_chunk,
                         time_start=time_start,
                         time_end=time_end,
                         time_stride=time_stride,
@@ -1856,6 +1920,10 @@ def load_or_generate(
                     feature_sampling=h5_feature_sampling,
                     feature_seed=feature_seed,
                     h5_spatial_bin=h5_spatial_bin,
+                    spatial_grid_size=spatial_grid_size,
+                    spatial_grid_method=spatial_grid_method,
+                    lazy_spatial_bin=lazy_spatial_bin,
+                    time_chunk=time_chunk,
                     time_start=time_start,
                     time_end=time_end,
                     time_stride=time_stride,

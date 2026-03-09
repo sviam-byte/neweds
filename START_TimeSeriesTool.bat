@@ -27,11 +27,12 @@ if exist requirements.txt (
 )
 
 echo.
-echo Запуск GUI...
+echo Запуск Web-интерфейса (Streamlit)...
 echo.
 
-python interfaces/gui.py
+start "" http://localhost:8501
+python -m streamlit run interfaces/web.py --server.address 127.0.0.1 --server.port 8501
 
 echo.
-echo GUI завершился.
+echo Streamlit завершился.
 pause
