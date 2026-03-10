@@ -886,6 +886,19 @@ def _load_h5_neuroimaging(
     logging.info("[HDF5] Output DataFrame: %s (%.1f MB)", df_h5.shape, df_h5.memory_usage(deep=True).sum() / (1024**2))
     return df_h5
 
+
+def _csv_probe_ncols(filepath: str, *, nrows: int = 2) -> int:
+    """Быстрый probe числа колонок CSV без полной загрузки.
+
+    Читает только ``nrows`` строк, чтобы определить ширину таблицы.
+    Возвращает 0 при ошибке.
+    """
+    try:
+        probe = pd.read_csv(filepath, header=None, nrows=nrows)
+        return int(probe.shape[1])
+    except Exception:
+        return 0
+
 def read_input_table(
     filepath: str,
     header: str = "auto",
@@ -938,6 +951,10 @@ def read_input_table(
         # pandas+pyarrow не поддерживает low_memory.
         if kw.get("engine") == "pyarrow":
             kw.pop("low_memory", None)
+        # Поддержка usecols для CSV: ограничение колонок на этапе чтения,
+        # чтобы избежать OOM на очень широких файлах (сотни тысяч вокселей).
+        if usecols != "auto" and usecols is not None:
+            kw["usecols"] = usecols
         df0 = pd.read_csv(fp, **kw)
     else:
         xl_usecols = usecols
@@ -2033,7 +2050,36 @@ def load_or_generate(
                     time_stride=time_stride,
                 )
         else:
-            raw = read_input_table(filepath, header=header, usecols=usecols, csv_engine=csv_engine)
+            # Защита от OOM на очень широких CSV (сотни тысяч колонок-вокселей):
+            # пробуем определить число колонок быстрым probe и, если их слишком
+            # много, ограничиваем usecols ДО полной загрузки — аналогично тому,
+            # как H5-путь применяет spatial binning / MAX_RAW_VOXELS_FOR_GUI.
+            _usecols_eff = usecols
+            _fp_low_csv = str(filepath).lower()
+            if _fp_low_csv.endswith(".csv") and _usecols_eff in {"auto", None}:
+                _csv_ncols = _csv_probe_ncols(str(filepath))
+                # Максимум колонок для безопасной загрузки CSV.
+                # feature_limit, если задан, имеет приоритет.
+                _csv_col_cap = MAX_RAW_VOXELS_FOR_GUI
+                if feature_limit is not None and int(feature_limit) > 0:
+                    _csv_col_cap = int(feature_limit)
+                if _csv_ncols > _csv_col_cap > 0:
+                    logging.warning(
+                        "[CSV] Файл содержит %d колонок (лимит=%d). "
+                        "Ограничиваем usecols при чтении для предотвращения OOM.",
+                        _csv_ncols,
+                        _csv_col_cap,
+                    )
+                    _mode = str(feature_sampling or "first").strip().lower()
+                    if _mode in {"random", "rand"}:
+                        _rng = np.random.default_rng(int(feature_seed))
+                        _pick = sorted(_rng.choice(_csv_ncols, size=_csv_col_cap, replace=False).tolist())
+                        _usecols_eff = _pick
+                    else:
+                        # "first" / default — первые N колонок
+                        _usecols_eff = list(range(_csv_col_cap))
+
+            raw = read_input_table(filepath, header=header, usecols=_usecols_eff, csv_engine=csv_engine)
 
             # Автопонижение типа: лучше осознанно перейти в float32,
             # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
