@@ -24,6 +24,37 @@ def test_read_input_table_without_header(tmp_path: Path) -> None:
     assert df.shape == (2, 3)
 
 
+def test_read_input_table_csv_usecols_limits_columns(tmp_path: Path) -> None:
+    """CSV reader should honor explicit usecols to avoid loading all columns."""
+    csv_path = tmp_path / "wide.csv"
+    csv_path.write_text("1,2,3,4\n5,6,7,8\n", encoding="utf-8")
+
+    df = read_input_table(str(csv_path), header="no", usecols=[0, 2])
+
+    assert df.shape == (2, 2)
+    assert list(df.columns) == ["c1", "c2"]
+
+
+def test_load_or_generate_csv_auto_cap_by_feature_limit(tmp_path: Path) -> None:
+    """Wide CSV should be capped before full read when feature_limit is configured."""
+    csv_path = tmp_path / "very_wide.csv"
+    csv_path.write_text("1,2,3,4,5,6\n7,8,9,10,11,12\n", encoding="utf-8")
+
+    df = data_loader.load_or_generate(
+        str(csv_path),
+        header="no",
+        time_col="none",
+        transpose="no",
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        feature_limit=3,
+    )
+
+    assert df.shape == (2, 3)
+
+
 def test_load_mat_numeric_matrix(tmp_path):
     """MAT with top-level numeric matrix should load via common loader path."""
     import numpy as np
