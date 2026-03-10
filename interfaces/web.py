@@ -1331,9 +1331,13 @@ def main() -> None:
                             row["error"] = f"graph_metrics: {exc}"
 
                     series_path = run_dir / f"{safe_stem}_series.xlsx"
+                    series_artifact_path = None
+
                     if bool(save_series_bundle):
                         try:
-                            tool.export_series_bundle(str(series_path))
+                            exported = tool.export_series_bundle(str(series_path))
+                            if exported:
+                                series_artifact_path = Path(exported)
                         except Exception as exc:
                             row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
 
@@ -1361,8 +1365,14 @@ def main() -> None:
                             include_series_files=True,
                         )
                         row["html_path"] = str(html_path)
-                    if series_path.exists():
-                        row["series_path"] = str(series_path)
+                    if series_artifact_path is None and series_path.exists():
+                        series_artifact_path = series_path
+
+                    row["series_path"] = (
+                        str(series_artifact_path)
+                        if series_artifact_path is not None and series_artifact_path.exists()
+                        else ""
+                    )
                     try:
                         tool.export_connectivity_bundle(
                             str(run_dir),
@@ -1627,11 +1637,16 @@ def main() -> None:
                         except Exception as e:
                             st.warning(f"Ошибка анализа графов: {e}")
 
-                # Сохраняем ряды отдельным файлом рядом с отчётами (если не выключено).
+                # Сохраняем ряды отдельным артефактом рядом с отчётами.
+                # Это может быть как .xlsx, так и директория с CSV.
                 series_path = run_dir / f"{stem}_series.xlsx"
+                series_artifact_path = None
+
                 if bool(save_series_bundle):
                     try:
-                        tool.export_series_bundle(str(series_path))
+                        exported = tool.export_series_bundle(str(series_path))
+                        if exported:
+                            series_artifact_path = Path(exported)
                     except Exception:
                         pass
 
@@ -1683,8 +1698,32 @@ def main() -> None:
                     if output_mode in {"html", "both"} and html_path.exists():
                         st.download_button("Скачать HTML", html_path.read_bytes(), html_path.name)
                 with c3:
-                    if series_path.exists():
-                        st.download_button("Скачать ряды (xlsx)", series_path.read_bytes(), series_path.name)
+                    if series_artifact_path is None and series_path.exists():
+                        series_artifact_path = series_path
+
+                    if series_artifact_path is not None and series_artifact_path.exists():
+                        if series_artifact_path.is_file():
+                            st.download_button(
+                                "Скачать ряды",
+                                series_artifact_path.read_bytes(),
+                                series_artifact_path.name,
+                            )
+                        elif series_artifact_path.is_dir():
+                            series_zip_path = _zip_tree(
+                                series_artifact_path,
+                                series_artifact_path.with_suffix(".zip"),
+                            )
+                            st.download_button(
+                                "Скачать ряды (ZIP)",
+                                series_zip_path.read_bytes(),
+                                series_zip_path.name,
+                            )
+
+                    if series_artifact_path is not None and series_artifact_path.exists():
+                        if series_artifact_path.is_file():
+                            st.caption(f"Ряды сохранены в файл: {series_artifact_path.name}")
+                        elif series_artifact_path.is_dir():
+                            st.caption(f"Ряды сохранены в папку: {series_artifact_path.name}")
 
                 status_payload = {
                     "input_file": str(input_path),
@@ -1692,7 +1731,11 @@ def main() -> None:
                     "status": "ok",
                     "excel_path": str(excel_path) if excel_path.exists() else "",
                     "html_path": str(html_path) if html_path.exists() else "",
-                    "series_path": str(series_path) if series_path.exists() else "",
+                    "series_path": (
+                        str(series_artifact_path)
+                        if series_artifact_path is not None and series_artifact_path.exists()
+                        else ""
+                    ),
                 }
                 _write_json(run_dir / "status.json", status_payload)
 
