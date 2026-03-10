@@ -1751,7 +1751,8 @@ class BigMasterTool:
         # чтобы HDF5 4D файлы не пытались загрузить все 700K+ вокселей.
         _big_data_keys = (
             "feature_limit", "feature_sampling", "feature_seed", "h5_spatial_bin",
-            "spatial_grid_size", "spatial_grid_method", "lazy_spatial_bin", "time_chunk",
+            "spatial_grid_size", "spatial_grid_method", "spatial_bin_range",
+            "lazy_spatial_bin", "time_chunk",
             "time_start", "time_end", "time_stride",
             "dtype", "auto_float32",
             "save_aggregated_h5", "aggregated_h5_dir", "reuse_existing_aggregated_h5",
