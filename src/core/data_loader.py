@@ -941,13 +941,38 @@ def read_input_table(
         df0 = pd.read_csv(fp, **kw)
     else:
         xl_usecols = usecols
+        excel_probe_single_col = False
+
         if usecols == "auto":
+            # Лёгкий probe первой колонки нужен для кейса «CSV в одной ячейке».
+            # Если это обычный XLS/XLSX с несколькими колонками, ниже перечитаем лист целиком.
             xl_usecols = [0]
+            excel_probe_single_col = True
+
         try:
             df0 = pd.read_excel(fp, header=None, usecols=xl_usecols)
         except Exception:
-            # Запасной вариант: читаем целиком
+            # Если чтение с выбором колонок не удалось, мягко падаем на полное чтение.
             df0 = pd.read_excel(fp, header=None)
+            excel_probe_single_col = False
+
+        if excel_probe_single_col:
+            probe_df = df0
+            split_probe = _maybe_split_single_column(probe_df)
+
+            # Если одиночная колонка распалась на несколько полей,
+            # это действительно «CSV в ячейке», полный reread не нужен.
+            # Иначе считаем, что это обычный Excel, и читаем весь лист.
+            probe_is_embedded_csv = (
+                split_probe.shape[1] > probe_df.shape[1]
+                or (probe_df.shape[1] == 1 and split_probe.shape[1] > 1)
+            )
+
+            if not probe_is_embedded_csv:
+                try:
+                    df0 = pd.read_excel(fp, header=None)
+                except Exception:
+                    df0 = probe_df
     df0 = _maybe_split_single_column(df0)
 
     if header not in {"auto", "yes", "no"}:
