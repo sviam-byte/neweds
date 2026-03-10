@@ -942,6 +942,14 @@ def read_input_table(
     else:
         xl_usecols = usecols
         excel_probe_single_col = False
+        excel_engine = None
+
+        # Явно выбираем движок по расширению, чтобы чтение Excel было стабильнее.
+        # openpyxl покрывает .xlsx/.xlsm, а xlrd нужен для legacy .xls.
+        if low.endswith(".xls"):
+            excel_engine = "xlrd"
+        elif low.endswith((".xlsx", ".xlsm")):
+            excel_engine = "openpyxl"
 
         if usecols == "auto":
             # Лёгкий probe первой колонки нужен для кейса «CSV в одной ячейке».
@@ -950,10 +958,16 @@ def read_input_table(
             excel_probe_single_col = True
 
         try:
-            df0 = pd.read_excel(fp, header=None, usecols=xl_usecols)
+            df0 = pd.read_excel(fp, header=None, usecols=xl_usecols, engine=excel_engine)
+        except ImportError as exc:
+            if low.endswith(".xls"):
+                raise ImportError(
+                    "Для чтения .xls нужен пакет xlrd. Установи: pip install xlrd>=2.0.1"
+                ) from exc
+            raise
         except Exception:
             # Если чтение с выбором колонок не удалось, мягко падаем на полное чтение.
-            df0 = pd.read_excel(fp, header=None)
+            df0 = pd.read_excel(fp, header=None, engine=excel_engine)
             excel_probe_single_col = False
 
         if excel_probe_single_col:
@@ -970,7 +984,7 @@ def read_input_table(
 
             if not probe_is_embedded_csv:
                 try:
-                    df0 = pd.read_excel(fp, header=None)
+                    df0 = pd.read_excel(fp, header=None, engine=excel_engine)
                 except Exception:
                     df0 = probe_df
     df0 = _maybe_split_single_column(df0)

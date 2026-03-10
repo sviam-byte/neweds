@@ -92,9 +92,9 @@ def _preset_payload(name: str) -> dict:
             "include_fft_plots": False, "save_series_bundle": True,
             "spatial_grid_size": 12, "spatial_grid_method": "mean", "lazy_spatial_bin": True,
             "time_chunk": 25, "time_stride": 2, "feature_limit": 0, "dimred_enabled": False,
-            # Batch-safe дефолты: без рекурсии и с фокусом на HDF5-файлы.
+            # Batch-safe дефолты: без рекурсии и с поддержкой всех входных форматов.
             "batch_recursive": False, "batch_skip_existing": True,
-            "batch_allowed_exts": [".h5", ".hdf5"],
+            "batch_allowed_exts": [".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5"],
         },
     }
     return presets.get(name, presets["Default stable"]).copy()
@@ -520,7 +520,7 @@ def main() -> None:
     batch_output_root = ""
     batch_recursive = False
     batch_skip_existing = True
-    batch_allowed_exts = [".h5", ".hdf5"]
+    batch_allowed_exts = [".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5"]
 
     if source.startswith("Файл"):
         _show_local_dialog_hint()
@@ -595,7 +595,7 @@ def main() -> None:
             batch_allowed_exts = st.multiselect(
                 "Какие расширения брать",
                 options=list(SUPPORTED_INPUT_EXTS),
-                default=st.session_state.get("batch_allowed_exts", [".h5", ".hdf5"]),
+                default=st.session_state.get("batch_allowed_exts", [".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5"]),
                 key="batch_allowed_exts",
                 help="Если ничего не выбрано, будет использован полный список поддерживаемых расширений.",
             )
@@ -1169,7 +1169,7 @@ def main() -> None:
                     try:
                         prev = json.loads(status_json.read_text(encoding="utf-8"))
                         prev_status = str(prev.get("status", "")).lower()
-                        if prev_status in {"ok", "partial", "skipped"}:
+                        if prev_status in {"ok", "skipped"}:
                             row = {
                                 "index": i,
                                 "input_file": str(p),
