@@ -159,3 +159,78 @@ def test_load_h5_can_save_and_reuse_aggregated_h5(tmp_path):
     assert df_reused.attrs.get("source_kind") == "aggregated_h5"
     assert df_reused.attrs.get("format") == "spatial_bins"
     assert df_reused.shape == df_first.shape
+
+
+def test_streaming_csv_voxel_wide_spatial_binning(tmp_path: Path) -> None:
+    """Large-CSV path should support streaming deterministic spatial binning."""
+    csv_path = tmp_path / "vox.csv"
+    csv_path.write_text(
+        "x,y,z,t0,t1\n"
+        "55,0,0,1,3\n"
+        "56,0,0,2,4\n"
+        "57,0,0,6,8\n",
+        encoding="utf-8",
+    )
+
+    df = data_loader.load_or_generate(
+        str(csv_path),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        spatial_grid_size=2,
+        spatial_grid_method="mean",
+        csv_stream_spatial_bin=True,
+        csv_chunk_rows=2,
+    )
+
+    assert df.attrs.get("source_kind") == "csv_voxel_spatial_stream"
+    assert list(df.columns) == ["bin_27_0_0", "bin_28_0_0"]
+    assert df.shape == (2, 2)
+    assert float(df.iloc[0, 0]) == 1.0
+    assert float(df.iloc[0, 1]) == 4.0
+
+
+def test_streaming_csv_bin_names_are_stable_with_missing_voxels(tmp_path: Path) -> None:
+    """Same voxel coordinates should map to the same bin names across files."""
+    a = tmp_path / "a.csv"
+    b = tmp_path / "b.csv"
+    a.write_text(
+        "x,y,z,t0,t1\n"
+        "55,0,0,1,2\n"
+        "56,0,0,3,4\n"
+        "57,0,0,5,6\n",
+        encoding="utf-8",
+    )
+    b.write_text(
+        "x,y,z,t0,t1\n"
+        "56,0,0,7,8\n"
+        "57,0,0,9,10\n",
+        encoding="utf-8",
+    )
+
+    dfa = data_loader.load_or_generate(
+        str(a),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        spatial_grid_size=2,
+        csv_stream_spatial_bin=True,
+        csv_chunk_rows=2,
+    )
+    dfb = data_loader.load_or_generate(
+        str(b),
+        preprocess=False,
+        normalize=False,
+        remove_outliers=False,
+        fill_missing=False,
+        spatial_grid_size=2,
+        csv_stream_spatial_bin=True,
+        csv_chunk_rows=2,
+    )
+
+    assert "bin_28_0_0" in dfa.columns
+    assert "bin_28_0_0" in dfb.columns
+    assert "bin_27_0_0" in dfa.columns
+    assert "bin_27_0_0" not in dfb.columns

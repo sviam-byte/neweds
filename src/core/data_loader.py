@@ -2168,6 +2168,8 @@ def load_or_generate(
     reuse_existing_aggregated_h5: bool = True,
     usecols: Any = "auto",
     csv_engine: str = "auto",
+    csv_stream_spatial_bin: bool = True,
+    csv_chunk_rows: int = 4096,
     preprocess: bool = True,
     log_transform: bool = False,
     remove_outliers: bool = True,
@@ -2282,64 +2284,93 @@ def load_or_generate(
                     time_stride=time_stride,
                 )
         else:
-            # Защита от OOM на очень широких CSV (сотни тысяч колонок-вокселей):
-            # пробуем определить число колонок быстрым probe и, если их слишком
-            # много, ограничиваем usecols ДО полной загрузки — аналогично тому,
-            # как H5-путь применяет spatial binning / MAX_RAW_VOXELS_FOR_GUI.
-            _usecols_eff = usecols
+            _csv_spatial_bin_size = int(spatial_grid_size or h5_spatial_bin or 0)
             _fp_low_csv = str(filepath).lower()
-            if _fp_low_csv.endswith(".csv") and _usecols_eff in {"auto", None}:
-                _csv_ncols = _csv_probe_ncols(str(filepath))
-                # Максимум колонок для безопасной загрузки CSV.
-                # feature_limit, если задан, имеет приоритет.
-                _csv_col_cap = MAX_RAW_VOXELS_FOR_GUI
-                if feature_limit is not None and int(feature_limit) > 0:
-                    _csv_col_cap = int(feature_limit)
-                if _csv_ncols > _csv_col_cap > 0:
-                    logging.warning(
-                        "[CSV] Файл содержит %d колонок (лимит=%d). "
-                        "Ограничиваем usecols при чтении для предотвращения OOM.",
-                        _csv_ncols,
-                        _csv_col_cap,
-                    )
-                    _mode = str(feature_sampling or "first").strip().lower()
-                    if _mode in {"random", "rand"}:
-                        _rng = np.random.default_rng(int(feature_seed))
-                        _pick = sorted(_rng.choice(_csv_ncols, size=_csv_col_cap, replace=False).tolist())
-                        _usecols_eff = _pick
-                    else:
-                        # "first" / default — первые N колонок
-                        _usecols_eff = list(range(_csv_col_cap))
+            df = None
 
-            raw = read_input_table(filepath, header=header, usecols=_usecols_eff, csv_engine=csv_engine)
-
-            # Автопонижение типа: лучше осознанно перейти в float32,
-            # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
-            dtype_eff = dtype
-            if dtype_eff is None and auto_float32:
-                try:
-                    n_rows, n_cols = int(raw.shape[0]), int(raw.shape[1])
-                    n_cells = n_rows * n_cols
-                    if n_cols >= 128 or n_cells >= 2_000_000:
-                        dtype_eff = "float32"
-                except Exception:
-                    pass
-
-            df = tidy_timeseries_table(
-                raw,
-                time_col=time_col,
-                transpose=transpose,
-                dtype=dtype_eff,
-                time_start=time_start,
-                time_end=time_end,
-                time_stride=time_stride,
-                feature_limit=feature_limit,
-                feature_sampling=feature_sampling,
-                feature_seed=feature_seed,
-                spatial_bin_size=int(spatial_grid_size or h5_spatial_bin or 0),
-                spatial_bin_method=str(spatial_grid_method or "mean"),
-                spatial_bin_range=spatial_bin_range,
+            _try_stream_csv_spatial = (
+                _fp_low_csv.endswith(".csv")
+                and bool(csv_stream_spatial_bin)
+                and _csv_spatial_bin_size > 1
+                and spatial_bin_range is None
+                and str(spatial_grid_method or "mean").strip().lower() in {"mean", "sum"}
+                and usecols in {"auto", None}
             )
+            if _try_stream_csv_spatial:
+                try:
+                    _layout = _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
+                    if bool(_layout.get("is_voxel_wide")):
+                        df = stream_csv_voxel_wide_to_timeseries(
+                            filepath,
+                            header=header,
+                            csv_engine=csv_engine,
+                            chunksize=int(csv_chunk_rows),
+                            spatial_bin_size=_csv_spatial_bin_size,
+                            spatial_bin_method=str(spatial_grid_method or "mean"),
+                            spatial_bin_range=None,
+                        )
+                except Exception as exc:
+                    logging.warning("[CSV spatial bin stream] fallback to regular loader: %s", exc)
+                    df = None
+
+            if df is None:
+                # Защита от OOM на очень широких CSV (сотни тысяч колонок-вокселей):
+                # пробуем определить число колонок быстрым probe и, если их слишком
+                # много, ограничиваем usecols ДО полной загрузки — аналогично тому,
+                # как H5-путь применяет spatial binning / MAX_RAW_VOXELS_FOR_GUI.
+                _usecols_eff = usecols
+                if _fp_low_csv.endswith(".csv") and _usecols_eff in {"auto", None}:
+                    _csv_ncols = _csv_probe_ncols(str(filepath))
+                    # Максимум колонок для безопасной загрузки CSV.
+                    # feature_limit, если задан, имеет приоритет.
+                    _csv_col_cap = MAX_RAW_VOXELS_FOR_GUI
+                    if feature_limit is not None and int(feature_limit) > 0:
+                        _csv_col_cap = int(feature_limit)
+                    if _csv_ncols > _csv_col_cap > 0:
+                        logging.warning(
+                            "[CSV] Файл содержит %d колонок (лимит=%d). "
+                            "Ограничиваем usecols при чтении для предотвращения OOM.",
+                            _csv_ncols,
+                            _csv_col_cap,
+                        )
+                        _mode = str(feature_sampling or "first").strip().lower()
+                        if _mode in {"random", "rand"}:
+                            _rng = np.random.default_rng(int(feature_seed))
+                            _pick = sorted(_rng.choice(_csv_ncols, size=_csv_col_cap, replace=False).tolist())
+                            _usecols_eff = _pick
+                        else:
+                            # "first" / default — первые N колонок
+                            _usecols_eff = list(range(_csv_col_cap))
+
+                raw = read_input_table(filepath, header=header, usecols=_usecols_eff, csv_engine=csv_engine)
+
+                # Автопонижение типа: лучше осознанно перейти в float32,
+                # чем получить OOM на неявных копиях в pandas/numpy при больших матрицах.
+                dtype_eff = dtype
+                if dtype_eff is None and auto_float32:
+                    try:
+                        n_rows, n_cols = int(raw.shape[0]), int(raw.shape[1])
+                        n_cells = n_rows * n_cols
+                        if n_cols >= 128 or n_cells >= 2_000_000:
+                            dtype_eff = "float32"
+                    except Exception:
+                        pass
+
+                df = tidy_timeseries_table(
+                    raw,
+                    time_col=time_col,
+                    transpose=transpose,
+                    dtype=dtype_eff,
+                    time_start=time_start,
+                    time_end=time_end,
+                    time_stride=time_stride,
+                    feature_limit=feature_limit,
+                    feature_sampling=feature_sampling,
+                    feature_seed=feature_seed,
+                    spatial_bin_size=_csv_spatial_bin_size,
+                    spatial_bin_method=str(spatial_grid_method or "mean"),
+                    spatial_bin_range=spatial_bin_range,
+                )
         coords_df = None
         try:
             coords_df = df.attrs.get("coords")
@@ -2419,3 +2450,297 @@ def load_or_generate(
     except Exception as e:
         logging.error(f"[Load] Ошибка загрузки: {e}")
         raise
+
+
+def _csv_choose_stream_engine(csv_engine: str = "auto") -> str:
+    """Выбирает движок CSV, совместимый с chunksize/итерацией."""
+    eng = str(csv_engine or "auto").strip().lower()
+    if eng in {"c", "python"}:
+        return eng
+    return "c"
+
+
+def _read_csv_probe_raw(
+    filepath: str,
+    *,
+    nrows: int = 8,
+    csv_engine: str = "auto",
+) -> pd.DataFrame:
+    """Читает небольшой сырой probe CSV без полной загрузки файла."""
+    kw: Dict[str, Any] = {"header": None, "nrows": int(nrows), "low_memory": False}
+    kw["engine"] = _csv_choose_stream_engine(csv_engine)
+    return pd.read_csv(filepath, **kw)
+
+
+def _probe_csv_voxel_wide_layout(
+    filepath: str,
+    *,
+    header: str = "auto",
+    csv_engine: str = "auto",
+) -> dict[str, Any]:
+    """Пробует дешёво определить, что CSV имеет формат x,y,z,t0..tN."""
+    if header not in {"auto", "yes", "no"}:
+        raise ValueError("header must be one of: auto|yes|no")
+
+    raw = _read_csv_probe_raw(filepath, nrows=8, csv_engine=csv_engine)
+    raw = _maybe_split_single_column(raw)
+    has_header = _detect_header(raw) if header == "auto" else (header == "yes")
+    if has_header:
+        hdr = raw.iloc[0].astype(str).tolist()
+        df = raw.iloc[1:].copy()
+        df.columns = [h if h.strip() else f"c{i+1}" for i, h in enumerate(hdr)]
+    else:
+        df = raw.copy()
+        df.columns = [f"c{i+1}" for i in range(df.shape[1])]
+
+    is_vox, lower = _detect_voxel_wide(df)
+    layout: dict[str, Any] = {
+        "has_header": bool(has_header),
+        "is_voxel_wide": bool(is_vox),
+        "columns": list(df.columns),
+        "lower": lower,
+    }
+    if is_vox:
+        layout["xcol"] = lower["x"]
+        layout["ycol"] = lower["y"]
+        layout["zcol"] = lower["z"]
+        layout["time_cols"] = [c for c in df.columns if str(c).strip().lower() not in {"x", "y", "z"}]
+    return layout
+
+
+def _iter_csv_voxel_wide_chunks(
+    filepath: str,
+    *,
+    header: str = "auto",
+    csv_engine: str = "auto",
+    chunksize: int = 4096,
+):
+    """Итератор по чанкам CSV для формата x,y,z,t0..tN."""
+    layout = _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
+    if not bool(layout.get("is_voxel_wide")):
+        raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+
+    kw: Dict[str, Any] = {
+        "chunksize": max(1, int(chunksize)),
+        "low_memory": False,
+        "engine": _csv_choose_stream_engine(csv_engine),
+    }
+    if bool(layout.get("has_header")):
+        kw["header"] = 0
+    else:
+        kw["header"] = None
+        kw["names"] = list(layout["columns"])
+
+    for chunk in pd.read_csv(filepath, **kw):
+        yield chunk
+
+
+def stream_csv_voxel_wide_to_timeseries(
+    filepath: str,
+    *,
+    header: str = "auto",
+    csv_engine: str = "auto",
+    chunksize: int = 4096,
+    spatial_bin_size: int = 5,
+    spatial_bin_method: str = "mean",
+    spatial_bin_range: tuple | None = None,
+    eps: float = 1e-12,
+    min_voxels_per_bin: int = 1,
+) -> pd.DataFrame:
+    """Потоковая загрузка giant CSV x,y,z,t0..tN → time×bins.
+
+    Режим ориентирован на локально-детерминированную биннизацию (вариант A):
+    бин каждого вокселя зависит только от его координат и ``bin_size``.
+    Пустые бины не форсятся в выход — число бинов может отличаться между файлами,
+    но одинаковые воксели всегда получают одинаковый ``bin_key``.
+
+    Для скорости потоково поддерживаются ``mean`` и ``sum``. ``median`` требует
+    хранения всех рядов внутри бина и здесь сознательно не поддерживается.
+    """
+    layout = _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
+    if not bool(layout.get("is_voxel_wide")):
+        raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+
+    method_eff = str(spatial_bin_method or "mean").strip().lower()
+    if method_eff not in {"mean", "sum"}:
+        raise ValueError(
+            "Streaming CSV spatial binning currently supports only mean/sum; "
+            f"got method={spatial_bin_method!r}"
+        )
+    if spatial_bin_range is not None:
+        raise ValueError(
+            "Streaming CSV spatial binning currently implements only local deterministic mode "
+            "(spatial_bin_range=None)."
+        )
+
+    b = max(1, int(spatial_bin_size or 1))
+    xcol = str(layout["xcol"])
+    ycol = str(layout["ycol"])
+    zcol = str(layout["zcol"])
+    time_cols = list(layout["time_cols"])
+
+    def _t_index(name: str) -> int | None:
+        s = str(name).strip().lower()
+        if s.startswith("t") and s[1:].isdigit():
+            return int(s[1:])
+        if s.isdigit():
+            return int(s)
+        return None
+
+    t_ids = [_t_index(c) for c in time_cols]
+    if all(v is not None for v in t_ids):
+        order = np.argsort(np.asarray(t_ids, dtype=int))
+        time_cols = [time_cols[i] for i in order]
+    else:
+        order = np.arange(len(time_cols), dtype=int)
+
+    bin_to_idx: Dict[tuple[int, int, int], int] = {}
+    bin_keys: list[tuple[int, int, int]] = []
+    sums_rows: list[np.ndarray] = []
+    counts_rows: list[int] = []
+    xsum_rows: list[float] = []
+    ysum_rows: list[float] = []
+    zsum_rows: list[float] = []
+    coord_count_rows: list[int] = []
+
+    n_chunks = 0
+    n_voxels_total = 0
+    n_alive_total = 0
+    n_time: int | None = None
+
+    for chunk in _iter_csv_voxel_wide_chunks(
+        filepath,
+        header=header,
+        csv_engine=csv_engine,
+        chunksize=chunksize,
+    ):
+        n_chunks += 1
+        work = chunk[[xcol, ycol, zcol] + time_cols].copy()
+        x = pd.to_numeric(work[xcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        y = pd.to_numeric(work[ycol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        z = pd.to_numeric(work[zcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        ts_arr = work[time_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32, copy=False)
+        if order.size:
+            ts_arr = ts_arr[:, order]
+        if n_time is None:
+            n_time = int(ts_arr.shape[1])
+        n_voxels_total += int(ts_arr.shape[0])
+        if ts_arr.size == 0:
+            continue
+
+        voxel_var = np.nanvar(ts_arr, axis=1)
+        alive = np.isfinite(voxel_var) & (voxel_var > eps) & np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        if not np.any(alive):
+            continue
+        n_alive_total += int(np.sum(alive))
+
+        xa = x[alive]
+        ya = y[alive]
+        za = z[alive]
+        ta = ts_arr[alive].astype(np.float64, copy=False)
+
+        bx = np.floor(xa / b).astype(np.int32)
+        by = np.floor(ya / b).astype(np.int32)
+        bz = np.floor(za / b).astype(np.int32)
+        coords = np.stack([bx, by, bz], axis=1)
+        uniq, inv = np.unique(coords, axis=0, return_inverse=True)
+        n_uniq = int(uniq.shape[0])
+        if n_uniq == 0:
+            continue
+
+        chunk_sums = np.zeros((n_uniq, ta.shape[1]), dtype=np.float64)
+        np.add.at(chunk_sums, inv, ta)
+        chunk_counts = np.bincount(inv, minlength=n_uniq).astype(np.int64)
+        chunk_xsum = np.bincount(inv, weights=xa, minlength=n_uniq).astype(np.float64)
+        chunk_ysum = np.bincount(inv, weights=ya, minlength=n_uniq).astype(np.float64)
+        chunk_zsum = np.bincount(inv, weights=za, minlength=n_uniq).astype(np.float64)
+
+        for j in range(n_uniq):
+            key = (int(uniq[j, 0]), int(uniq[j, 1]), int(uniq[j, 2]))
+            idx = bin_to_idx.get(key)
+            if idx is None:
+                idx = len(bin_keys)
+                bin_to_idx[key] = idx
+                bin_keys.append(key)
+                sums_rows.append(chunk_sums[j].copy())
+                counts_rows.append(int(chunk_counts[j]))
+                xsum_rows.append(float(chunk_xsum[j]))
+                ysum_rows.append(float(chunk_ysum[j]))
+                zsum_rows.append(float(chunk_zsum[j]))
+                coord_count_rows.append(int(chunk_counts[j]))
+            else:
+                sums_rows[idx] += chunk_sums[j]
+                counts_rows[idx] += int(chunk_counts[j])
+                xsum_rows[idx] += float(chunk_xsum[j])
+                ysum_rows[idx] += float(chunk_ysum[j])
+                zsum_rows[idx] += float(chunk_zsum[j])
+                coord_count_rows[idx] += int(chunk_counts[j])
+
+    if not bin_keys or n_time is None:
+        raise ValueError(
+            f"Streaming CSV spatial binning produced no active bins (bin_size={b}, file={filepath})."
+        )
+
+    keep = [i for i, c in enumerate(counts_rows) if int(c) >= max(1, int(min_voxels_per_bin))]
+    if not keep:
+        raise ValueError(
+            f"Streaming CSV spatial binning: all bins are below min_voxels_per_bin={min_voxels_per_bin}."
+        )
+
+    keep_sorted = sorted(keep, key=lambda i: bin_keys[i])
+    result = np.vstack([sums_rows[i] for i in keep_sorted]).astype(np.float64, copy=False)
+    counts_arr = np.asarray([counts_rows[i] for i in keep_sorted], dtype=np.int64)
+    if method_eff == "mean":
+        result = (result / np.maximum(counts_arr[:, None], 1)).astype(np.float32)
+    else:
+        result = result.astype(np.float32)
+
+    bin_names = [f"bin_{bin_keys[i][0]}_{bin_keys[i][1]}_{bin_keys[i][2]}" for i in keep_sorted]
+    coords_rows = []
+    for pos, i in enumerate(keep_sorted):
+        cc = max(1, int(coord_count_rows[i]))
+        bx_i, by_i, bz_i = bin_keys[i]
+        coords_rows.append(
+            {
+                "voxel_id": bin_names[pos],
+                "x": float(xsum_rows[i] / cc),
+                "y": float(ysum_rows[i] / cc),
+                "z": float(zsum_rows[i] / cc),
+                "bin_key": f"{bx_i}_{by_i}_{bz_i}",
+                "n_voxels": int(coord_count_rows[i]),
+                "n_active": int(counts_rows[i]),
+            }
+        )
+
+    out = pd.DataFrame(result.T, columns=bin_names)
+    out.attrs["coords"] = pd.DataFrame(coords_rows)
+    out.attrs["format"] = "spatial_bins"
+    out.attrs["source_kind"] = "csv_voxel_spatial_stream"
+    out.attrs["feature_axis"] = "spatial_bin"
+    out.attrs["bin_size"] = b
+    out.attrs["voxel_time_cols"] = [str(c) for c in time_cols]
+    out.attrs["spatial_bin_report"] = {
+        "original_voxels": int(n_voxels_total),
+        "alive_voxels": int(n_alive_total),
+        "output_bins": len(keep_sorted),
+        "bin_size": b,
+        "method": method_eff,
+        "bin_range": None,
+        "bin_key_formula": "floor(coord / bin_size)",
+        "deterministic": True,
+        "fixed_range": False,
+        "streaming": True,
+        "chunksize": int(chunksize),
+        "n_chunks": int(n_chunks),
+    }
+    logging.info(
+        "[CSV spatial bin stream] Result: %d×%d from %d voxels (%d alive), %d bins, chunks=%d, chunk_rows=%d",
+        out.shape[0],
+        out.shape[1],
+        int(n_voxels_total),
+        int(n_alive_total),
+        len(keep_sorted),
+        int(n_chunks),
+        int(chunksize),
+    )
+    return out
