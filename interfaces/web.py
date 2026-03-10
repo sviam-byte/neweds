@@ -1263,6 +1263,25 @@ def main() -> None:
                         h5_spatial_bin=int(h5_spatial_bin),
                     )
 
+                    # Отчёт о spatial binning в batch-лог
+                    try:
+                        _bpr = getattr(tool, "preprocessing_report", None)
+                        _bnotes = (getattr(_bpr, "notes", {}) or {}) if _bpr else {}
+                        _bsb = _bnotes.get("spatial_bin_report")
+                        if isinstance(_bsb, dict):
+                            _binfo = (
+                                f"spatial_bin: {_bsb.get('original_voxels', '?')} вокселей → "
+                                f"{_bsb.get('active_bins', '?')} бинов "
+                                f"(bin_size={_bsb.get('bin_size', '?')}, method={_bsb.get('method', '?')})"
+                            )
+                            _append_text(batch_log, f"[LOAD ] {p} | {_binfo}")
+                            row["spatial_bin_info"] = _binfo
+                        _bshape = getattr(tool, "data", None)
+                        if _bshape is not None:
+                            row["loaded_shape"] = f"{_bshape.shape[0]}x{_bshape.shape[1]}"
+                    except Exception:
+                        pass
+
                     window_sizes_main = _parse_int_list_text(window_sizes_text) if use_main_windows else None
                     run_window_stride = int(window_stride_main) if int(window_stride_main) > 0 else 0
                     method_options = None
@@ -1553,6 +1572,23 @@ def main() -> None:
                         "Для H5 voxel-data обычно причина в слишком агрессивной фильтрации признаков."
                     )
                     st.stop()
+
+                # ── Отчёт о загрузке / spatial binning ──
+                try:
+                    _pr = getattr(tool, "preprocessing_report", None)
+                    _notes = (getattr(_pr, "notes", {}) or {}) if _pr else {}
+                    _sb = _notes.get("spatial_bin_report")
+                    if isinstance(_sb, dict):
+                        _shape = getattr(df_loaded, "shape", (0, 0))
+                        st.info(
+                            f"📊 **Spatial binning**: {_sb.get('original_voxels', '?'):,} вокселей → "
+                            f"**{_sb.get('active_bins', '?'):,}** бинов "
+                            f"(bin_size={_sb.get('bin_size', '?')}, метод={_sb.get('method', '?')}). "
+                            f"Итоговая матрица: {_shape[0]}×{_shape[1]}. "
+                            f"Детерминирован: одинаковая геометрия → одинаковые бины."
+                        )
+                except Exception:
+                    pass
 
                 # main windows
                 window_sizes_main = None

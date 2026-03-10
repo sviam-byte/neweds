@@ -594,6 +594,26 @@ class HTMLReportGenerator:
 
             prep_lines = []
             p0 = prep.get("preprocess") or {}
+            # Spatial binning report
+            try:
+                _p0_notes = p0.get("notes") or {}
+                _sb_html = _p0_notes.get("spatial_bin_report")
+                if isinstance(_sb_html, dict):
+                    _orig = _sb_html.get("original_voxels", "?")
+                    _active = _sb_html.get("active_bins", "?")
+                    _total = _sb_html.get("total_grid_bins", _sb_html.get("total_bins", "?"))
+                    _bs = _sb_html.get("bin_size", "?")
+                    _meth = html.escape(str(_sb_html.get("method", "mean")))
+                    prep_lines.append(
+                        f"<b>Spatial binning</b>: {_orig} вокселей → {_active} бинов "
+                        f"(из {_total} возможных), bin_size={_bs}, метод={_meth}"
+                    )
+                    prep_lines.append(
+                        "<b>Детерминированность</b>: да — ключ бина = floor(coord / bin_size), "
+                        "одинаковая геометрия → одинаковые бины"
+                    )
+            except Exception:
+                pass
             if p0.get("enabled") is not None:
                 prep_lines.append(f"<b>Предобработка</b>: {'ON' if p0.get('enabled') else 'OFF'}")
             if p0.get("dropped_columns"):

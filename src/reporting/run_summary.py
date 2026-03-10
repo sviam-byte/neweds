@@ -41,6 +41,23 @@ def build_run_summary_ru(tool, *, run_dir: Optional[str] = None) -> str:
     has_coords = getattr(tool, "coords_df", None) is not None
     lines.append(f"- координаты (x,y,z): {_fmt_bool(has_coords)}")
 
+    # Spatial binning
+    sb = notes.get("spatial_bin_report")
+    if isinstance(sb, dict):
+        lines.append("Spatial binning")
+        lines.append(f"- вокселей в файле: {sb.get('original_voxels', '?')}")
+        lines.append(f"- живых вокселей: {sb.get('alive_voxels', '?')}")
+        lines.append(f"- бинов (активных): {sb.get('active_bins', '?')} из {sb.get('total_grid_bins', sb.get('total_bins', '?'))}")
+        lines.append(f"- bin_size: {sb.get('bin_size', '?')}")
+        lines.append(f"- метод агрегации: {sb.get('method', '?')}")
+        lines.append(f"- детерминирован: {_fmt_bool(sb.get('deterministic', True))}")
+        lines.append(f"- фиксированная сетка: {_fmt_bool(sb.get('fixed_range', False))}")
+        gr = sb.get("grid_range_used")
+        if gr:
+            lines.append(f"- grid_range: {gr}")
+            if not sb.get("fixed_range", False):
+                lines.append(f"  ↑ Для воспроизведения: spatial_bin_range={gr}")
+
     # 2) Предобработка
     lines.append("Предобработка")
     if rep is None:
