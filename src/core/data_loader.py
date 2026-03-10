@@ -2193,7 +2193,7 @@ def load_or_generate(
     usecols: Any = "auto",
     csv_engine: str = "auto",
     csv_stream_spatial_bin: bool = True,
-    csv_chunk_rows: int = 4096,
+    csv_chunk_rows: int = 32768,
     preprocess: bool = True,
     log_transform: bool = False,
     remove_outliers: bool = True,
