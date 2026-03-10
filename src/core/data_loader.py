@@ -7,6 +7,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -213,7 +214,13 @@ def voxel_wide_to_timeseries(
         return df
 
     xcol, ycol, zcol = lower["x"], lower["y"], lower["z"]
-    time_cols = [c for c in df.columns if str(c).strip().lower() not in {"x", "y", "z"}]
+    # В матрицу сигнала включаем только временные колонки t0..tN или цифровые индексы.
+    # Мета-поля (subject/group/sex/iq и т.п.) не попадают в ts по умолчанию.
+    _t_re = re.compile(r"^t\d+$")
+    time_cols = [
+        c for c in df.columns
+        if _t_re.match(str(c).strip().lower()) or str(c).strip().isdigit()
+    ]
 
     _bs = int(spatial_bin_size or 0)
     if _bs > 1:
@@ -265,42 +272,59 @@ def voxel_wide_to_timeseries(
     else:
         time_cols_sorted = list(time_cols)
 
-    n = int(coords.shape[0])
     x = coords["x"].to_numpy(dtype=float, copy=False)
     y = coords["y"].to_numpy(dtype=float, copy=False)
     z = coords["z"].to_numpy(dtype=float, copy=False)
 
-    def _int_or_nan(a: np.ndarray) -> np.ndarray:
+    def _to_int_safe(a: np.ndarray) -> np.ndarray:
+        """Безопасно приводит массив координат float к int64."""
         m = np.isfinite(a)
-        out = np.empty(a.shape[0], dtype=object)
-        out[m] = a[m].astype(np.int64).astype(str)
-        out[~m] = "nan"
+        out = np.full(a.shape[0], 0, dtype=np.int64)
+        if np.any(~m):
+            logging.warning(
+                "[voxel_wide] %d нефинитных координат заменены на 0.",
+                int(np.sum(~m)),
+            )
+        frac_mask = m & (a != np.floor(a))
+        if np.any(frac_mask):
+            logging.warning(
+                "[voxel_wide] Координаты содержат дробные значения и будут усечены до int64."
+            )
+        out[m] = a[m].astype(np.int64)
         return out
 
-    xs = _int_or_nan(x)
-    ys = _int_or_nan(y)
-    zs = _int_or_nan(z)
+    xi = _to_int_safe(x)
+    yi = _to_int_safe(y)
+    zi = _to_int_safe(z)
 
-    i_str = np.char.zfill(np.arange(n, dtype=np.int64).astype(str), 4)
-    voxel_ids = np.char.add(
-        np.char.add(
-            np.char.add(
-                np.char.add(
-                    np.char.add(np.char.add(np.char.add("v", i_str), "_x"), xs),
-                    "_y",
-                ),
-                ys,
-            ),
-            "_z",
-        ),
-        zs,
-    ).astype(object)
+    # Детерминированный порядок строк: сортировка по (x, y, z).
+    row_order = np.lexsort((zi, yi, xi))
+    xi = xi[row_order]
+    yi = yi[row_order]
+    zi = zi[row_order]
+    coords = coords.iloc[row_order].copy().reset_index(drop=True)
+    ts = ts.iloc[row_order].copy()
+
+    dup_mask = (xi[1:] == xi[:-1]) & (yi[1:] == yi[:-1]) & (zi[1:] == zi[:-1])
+    n_dupes = int(np.sum(dup_mask))
+    if n_dupes:
+        logging.warning(
+            "[voxel_wide] Обнаружено %d строк с повторяющимися координатами (x,y,z).",
+            n_dupes,
+        )
+
+    # Убираем индекс строки из id: одинаковые координаты → одинаковый voxel_id между субъектами.
+    voxel_ids = np.array(
+        [f"x{xi[i]}_y{yi[i]}_z{zi[i]}" for i in range(len(xi))],
+        dtype=object,
+    )
 
     coords.insert(0, "voxel_id", voxel_ids)
-    try:
-        dup = coords.duplicated(subset=["x", "y", "z"], keep=False)
-        coords["coord_duplicate"] = dup.astype(int)
-    except Exception:
+    if len(xi) > 1:
+        left = np.concatenate(([False], dup_mask))
+        right = np.concatenate((dup_mask, [False]))
+        coords["coord_duplicate"] = (left | right).astype(int)
+    else:
         coords["coord_duplicate"] = 0
 
     ts.index = voxel_ids
@@ -2504,7 +2528,11 @@ def _probe_csv_voxel_wide_layout(
         layout["xcol"] = lower["x"]
         layout["ycol"] = lower["y"]
         layout["zcol"] = lower["z"]
-        layout["time_cols"] = [c for c in df.columns if str(c).strip().lower() not in {"x", "y", "z"}]
+        _t_re = re.compile(r"^t\d+$")
+        layout["time_cols"] = [
+            c for c in df.columns
+            if _t_re.match(str(c).strip().lower()) or str(c).strip().isdigit()
+        ]
     return layout
 
 
