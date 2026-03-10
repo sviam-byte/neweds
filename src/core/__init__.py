@@ -9,6 +9,7 @@ from .data_loader import load_or_generate, read_input_table, tidy_timeseries_tab
 from .preprocessing import configure_warnings, additional_preprocessing
 from .generator import generate_coupled_system, generate_random_walks
 from .voxel_space import CanonicalVoxelSpace, VoxelStrategy, align_subjects
+from .group_pipeline import run_group_pipeline, load_group, fit_canonical_space
 
 __all__ = [
     "load_or_generate",
@@ -21,4 +22,7 @@ __all__ = [
     "CanonicalVoxelSpace",
     "VoxelStrategy",
     "align_subjects",
+    "run_group_pipeline",
+    "load_group",
+    "fit_canonical_space",
 ]
