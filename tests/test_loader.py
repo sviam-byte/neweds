@@ -234,3 +234,25 @@ def test_streaming_csv_bin_names_are_stable_with_missing_voxels(tmp_path: Path) 
     assert "bin_28_0_0" in dfb.columns
     assert "bin_27_0_0" in dfa.columns
     assert "bin_27_0_0" not in dfb.columns
+
+
+def test_streaming_csv_fixed_range_keeps_empty_bins_as_nan(tmp_path: Path) -> None:
+    """Fixed range should preserve empty bins so alignment stays deterministic."""
+    csv_path = tmp_path / "fixed_range.csv"
+    csv_path.write_text(
+        "x,y,z,t0,t1\n"
+        "0,0,0,1,2\n",
+        encoding="utf-8",
+    )
+
+    df = data_loader.stream_csv_voxel_wide_to_timeseries(
+        str(csv_path),
+        spatial_bin_size=1,
+        spatial_bin_range=((0, 1), (0, 0), (0, 0)),
+        chunksize=1,
+    )
+
+    assert list(df.columns) == ["bin_0_0_0", "bin_1_0_0"]
+    assert float(df.iloc[0, 0]) == 1.0
+    assert float(df.iloc[1, 0]) == 2.0
+    assert df["bin_1_0_0"].isna().all()
