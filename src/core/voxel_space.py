@@ -128,6 +128,11 @@ class CanonicalVoxelSpace:
             "canonical_strategy": self.strategy.value,
             "format": "voxel_wide",
         }
+        # Сохраняем attrs исходного DataFrame для провенанса пайплайна.
+        if getattr(df, "attrs", None):
+            result.attrs["source_attrs"] = {
+                k: v for k, v in df.attrs.items() if k not in result.attrs
+            }
         return result
 
     def coverage_report(self, df: pd.DataFrame) -> dict:
@@ -188,6 +193,7 @@ def _voxel_id_sort_key(voxel_id: str) -> tuple[int, int, int]:
         parts = voxel_id.split("_")
         return int(parts[0][1:]), int(parts[1][1:]), int(parts[2][1:])
     except Exception:
+        logger.debug("Некорректный voxel_id при сортировке: %r", voxel_id)
         return 0, 0, 0
 
 
