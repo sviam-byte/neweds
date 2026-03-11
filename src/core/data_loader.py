@@ -2826,19 +2826,30 @@ def stream_csv_voxel_wide_to_timeseries(
             f"Streaming CSV spatial binning produced no active bins (bin_size={b}, file={filepath})."
         )
 
-    keep = [i for i, c in enumerate(counts_rows) if int(c) >= max(1, int(min_voxels_per_bin))]
-    if not keep:
-        raise ValueError(
-            f"Streaming CSV spatial binning: all bins are below min_voxels_per_bin={min_voxels_per_bin}."
-        )
+    if fixed_range:
+        # Для фиксированной сетки сохраняем все бины, включая пустые (count=0).
+        keep = list(range(len(bin_keys)))
+    else:
+        keep = [i for i, c in enumerate(counts_rows) if int(c) >= max(1, int(min_voxels_per_bin))]
+        if not keep:
+            raise ValueError(
+                f"Streaming CSV spatial binning: all bins are below min_voxels_per_bin={min_voxels_per_bin}."
+            )
 
     keep_sorted = sorted(keep, key=lambda i: bin_keys[i])
-    result = np.vstack([sums_rows[i] for i in keep_sorted]).astype(np.float64, copy=False)
-    counts_arr = np.asarray([counts_rows[i] for i in keep_sorted], dtype=np.int64)
-    if method_eff == "mean":
-        result = (result / np.maximum(counts_arr[:, None], 1)).astype(np.float32)
-    else:
-        result = result.astype(np.float32)
+
+    # Пустые бины в fixed_range режимe возвращаем как NaN-ряды для дальнейшего align().
+    result_rows: list[np.ndarray] = []
+    n_t = int(n_time or 0)
+    for i in keep_sorted:
+        cnt = int(counts_rows[i])
+        if cnt == 0:
+            result_rows.append(np.full(n_t, np.nan, dtype=np.float32))
+        elif method_eff == "mean":
+            result_rows.append((sums_rows[i] / cnt).astype(np.float32))
+        else:
+            result_rows.append(sums_rows[i].astype(np.float32))
+    result = np.vstack(result_rows) if result_rows else np.empty((0, n_t), dtype=np.float32)
 
     bin_names = [f"bin_{bin_keys[i][0]}_{bin_keys[i][1]}_{bin_keys[i][2]}" for i in keep_sorted]
     coords_rows = []
