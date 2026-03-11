@@ -64,6 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--canonical-reference", default="all",
+        choices=["healthy", "schiz", "all"],
+        help=(
+            "Референсная группа для canonical space (default: all). "
+            "Опция healthy может скрыть шиз-специфичные регионы."
+        ),
+    )
+    p.add_argument(
+        "--min-bin-coverage", type=float, default=0.8, metavar="F",
+        help=(
+            "Минимальная доля субъектов (0..1), у которых бин должен присутствовать, "
+            "чтобы пары с этим бином попали в статистику (default: 0.8)."
+        ),
+    )
+    p.add_argument(
         "--alpha", type=float, default=0.05, metavar="A",
         help="Уровень значимости FDR Benjamini-Hochberg (default: 0.05)",
     )
@@ -103,6 +118,8 @@ def main() -> None:
             spatial_grid_size=args.spatial_grid_size,
             strategy=args.strategy,
             alpha=args.alpha,
+            canonical_reference=args.canonical_reference,
+            min_bin_coverage=args.min_bin_coverage,
             csv_chunk_rows=args.chunk_size,
             save_feature_matrix=not args.no_save_features,
         )

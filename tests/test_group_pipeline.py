@@ -13,6 +13,8 @@ from src.core.group_pipeline import (
     _point_biserial_binary,
     build_missing_bin_qc_table,
     extract_upper_triangle,
+    filter_features_by_bin_coverage,
+    group_comparison,
     load_subject,
 )
 
@@ -98,3 +100,53 @@ def test_missing_bins_do_not_break_mannwhitney_and_fdr() -> None:
 
     assert np.isfinite(p).all()
     assert np.isfinite(p_fdr).all()
+
+
+def test_filter_features_by_bin_coverage_masks_pairs_with_sparse_bins() -> None:
+    """Coverage filter should keep only feature pairs with both bins well covered."""
+    bin_ids = ["b0", "b1", "b2"]
+    # Features correspond to pairs: (0,1), (0,2), (1,2)
+    feat_a = np.array([[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]], dtype=float)
+    feat_b = np.array([[0.5, 0.6, 0.7]], dtype=float)
+
+    # b2 отсутствует у одного субъекта => покрытие b2 = 2/3 < 0.8.
+    dfs_a = {
+        "a1": pd.DataFrame({"b0": [1.0], "b1": [2.0], "b2": [3.0]}),
+        "a2": pd.DataFrame({"b0": [1.0], "b1": [2.0], "b2": [np.nan]}),
+    }
+    dfs_b = {"b1": pd.DataFrame({"b0": [1.0], "b1": [2.0], "b2": [3.0]})}
+
+    out_a, out_b, mask = filter_features_by_bin_coverage(
+        feat_a,
+        feat_b,
+        bin_ids=bin_ids,
+        dfs_a=dfs_a,
+        dfs_b=dfs_b,
+        min_coverage=0.8,
+    )
+
+    assert mask.tolist() == [True, False, False]
+    assert out_a.shape == (2, 1)
+    assert out_b.shape == (1, 1)
+
+
+def test_group_comparison_reports_effect_size_and_respects_pair_mask() -> None:
+    """group_comparison must expose effect size and align bin labels with filtered pairs."""
+    features_a = np.array([[0.1, 0.9], [0.2, 1.0]], dtype=float)
+    features_b = np.array([[0.3, 1.1], [0.4, 1.2]], dtype=float)
+    # For 3 bins, pairs are: (b0,b1), (b0,b2), (b1,b2)
+    bin_ids = ["b0", "b1", "b2"]
+    pair_mask = np.array([True, False, True], dtype=bool)
+
+    df = group_comparison(
+        features_a,
+        features_b,
+        bin_ids=bin_ids,
+        alpha=0.05,
+        pair_mask=pair_mask,
+    )
+
+    assert list(df.columns) == [
+        "bin_i", "bin_j", "u_stat", "p_raw", "p_fdr", "effect_size_r", "significant"
+    ]
+    assert set(zip(df["bin_i"], df["bin_j"])) == {("b0", "b1"), ("b1", "b2")}

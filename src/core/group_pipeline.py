@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,9 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_EXTS = {".csv", ".xlsx", ".xls", ".parquet"}
 _T_COL_RE = re.compile(r"^t\d+$")
 _META_COLS = frozenset({"subject", "group", "iq", "sex"})
+
+# Порог point-biserial корреляции missingness×group для критического предупреждения.
+COVERAGE_CONFOUND_THRESHOLD = 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,23 @@ def load_group(
             logger.error("[%s] ПРОПУСК %s: %s", group_label, path.name, exc)
     if not result:
         raise RuntimeError(f"Ни один субъект из {directory} не загружен.")
+
+    # Защита от несопоставимых матриц connectivity: у всех субъектов должен быть
+    # одинаковый размер временной оси (число TR/таймпоинтов).
+    n_times = {sid: int(df.shape[0]) for sid, df in result.items()}
+    unique_times = set(n_times.values())
+    if len(unique_times) > 1:
+        counts = Counter(n_times.values())
+        logger.error(
+            "[%s] КРИТИЧНО: обнаружено разное число timepoints: %s",
+            group_label,
+            dict(counts),
+        )
+        raise ValueError(
+            f"[{group_label}] Разное число timepoints: {dict(counts)}. "
+            "Перед анализом приведите субъекты к единой временной длине."
+        )
+
     if schemas:
         _cross_validate_group_schemas(schemas, group_label)
     return result
@@ -344,6 +365,53 @@ def build_feature_matrix(
     return np.vstack(rows), subject_ids
 
 
+def filter_features_by_bin_coverage(
+    feat_a: np.ndarray,
+    feat_b: np.ndarray,
+    bin_ids: list[str],
+    dfs_a: dict[str, pd.DataFrame],
+    dfs_b: dict[str, pd.DataFrame],
+    min_coverage: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Фильтрует признаки-пары по покрытию бинов среди всех субъектов.
+
+    Сохраняются только пары (i, j), где оба бина присутствуют как минимум у
+    ``min_coverage`` доли субъектов (проверка по наличию хотя бы одного finite
+    значения в колонке после align).
+    """
+    if not (0.0 < min_coverage <= 1.0):
+        raise ValueError("min_coverage должен быть в диапазоне (0, 1].")
+
+    n_bins = len(bin_ids)
+    all_dfs = list(dfs_a.values()) + list(dfs_b.values())
+    n_total = len(all_dfs)
+
+    bin_present_count = np.zeros(n_bins, dtype=np.int64)
+    for df in all_dfs:
+        arr = df.to_numpy(dtype=np.float64, copy=False)
+        bin_present_count += np.isfinite(arr).any(axis=0).astype(np.int64)
+
+    bin_ok = bin_present_count >= (min_coverage * n_total)
+    idx_i, idx_j = np.triu_indices(n_bins, k=1)
+    feat_mask = bin_ok[idx_i] & bin_ok[idx_j]
+
+    logger.info(
+        "Coverage filter: %d/%d бинов >= %.0f%% покрытия; признаков сохранено %d/%d",
+        int(bin_ok.sum()),
+        n_bins,
+        min_coverage * 100,
+        int(feat_mask.sum()),
+        len(feat_mask),
+    )
+    if not np.any(feat_mask):
+        raise RuntimeError(
+            "Coverage filter удалил все признаки. "
+            "Снизьте min_bin_coverage или проверьте покрытие данных."
+        )
+
+    return feat_a[:, feat_mask], feat_b[:, feat_mask], feat_mask
+
+
 # ---------------------------------------------------------------------------
 # Статистика: Mann-Whitney + Benjamini-Hochberg (векторизованный)
 # ---------------------------------------------------------------------------
@@ -370,15 +438,21 @@ def _mannwhitneyu_vectorized(
     X_all = np.vstack([X_a, X_b])  # (n, n_features)
 
     ranks = np.empty((n, n_features), dtype=np.float64)
+    tie_corrections = np.zeros(n_features, dtype=np.float64)
     for f in range(n_features):
-        # Используем pandas.rank для tie-aware рангов без Python-цикла по tie-группам.
-        ranks[:, f] = pd.Series(X_all[:, f]).rank(method="average").to_numpy(dtype=np.float64)
+        col = X_all[:, f]
+        ranks[:, f] = pd.Series(col).rank(method="average").to_numpy(dtype=np.float64)
+        _, counts = np.unique(col, return_counts=True)
+        tie_corrections[f] = np.sum(counts ** 3 - counts)
 
     rank_sum_a = ranks[:n_a, :].sum(axis=0)
     U_a = rank_sum_a - n_a * (n_a + 1) / 2.0
 
     mu = n_a * n_b / 2.0
-    sigma = np.sqrt(n_a * n_b * (n + 1) / 12.0)
+    sigma = np.sqrt(
+        (n_a * n_b / 12.0) * ((n + 1) - tie_corrections / (n * (n - 1)))
+    )
+    sigma = np.maximum(sigma, 1e-12)
     Z = (U_a - mu) / sigma
     p = 2.0 * _norm.sf(np.abs(Z))
     p = np.clip(p, 0.0, 1.0)
@@ -413,6 +487,7 @@ def group_comparison(
     features_b: np.ndarray,
     bin_ids: list[str],
     alpha: float = 0.05,
+    pair_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Сравнение двух групп по всем парам бинов (upper triangle features).
 
@@ -423,11 +498,16 @@ def group_comparison(
         alpha: уровень значимости FDR
 
     Returns:
-        DataFrame: bin_i, bin_j, u_stat, p_raw, p_fdr, significant
+        DataFrame: bin_i, bin_j, u_stat, p_raw, p_fdr, effect_size_r, significant
         Отсортирован по p_fdr (ascending).
     """
     n_bins = len(bin_ids)
     idx_i, idx_j = np.triu_indices(n_bins, k=1)
+    if pair_mask is not None:
+        idx_i = idx_i[pair_mask]
+        idx_j = idx_j[pair_mask]
+
+    n_a, n_b = features_a.shape[0], features_b.shape[0]
 
     logger.info(
         "Mann-Whitney: %d vs %d субъектов, %d признаков …",
@@ -438,6 +518,7 @@ def group_comparison(
 
     logger.info("FDR (Benjamini-Hochberg, alpha=%.3f) …", alpha)
     p_fdr, significant = _fdr_bh(p_raw, alpha=alpha)
+    rank_biserial = 1.0 - (2.0 * u_stat) / (n_a * n_b)
 
     n_sig = int(significant.sum())
     logger.info(
@@ -451,6 +532,7 @@ def group_comparison(
         "u_stat":      u_stat,
         "p_raw":       p_raw,
         "p_fdr":       p_fdr,
+        "effect_size_r": rank_biserial,
         "significant": significant,
     }).sort_values("p_fdr").reset_index(drop=True)
 
@@ -472,7 +554,8 @@ def run_group_pipeline(
     alpha: float = 0.05,
     save_canonical_space: bool = True,
     save_feature_matrix: bool = True,
-    canonical_reference: str = "healthy",
+    canonical_reference: str = "all",
+    min_bin_coverage: float = 0.8,
 ) -> dict:
     """Полный pipeline группового сравнения.
 
@@ -515,7 +598,7 @@ def run_group_pipeline(
 
     # 2. Canonical space
     logger.info("=== Canonical voxel space (strategy=%s) ===", strategy)
-    ref = str(canonical_reference or "healthy").strip().lower()
+    ref = str(canonical_reference or "all").strip().lower()
     if ref == "healthy":
         ref_dfs = dfs_healthy
     elif ref == "schiz":
@@ -557,8 +640,15 @@ def run_group_pipeline(
     if np.isfinite(missing_corr) and abs(missing_corr) >= 0.3:
         logger.warning(
             "n_missing_bins заметно коррелирует с диагнозом (r=%.4f). "
-            "Это может указывать на конфаундер покрытия canonical space.",
+            "Результаты группового сравнения могут быть конфаундированы покрытием.",
             missing_corr,
+        )
+    if np.isfinite(missing_corr) and abs(missing_corr) >= COVERAGE_CONFOUND_THRESHOLD:
+        logger.error(
+            "КРИТИЧНО: n_missing_bins сильно коррелирует с диагнозом (r=%.4f >= %.2f). "
+            "Рекомендуется фиксированный spatial_bin_range и/или более строгий coverage-filter.",
+            missing_corr,
+            COVERAGE_CONFOUND_THRESHOLD,
         )
 
     qc_missing.to_csv(out / "missing_bin_qc.csv", index=False)
@@ -567,6 +657,18 @@ def run_group_pipeline(
     logger.info("=== Connectivity (%s) + признаки ===", method)
     feat_schiz, ids_schiz = build_feature_matrix(dfs_schiz_al, method=method)
     feat_healthy, ids_healthy = build_feature_matrix(dfs_healthy_al, method=method)
+
+    pair_mask: np.ndarray | None = None
+    if min_bin_coverage > 0.0:
+        logger.info("=== Фильтрация признаков по покрытию бинов (min=%.0f%%) ===", min_bin_coverage * 100)
+        feat_schiz, feat_healthy, pair_mask = filter_features_by_bin_coverage(
+            feat_schiz,
+            feat_healthy,
+            bin_ids=space.voxel_ids,
+            dfs_a=dfs_schiz_al,
+            dfs_b=dfs_healthy_al,
+            min_coverage=min_bin_coverage,
+        )
 
     if save_feature_matrix:
         np.save(out / "features_schiz.npy", feat_schiz)
@@ -585,6 +687,7 @@ def run_group_pipeline(
         feat_schiz, feat_healthy,
         bin_ids=space.voxel_ids,
         alpha=alpha,
+        pair_mask=pair_mask,
     )
 
     # 7. Экспорт
@@ -612,6 +715,7 @@ def run_group_pipeline(
         "method":           method,
         "strategy":         strategy,
         "canonical_reference": ref,
+        "min_bin_coverage": min_bin_coverage,
         "spatial_grid_size": spatial_grid_size,
         "missing_bins_diag_corr": (
             None if not np.isfinite(missing_corr) else round(float(missing_corr), 6)
