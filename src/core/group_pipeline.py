@@ -54,9 +54,13 @@ def load_subject(
         spatial_grid_method=spatial_grid_method,
         csv_stream_spatial_bin=True,
         csv_chunk_rows=csv_chunk_rows,
-        preprocess=True,
+        # Не применяем subject-wise preprocessing до align(), чтобы не вносить
+        # асимметричный dropout бинов между группами.
+        preprocess=False,
         normalize=False,
         remove_outliers=False,
+        # Не маскируем NaN нулями: отсутствующие бины должны быть явными.
+        fill_missing=False,
         return_report=False,
     )
     if df.empty:
@@ -218,22 +222,79 @@ def align_all(
     return result
 
 
+def _count_fully_missing_bins(df: pd.DataFrame) -> int:
+    """Считает число бинов, полностью отсутствующих у субъекта после align()."""
+    arr = df.to_numpy(dtype=np.float64, copy=False)
+    return int((~np.isfinite(arr)).all(axis=0).sum())
+
+
+def build_missing_bin_qc_table(dfs_aligned: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Строит QC-таблицу покрытия canonical space для набора субъектов."""
+    rows: list[dict[str, float | str | int]] = []
+    for sid, df in dfs_aligned.items():
+        n_bins = int(df.shape[1])
+        n_missing = _count_fully_missing_bins(df)
+        rows.append({
+            "subject_id": sid,
+            "n_bins": n_bins,
+            "n_missing_bins": n_missing,
+            "missing_bin_fraction": float(n_missing / max(1, n_bins)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _point_biserial_binary(labels: np.ndarray, values: np.ndarray) -> float:
+    """Корреляция бинарной метки и непрерывного признака (через Pearson)."""
+    x = np.asarray(labels, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64)
+    if x.size != y.size or x.size < 2:
+        return float("nan")
+    if np.nanstd(x) < 1e-12 or np.nanstd(y) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 # ---------------------------------------------------------------------------
 # Connectivity
 # ---------------------------------------------------------------------------
 
 def _correlation_matrix_fast(df: pd.DataFrame) -> np.ndarray:
-    """Pearson correlation (NaN → column mean перед расчётом)."""
+    """Pearson correlation с корректной обработкой отсутствующих бинов.
+
+    После ``align()`` часть бинов может отсутствовать у субъекта полностью.
+    Такие колонки приходят как all-NaN и должны давать нулевые корреляции,
+    а не заражать матрицу NaN-ами.
+    """
     X = df.to_numpy(dtype=np.float64, copy=True)
-    col_means = np.nanmean(X, axis=0)
+
+    # Колонки, где есть хотя бы одно конечное наблюдение.
+    finite_col = np.isfinite(X).any(axis=0)
+
+    # Для обычных колонок заполняем NaN средним; для all-NaN колонок берём 0.
+    finite_mask = np.isfinite(X)
+    finite_counts = finite_mask.sum(axis=0)
+    finite_sums = np.where(finite_mask, X, 0.0).sum(axis=0)
+    col_means = np.divide(
+        finite_sums,
+        np.maximum(finite_counts, 1),
+        dtype=np.float64,
+    )
+    col_means = np.where(finite_col, col_means, 0.0)
     nan_mask = ~np.isfinite(X)
     X[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+
     X -= X.mean(axis=0, keepdims=True)
     norms = np.sqrt((X ** 2).sum(axis=0, keepdims=True))
+    # Нулевые колонки (в т.ч. бывшие all-NaN) оставляем нулевыми после деления.
     norms[norms < 1e-12] = 1.0
     X /= norms
+
     C = X.T @ X
     np.clip(C, -1.0, 1.0, out=C)
+
+    # Явно обнуляем строки/столбцы отсутствующих бинов для прозрачности.
+    C[~finite_col, :] = 0.0
+    C[:, ~finite_col] = 0.0
     return C
 
 
@@ -481,7 +542,28 @@ def run_group_pipeline(
     dfs_schiz_al = align_all(dfs_schiz, space)
     dfs_healthy_al = align_all(dfs_healthy, space)
 
-    # 4–5. Connectivity + признаки
+    # 4. QC по отсутствующим бинам (потенциальный конфаундер покрытия)
+    qc_schiz = build_missing_bin_qc_table(dfs_schiz_al)
+    qc_schiz["group"] = "schiz"
+    qc_healthy = build_missing_bin_qc_table(dfs_healthy_al)
+    qc_healthy["group"] = "healthy"
+    qc_missing = pd.concat([qc_schiz, qc_healthy], axis=0, ignore_index=True)
+
+    labels = np.concatenate([
+        np.zeros(len(qc_schiz), dtype=np.float64),
+        np.ones(len(qc_healthy), dtype=np.float64),
+    ])
+    missing_corr = _point_biserial_binary(labels, qc_missing["n_missing_bins"].to_numpy())
+    if np.isfinite(missing_corr) and abs(missing_corr) >= 0.3:
+        logger.warning(
+            "n_missing_bins заметно коррелирует с диагнозом (r=%.4f). "
+            "Это может указывать на конфаундер покрытия canonical space.",
+            missing_corr,
+        )
+
+    qc_missing.to_csv(out / "missing_bin_qc.csv", index=False)
+
+    # 5. Connectivity + признаки
     logger.info("=== Connectivity (%s) + признаки ===", method)
     feat_schiz, ids_schiz = build_feature_matrix(dfs_schiz_al, method=method)
     feat_healthy, ids_healthy = build_feature_matrix(dfs_healthy_al, method=method)
@@ -531,5 +613,9 @@ def run_group_pipeline(
         "strategy":         strategy,
         "canonical_reference": ref,
         "spatial_grid_size": spatial_grid_size,
+        "missing_bins_diag_corr": (
+            None if not np.isfinite(missing_corr) else round(float(missing_corr), 6)
+        ),
+        "missing_bins_qc_path": str((out / "missing_bin_qc.csv").resolve()),
         "output_dir":       str(out.resolve()),
     }
