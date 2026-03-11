@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,8 @@ from .voxel_space import CanonicalVoxelSpace
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_EXTS = {".csv", ".xlsx", ".xls", ".parquet"}
+_T_COL_RE = re.compile(r"^t\d+$")
+_META_COLS = frozenset({"subject", "group", "iq", "sex"})
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,7 @@ def load_group(
     """
     files = _iter_subject_files(directory)
     result: dict[str, pd.DataFrame] = {}
+    schemas: list[dict] = []
     for path in files:
         sid = f"{group_label}::{path.stem}"
         logger.info("[%s] загрузка %s …", group_label, path.name)
@@ -87,6 +91,7 @@ def load_group(
                 csv_chunk_rows=csv_chunk_rows,
             )
             result[sid] = df
+            schemas.append(_validate_subject_schema(path, _peek_columns(path)))
             logger.info(
                 "[%s] %s: %d t × %d bins",
                 group_label, path.name, df.shape[0], df.shape[1],
@@ -95,7 +100,86 @@ def load_group(
             logger.error("[%s] ПРОПУСК %s: %s", group_label, path.name, exc)
     if not result:
         raise RuntimeError(f"Ни один субъект из {directory} не загружен.")
+    if schemas:
+        _cross_validate_group_schemas(schemas, group_label)
     return result
+
+
+def _peek_columns(filepath: Path) -> list[str]:
+    """Читает только имена колонок файла субъекта (дёшево, без полной загрузки)."""
+    suffix = filepath.suffix.lower()
+    if suffix == ".csv":
+        probe = pd.read_csv(filepath, nrows=0)
+        return [str(c) for c in probe.columns]
+    if suffix in {".xlsx", ".xls"}:
+        probe = pd.read_excel(filepath, nrows=0)
+        return [str(c) for c in probe.columns]
+    if suffix == ".parquet":
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            return [str(c) for c in pq.ParquetFile(filepath).schema.names]
+        except Exception:
+            probe = pd.read_parquet(filepath)
+            return [str(c) for c in probe.columns]
+    return []
+
+
+def _validate_subject_schema(filepath: Path, columns: list[str]) -> dict:
+    """Извлекает ключевые метрики схемы входного файла субъекта."""
+    cols = [str(c).strip() for c in columns]
+    lower = [c.lower() for c in cols]
+
+    time_cols = [c for c in lower if _T_COL_RE.match(c)]
+    meta_cols = [c for c in lower if c in _META_COLS]
+    coord_cols = [c for c in lower if c in {"x", "y", "z"}]
+
+    t_ids = sorted(int(c[1:]) for c in time_cols)
+    if t_ids:
+        t_min, t_max = t_ids[0], t_ids[-1]
+        missing = sorted(set(range(t_min, t_max + 1)) - set(t_ids))
+    else:
+        t_min, t_max, missing = None, None, []
+
+    if missing:
+        logger.warning(
+            "[schema] %s: пропущены временные точки t* (%d, первые=%s)",
+            filepath.name,
+            len(missing),
+            missing[:10],
+        )
+
+    return {
+        "file": filepath.name,
+        "n_time_cols": len(time_cols),
+        "n_meta_cols": len(meta_cols),
+        "n_coord_cols": len(coord_cols),
+        "t_range": (t_min, t_max),
+        "has_meta": bool(meta_cols),
+        "missing_t_count": len(missing),
+    }
+
+
+def _cross_validate_group_schemas(schemas: list[dict], group_label: str) -> None:
+    """Сверяет схемы субъектов внутри одной группы и пишет диагностические предупреждения."""
+    n_times = sorted({int(s["n_time_cols"]) for s in schemas})
+    t_ranges = sorted({tuple(s["t_range"]) for s in schemas})
+    if len(n_times) > 1:
+        logger.warning("[%s] Разное число временных колонок t*: %s", group_label, n_times)
+    if len(t_ranges) > 1:
+        logger.warning("[%s] Разные диапазоны t*: %s", group_label, t_ranges)
+
+    no_meta = [s["file"] for s in schemas if not bool(s["has_meta"])]
+    if no_meta:
+        logger.warning(
+            "[%s] Субъекты без метаданных subject/group/iq/sex: %s",
+            group_label,
+            no_meta,
+        )
+
+    with_gaps = [s["file"] for s in schemas if int(s["missing_t_count"]) > 0]
+    if with_gaps:
+        logger.warning("[%s] Обнаружены пропуски t* у файлов: %s", group_label, with_gaps)
 
 
 # ---------------------------------------------------------------------------
@@ -224,25 +308,10 @@ def _mannwhitneyu_vectorized(
 
     X_all = np.vstack([X_a, X_b])  # (n, n_features)
 
-    # Ранги по каждому признаку (average ties)
-    order = np.argsort(X_all, axis=0, kind="stable")
     ranks = np.empty((n, n_features), dtype=np.float64)
-    rows_idx = np.arange(n)
     for f in range(n_features):
-        r = np.empty(n, dtype=np.float64)
-        r[order[:, f]] = rows_idx + 1.0
-        # average ties: группируем одинаковые значения
-        vals = X_all[order[:, f], f]
-        i = 0
-        while i < n:
-            j = i + 1
-            while j < n and vals[j] == vals[i]:
-                j += 1
-            if j > i + 1:
-                avg = (i + j + 1) / 2.0  # средний ранг 1-based
-                r[order[i:j, f]] = avg
-            i = j
-        ranks[:, f] = r
+        # Используем pandas.rank для tie-aware рангов без Python-цикла по tie-группам.
+        ranks[:, f] = pd.Series(X_all[:, f]).rank(method="average").to_numpy(dtype=np.float64)
 
     rank_sum_a = ranks[:n_a, :].sum(axis=0)
     U_a = rank_sum_a - n_a * (n_a + 1) / 2.0
@@ -342,12 +411,13 @@ def run_group_pipeline(
     alpha: float = 0.05,
     save_canonical_space: bool = True,
     save_feature_matrix: bool = True,
+    canonical_reference: str = "healthy",
 ) -> dict:
     """Полный pipeline группового сравнения.
 
     Шаги:
       1. Загрузка субъектов (потоковая биннизация)
-      2. Построение canonical voxel space по всем субъектам
+      2. Построение canonical voxel space по reference-группе
       3. Выравнивание субъектов к canonical space
       4. Вычисление connectivity матриц (Pearson correlation)
       5. Извлечение признаков (upper triangle пар бинов)
@@ -384,7 +454,22 @@ def run_group_pipeline(
 
     # 2. Canonical space
     logger.info("=== Canonical voxel space (strategy=%s) ===", strategy)
-    space = fit_canonical_space(all_dfs, strategy=strategy)
+    ref = str(canonical_reference or "healthy").strip().lower()
+    if ref == "healthy":
+        ref_dfs = dfs_healthy
+    elif ref == "schiz":
+        ref_dfs = dfs_schiz
+    elif ref == "all":
+        ref_dfs = all_dfs
+        logger.warning("canonical_reference='all' может давать leakage при train/test сценариях.")
+    else:
+        raise ValueError(
+            "canonical_reference должен быть одним из: 'healthy', 'schiz', 'all'."
+        )
+
+    space = fit_canonical_space(ref_dfs, strategy=strategy)
+    space.source_info["reference_group"] = ref
+    space.source_info["n_reference_subjects"] = len(ref_dfs)
 
     if save_canonical_space:
         space_path = out / "canonical_space.json"
@@ -444,6 +529,7 @@ def run_group_pipeline(
         "alpha":            alpha,
         "method":           method,
         "strategy":         strategy,
+        "canonical_reference": ref,
         "spatial_grid_size": spatial_grid_size,
         "output_dir":       str(out.resolve()),
     }

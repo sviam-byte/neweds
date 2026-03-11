@@ -189,6 +189,51 @@ def _select_voxels_wide(
     return df.iloc[:k, :].copy()
 
 
+def _validate_voxel_uniqueness(
+    xi: np.ndarray,
+    yi: np.ndarray,
+    zi: np.ndarray,
+    *,
+    on_duplicate: str = "error",
+) -> np.ndarray:
+    """Проверяет уникальность (x,y,z) в отсортированном наборе координат.
+
+    Args:
+        xi, yi, zi: координаты после детерминированной сортировки по (x, y, z).
+        on_duplicate: политика обработки дублей:
+            - "error": бросает ValueError (безопасный режим по умолчанию);
+            - "warn": только предупреждение, без удаления строк;
+            - "drop_first": оставляет последнее вхождение в цепочке дублей.
+
+    Returns:
+        Булева маска keep той же длины, что и входные массивы.
+    """
+    dup_mask = (xi[1:] == xi[:-1]) & (yi[1:] == yi[:-1]) & (zi[1:] == zi[:-1])
+    n_dupes = int(np.sum(dup_mask))
+    if n_dupes == 0:
+        return np.ones(len(xi), dtype=bool)
+
+    dup_pos = np.where(dup_mask)[0]
+    examples = [(int(xi[i + 1]), int(yi[i + 1]), int(zi[i + 1])) for i in dup_pos[:3]]
+    msg = (
+        f"[voxel_wide] Обнаружено {n_dupes} повторяющихся координат (x,y,z). "
+        f"Примеры: {examples}. Это делает voxel_id неоднозначным."
+    )
+
+    mode = str(on_duplicate or "error").strip().lower()
+    if mode == "error":
+        raise ValueError(msg)
+    if mode == "warn":
+        logging.warning(msg)
+        return np.ones(len(xi), dtype=bool)
+    if mode == "drop_first":
+        logging.warning(msg + " Применяется drop_first: оставляем последнее вхождение.")
+        keep = np.ones(len(xi), dtype=bool)
+        keep[np.concatenate((dup_mask, [False]))] = False
+        return keep
+    raise ValueError(f"Неизвестный режим on_duplicate={on_duplicate!r}")
+
+
 def voxel_wide_to_timeseries(
     df: pd.DataFrame,
     *,
@@ -198,6 +243,7 @@ def voxel_wide_to_timeseries(
     spatial_bin_size: int = 0,
     spatial_bin_method: str = "mean",
     spatial_bin_range: tuple | None = None,
+    on_duplicate_voxels: str = "error",
 ) -> pd.DataFrame:
     """Конвертирует таблицу x,y,z,t0..tN в матрицу time × voxel (или time × bin).
 
@@ -305,13 +351,20 @@ def voxel_wide_to_timeseries(
     coords = coords.iloc[row_order].copy().reset_index(drop=True)
     ts = ts.iloc[row_order].copy()
 
-    dup_mask = (xi[1:] == xi[:-1]) & (yi[1:] == yi[:-1]) & (zi[1:] == zi[:-1])
-    n_dupes = int(np.sum(dup_mask))
-    if n_dupes:
-        logging.warning(
-            "[voxel_wide] Обнаружено %d строк с повторяющимися координатами (x,y,z).",
-            n_dupes,
-        )
+    keep = _validate_voxel_uniqueness(
+        xi,
+        yi,
+        zi,
+        on_duplicate=on_duplicate_voxels,
+    )
+    if not keep.all():
+        xi = xi[keep]
+        yi = yi[keep]
+        zi = zi[keep]
+        coords = coords.iloc[np.where(keep)[0]].copy().reset_index(drop=True)
+        ts = ts.iloc[np.where(keep)[0]].copy()
+
+    dup_mask = (xi[1:] == xi[:-1]) & (yi[1:] == yi[:-1]) & (zi[1:] == zi[:-1]) if len(xi) > 1 else np.array([], dtype=bool)
 
     # Убираем индекс строки из id: одинаковые координаты → одинаковый voxel_id между субъектами.
     voxel_ids = np.array(
@@ -1283,6 +1336,7 @@ def tidy_timeseries_table(
     spatial_bin_size: int = 0,
     spatial_bin_method: str = "mean",
     spatial_bin_range: tuple | None = None,
+    on_duplicate_voxels: str = "error",
 ) -> pd.DataFrame:
     """Превращает сырую таблицу в numeric матрицу вида time × features."""
     out = df.copy()
@@ -1298,6 +1352,7 @@ def tidy_timeseries_table(
             spatial_bin_size=spatial_bin_size,
             spatial_bin_method=spatial_bin_method,
             spatial_bin_range=spatial_bin_range,
+            on_duplicate_voxels=on_duplicate_voxels,
         )
     except Exception:
         pass
@@ -2117,13 +2172,31 @@ def preprocess_timeseries(
             stds = np.nanstd(arr, axis=0)
             stds[stds < 1e-12] = 1.0
             out[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
+            report.notes["normalization"] = {
+                "mode": "zscore",
+                "n_series": len(cols),
+                "col_names": [str(c) for c in cols],
+                "means": means.tolist(),
+                "stds": stds.tolist(),
+            }
         elif mode in {"robust", "robust_z", "mad"}:
             report.add("[Preprocess] normalize: robust z-score (median/MAD) per series")
+            medians: list[float] = []
+            mads: list[float] = []
             for col in cols:
                 s = out[col].astype(float)
                 med = float(s.median())
                 mad = float((s - med).abs().median()) * 1.4826 + 1e-12
                 out[col] = (s - med) / mad
+                medians.append(med)
+                mads.append(mad)
+            report.notes["normalization"] = {
+                "mode": "robust_zscore",
+                "n_series": len(cols),
+                "col_names": [str(c) for c in cols],
+                "medians": medians,
+                "mads": mads,
+            }
         elif mode in {"rank", "rank_dense", "rank_pct", "rank_percentile"}:
             rmode = str(rank_mode or "dense").strip().lower()
             if mode in {"rank_pct", "rank_percentile"}:
@@ -2139,6 +2212,13 @@ def preprocess_timeseries(
             stds = np.nanstd(arr, axis=0)
             stds[stds < 1e-12] = 1.0
             out[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
+            report.notes["normalization"] = {
+                "mode": "zscore",
+                "n_series": len(cols),
+                "col_names": [str(c) for c in cols],
+                "means": means.tolist(),
+                "stds": stds.tolist(),
+            }
 
     if check_stationarity:
         report.add("[Preprocess] stationarity check: ADF")
@@ -2174,6 +2254,7 @@ def load_or_generate(
     spatial_grid_size: int | None = None,
     spatial_grid_method: str = "mean",
     spatial_bin_range: tuple | None = None,
+    on_duplicate_voxels: str = "error",
     lazy_spatial_bin: bool = False,
     time_chunk: int = 50,
     # Параметры для больших данных и производительности
@@ -2316,8 +2397,7 @@ def load_or_generate(
                 _fp_low_csv.endswith(".csv")
                 and bool(csv_stream_spatial_bin)
                 and _csv_spatial_bin_size > 1
-                and spatial_bin_range is None
-                and str(spatial_grid_method or "mean").strip().lower() in {"mean", "sum"}
+                                and str(spatial_grid_method or "mean").strip().lower() in {"mean", "sum"}
                 and usecols in {"auto", None}
             )
             if _try_stream_csv_spatial:
@@ -2331,7 +2411,7 @@ def load_or_generate(
                             chunksize=int(csv_chunk_rows),
                             spatial_bin_size=_csv_spatial_bin_size,
                             spatial_bin_method=str(spatial_grid_method or "mean"),
-                            spatial_bin_range=None,
+                            spatial_bin_range=spatial_bin_range,
                         )
                 except Exception as exc:
                     logging.warning("[CSV spatial bin stream] fallback to regular loader: %s", exc)
@@ -2394,6 +2474,7 @@ def load_or_generate(
                     spatial_bin_size=_csv_spatial_bin_size,
                     spatial_bin_method=str(spatial_grid_method or "mean"),
                     spatial_bin_range=spatial_bin_range,
+                    on_duplicate_voxels=on_duplicate_voxels,
                 )
         coords_df = None
         try:
@@ -2595,13 +2676,16 @@ def stream_csv_voxel_wide_to_timeseries(
             "Streaming CSV spatial binning currently supports only mean/sum; "
             f"got method={spatial_bin_method!r}"
         )
-    if spatial_bin_range is not None:
-        raise ValueError(
-            "Streaming CSV spatial binning currently implements only local deterministic mode "
-            "(spatial_bin_range=None)."
-        )
-
     b = max(1, int(spatial_bin_size or 1))
+    fixed_range = spatial_bin_range is not None
+    if fixed_range:
+        (rx0, rx1), (ry0, ry1), (rz0, rz1) = spatial_bin_range
+        grid_bx_min = int(np.floor(rx0 / b))
+        grid_bx_max = int(np.floor(rx1 / b))
+        grid_by_min = int(np.floor(ry0 / b))
+        grid_by_max = int(np.floor(ry1 / b))
+        grid_bz_min = int(np.floor(rz0 / b))
+        grid_bz_max = int(np.floor(rz1 / b))
     xcol = str(layout["xcol"])
     ycol = str(layout["ycol"])
     zcol = str(layout["zcol"])
@@ -2670,6 +2754,22 @@ def stream_csv_voxel_wide_to_timeseries(
         bx = np.floor(xa / b).astype(np.int32)
         by = np.floor(ya / b).astype(np.int32)
         bz = np.floor(za / b).astype(np.int32)
+        if fixed_range:
+            in_range = (
+                (bx >= grid_bx_min) & (bx <= grid_bx_max)
+                & (by >= grid_by_min) & (by <= grid_by_max)
+                & (bz >= grid_bz_min) & (bz <= grid_bz_max)
+            )
+            bx = bx[in_range]
+            by = by[in_range]
+            bz = bz[in_range]
+            xa = xa[in_range]
+            ya = ya[in_range]
+            za = za[in_range]
+            ta = ta[in_range]
+            if bx.size == 0:
+                continue
+
         coords = np.stack([bx, by, bz], axis=1)
         uniq, inv = np.unique(coords, axis=0, return_inverse=True)
         n_uniq = int(uniq.shape[0])
@@ -2703,6 +2803,23 @@ def stream_csv_voxel_wide_to_timeseries(
                 ysum_rows[idx] += float(chunk_ysum[j])
                 zsum_rows[idx] += float(chunk_zsum[j])
                 coord_count_rows[idx] += int(chunk_counts[j])
+
+    if fixed_range:
+        for ibx in range(grid_bx_min, grid_bx_max + 1):
+            for iby in range(grid_by_min, grid_by_max + 1):
+                for ibz in range(grid_bz_min, grid_bz_max + 1):
+                    key = (int(ibx), int(iby), int(ibz))
+                    if key in bin_to_idx:
+                        continue
+                    idx = len(bin_keys)
+                    bin_to_idx[key] = idx
+                    bin_keys.append(key)
+                    sums_rows.append(np.zeros((n_time or 0,), dtype=np.float64))
+                    counts_rows.append(0)
+                    xsum_rows.append(float(ibx * b + b / 2.0))
+                    ysum_rows.append(float(iby * b + b / 2.0))
+                    zsum_rows.append(float(ibz * b + b / 2.0))
+                    coord_count_rows.append(0)
 
     if not bin_keys or n_time is None:
         raise ValueError(
@@ -2753,10 +2870,10 @@ def stream_csv_voxel_wide_to_timeseries(
         "output_bins": len(keep_sorted),
         "bin_size": b,
         "method": method_eff,
-        "bin_range": None,
+        "bin_range": spatial_bin_range,
         "bin_key_formula": "floor(coord / bin_size)",
         "deterministic": True,
-        "fixed_range": False,
+        "fixed_range": bool(fixed_range),
         "streaming": True,
         "chunksize": int(chunksize),
         "n_chunks": int(n_chunks),

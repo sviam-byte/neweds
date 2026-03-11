@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
@@ -150,6 +151,12 @@ class CanonicalVoxelSpace:
             "fill_value": self.fill_value if np.isfinite(self.fill_value) else None,
             "voxel_ids": self.voxel_ids,
             "source_info": self.source_info,
+            "runtime": {
+                "python": sys.version,
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "created_at": pd.Timestamp.now().isoformat(),
+            },
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
