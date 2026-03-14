@@ -965,6 +965,18 @@ class App(tk.Tk):
         if do_excel:
             self._set_stage("Формирование Excel отчёта", 0.99)
             tool.export_big_excel(excel_path, threshold=cfg.graph_threshold, p_value_alpha=cfg.p_value_alpha)
+        try:
+            tool.export_run_manifest(os.path.join(out_dir, f"{name_prefix}_run_manifest.json"), extra={"out_dir": out_dir, "input_file": fp})
+        except Exception as e:
+            print(f"[WARN] export_run_manifest failed: {e}")
+        try:
+            tool.export_binned_timeseries(
+                os.path.join(out_dir, f"{name_prefix}_binned_timeseries.csv"),
+                coords_path=os.path.join(out_dir, f"{name_prefix}_binned_coords.csv"),
+                metadata_path=os.path.join(out_dir, f"{name_prefix}_binned_meta.json"),
+            )
+        except Exception:
+            pass
         self._set_stage("Готово", 1.0)
         return html_path if do_html else None
 
