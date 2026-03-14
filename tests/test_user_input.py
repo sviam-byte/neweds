@@ -50,3 +50,14 @@ def test_expand_variants_preset_and_unique() -> None:
     # После канонизации алиасов ожидаем canonical-имя variant
     assert variants.count("correlation_full") == 1
     assert variants.count("te_directed") == 1
+
+
+def test_expand_variants_all_matches_registry() -> None:
+    variants, explain = expand_variants(["all"])
+    assert "preset 'all'" in explain
+    assert "te_full" in variants
+    assert "te_partial" in variants
+    assert "correlation_directed" in variants
+    assert "h2_directed" in variants
+    assert "granger_partial" in variants
+    assert "te_directed" not in variants

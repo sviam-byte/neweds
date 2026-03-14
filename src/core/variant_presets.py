@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+from ..metrics.registry import METRICS_REGISTRY
+
 
 # Алиасы коротких имён → каноническое имя в реестре (registry.py).
 # Позволяет использовать сокращения в пресетах и пользовательском вводе.
@@ -22,6 +24,9 @@ def _resolve_alias(name: str) -> str:
     return VARIANT_ALIASES.get(name, name)
 
 
+ALL_REGISTRY_VARIANTS = list(METRICS_REGISTRY.keys())
+
+
 PRESETS = {
     # максимально безопасный по времени и интерпретации
     "basic": [
@@ -37,56 +42,61 @@ PRESETS = {
     "entropy": [
         "mutinf_full",
         "mutinf_partial",
+        "ordinal_full",
     ],
-    # нелинейные (без параметров)
+    # нелинейные
     "nonlinear": [
         "dcor_full",
         "dcor_partial",
         "ordinal_full",
+        "h2_full",
+        "h2_partial",
     ],
-    # направленные/каузальные
+    # направленные/каузальные — только реально существующие variant-ы
     "causal": [
-        "granger_directed",
-        "te_directed",
-        "ah_directed",
-        "dcor_directed",
-        "ordinal_directed",
+        variant
+        for variant in [
+            "correlation_directed",
+            "h2_directed",
+            "granger_full",
+            "granger_partial",
+            "te_full",
+            "te_partial",
+            "ah_directed",
+            "dcor_directed",
+            "ordinal_directed",
+        ]
+        if variant in ALL_REGISTRY_VARIANTS
     ],
-    # «всё адекватное»: без слишком экспериментальных комбинаций
+    # «полный разумный»
     "full": [
-        "corr_full",
-        "corr_partial",
-        "coh_full",
-        "mutinf_full",
-        "mutinf_partial",
-        "dcor_full",
-        "ordinal_full",
-        "granger_directed",
-        "te_directed",
-        "ah_directed",
+        variant
+        for variant in [
+            "correlation_full",
+            "correlation_spearman",
+            "correlation_kendall",
+            "correlation_partial",
+            "correlation_directed",
+            "coherence_full",
+            "coherence_partial",
+            "mutinf_full",
+            "mutinf_partial",
+            "dcor_full",
+            "dcor_partial",
+            "ordinal_full",
+            "ordinal_directed",
+            "granger_full",
+            "granger_partial",
+            "te_full",
+            "te_partial",
+            "ah_full",
+            "ah_partial",
+            "ah_directed",
+        ]
+        if variant in ALL_REGISTRY_VARIANTS
     ],
-    "all": [
-        "corr_full",
-        "corr_partial",
-        "coh_full",
-        "coh_partial",
-        "mutinf_full",
-        "mutinf_partial",
-        "dcor_full",
-        "dcor_partial",
-        "dcor_directed",
-        "ordinal_full",
-        "ordinal_directed",
-        "granger_full",
-        "granger_partial",
-        "granger_directed",
-        "te_full",
-        "te_partial",
-        "te_directed",
-        "ah_full",
-        "ah_partial",
-        "ah_directed",
-    ],
+    # абсолютно всё из живого реестра
+    "all": list(ALL_REGISTRY_VARIANTS),
 }
 
 

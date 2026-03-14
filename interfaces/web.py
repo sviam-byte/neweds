@@ -20,7 +20,7 @@ import streamlit as st
 # Добавляем путь к src
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import EXPERIMENTAL_METHODS, SAVE_FOLDER, STABLE_METHODS
+from src.config import EXPERIMENTAL_METHODS, METHOD_INFO, SAVE_FOLDER, STABLE_METHODS
 from src.core import engine, generator
 from src.core.preprocessing import configure_warnings
 from src.validation.runner import run_quick_validation, run_full_validation, run_validation
@@ -28,27 +28,71 @@ from src.validation.scenarios import ALL_SCENARIOS, QUICK_SCENARIOS
 
 configure_warnings()
 
+
+def _registry_methods() -> list[str]:
+    """Полный список методов из реестра движка, а не из урезанных UI-списков."""
+    try:
+        methods = sorted(list((getattr(engine, "method_mapping", None) or {}).keys()))
+    except Exception:
+        methods = []
+    if methods:
+        return methods
+    # Fallback на config-списки, если по какой-то причине реестр недоступен.
+    return sorted(set(STABLE_METHODS + EXPERIMENTAL_METHODS))
+
+
+def _pick_available(preferred: list[str]) -> list[str]:
+    available = set(_registry_methods())
+    return [m for m in preferred if m in available]
+
+
+def _full_method_bundles() -> dict[str, list[str]]:
+    all_methods = _registry_methods()
+    return {
+        "Пользовательский": [],
+        "Fast stable": _preset_payload("Fast stable").get("selected_methods", []),
+        "Default stable": _preset_payload("Default stable").get("selected_methods", []),
+        "Все stable": list(STABLE_METHODS),
+        "Corr + rank": _pick_available([
+            "correlation_full", "correlation_spearman", "correlation_kendall",
+            "correlation_partial", "correlation_directed",
+        ]),
+        "MI + TE": _pick_available([
+            "mutinf_full", "mutinf_partial", "te_full", "te_partial",
+            "ordinal_full", "ordinal_directed",
+        ]),
+        "Directed + causal": _pick_available([
+            "correlation_directed", "h2_directed",
+            "granger_full", "granger_partial",
+            "te_full", "te_partial",
+            "ah_directed", "dcor_directed", "ordinal_directed",
+        ]),
+        "Всё": list(all_methods),
+    }
+
+
+def _method_label(name: str) -> str:
+    info = METHOD_INFO.get(name) or {}
+    title = str(info.get("title") or "").strip()
+    return f"{name} — {title}" if title else name
+
 PRESET_NAMES = [
     "Fast stable",
     "Default stable",
     "Heavy research",
+    "All methods",
     "fMRI batch safe",
 ]
 
 
 def _preset_payload(name: str) -> dict:
     """Возвращает пресет sane-defaults для типовых запусков."""
-    fast_methods = [
-        m for m in ["correlation_full", "correlation_spearman", "dcor_full", "ordinal_full"]
-        if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
-    ]
-    stable_methods = [
-        m for m in [
-            "correlation_full", "correlation_spearman", "correlation_kendall", "correlation_partial", "coherence_full",
-            "dcor_full", "ordinal_full", "granger_full",
-        ] if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
-    ]
-    all_heavy = list(STABLE_METHODS + EXPERIMENTAL_METHODS)
+    fast_methods = _pick_available(["correlation_full", "correlation_spearman", "dcor_full", "ordinal_full"])
+    stable_methods = _pick_available([
+        "correlation_full", "correlation_spearman", "correlation_kendall", "correlation_partial",
+        "coherence_full", "dcor_full", "ordinal_full", "granger_full",
+    ])
+    all_heavy = list(_registry_methods())
 
     presets = {
         "Fast stable": {
@@ -72,6 +116,16 @@ def _preset_payload(name: str) -> dict:
             "include_fft_plots": False, "save_series_bundle": True, "time_stride": 1,
         },
         "Heavy research": {
+            "selected_methods": all_heavy, "enable_experimental": True,
+            "remove_ar1": True, "remove_ar_order": 3, "ar_diagnostics": True,
+            "lag_selection_mode_ui": "optimize", "lag": 1, "max_lag": 8,
+            "use_main_windows": True, "window_sizes_text": "128,256,512", "window_stride_main": 0,
+            "window_policy": "best", "include_scans": True,
+            "scan_lag": True, "scan_window_pos": True, "scan_window_size": True, "scan_cube": False,
+            "output_mode": "both", "include_diagnostics": True, "include_matrix_tables": True,
+            "include_fft_plots": True, "save_series_bundle": True, "time_stride": 1,
+        },
+        "All methods": {
             "selected_methods": all_heavy, "enable_experimental": True,
             "remove_ar1": True, "remove_ar_order": 3, "ar_diagnostics": True,
             "lag_selection_mode_ui": "optimize", "lag": 1, "max_lag": 8,
@@ -1041,18 +1095,42 @@ def main() -> None:
     st.subheader("3. Выбор методов")
 
 
-    all_methods = STABLE_METHODS + EXPERIMENTAL_METHODS
-    if "selected_methods" not in st.session_state or not st.session_state.get("selected_methods"):
-        st.session_state["selected_methods"] = list(DEFAULT_STABLE_METHODS)
+    all_methods = _registry_methods()
+    selected_current = [m for m in st.session_state.get("selected_methods", DEFAULT_STABLE_METHODS) if m in all_methods]
+    if not selected_current:
+        selected_current = list(_pick_available(DEFAULT_STABLE_METHODS))
+        st.session_state["selected_methods"] = list(selected_current)
+
+    bundle_map = _full_method_bundles()
+    bundle_choice = st.selectbox(
+        "Набор методов",
+        list(bundle_map.keys()),
+        index=0,
+        key="method_bundle_choice",
+        help="Быстрый выбор готового набора. Вариант 'Всё' берёт полный реестр методов движка.",
+    )
+    apply_cols = st.columns([1, 4])
+    with apply_cols[0]:
+        if st.button("Применить набор"):
+            if bundle_choice != "Пользовательский":
+                chosen = list(bundle_map.get(bundle_choice, []))
+                st.session_state["selected_methods"] = chosen
+                if any(m not in STABLE_METHODS for m in chosen):
+                    st.session_state["enable_experimental"] = True
+                st.rerun()
+    with apply_cols[1]:
+        st.caption(f"Доступно в реестре: {len(all_methods)} методов")
+
     selected_methods = st.multiselect(
         "Выберите методы",
         all_methods,
-        default=st.session_state.get("selected_methods", DEFAULT_STABLE_METHODS),
+        default=selected_current,
         key="selected_methods",
+        format_func=_method_label,
     )
 
     with st.expander("Быстрые кнопки", expanded=False):
-        cqb1, cqb2, cqb3, cqb4, cqb5, cqb6 = st.columns(6)
+        cqb1, cqb2, cqb3, cqb4, cqb5, cqb6, cqb7 = st.columns(7)
         with cqb1:
             if st.button("Только fast stable"):
                 st.session_state["selected_methods"] = _preset_payload("Fast stable")["selected_methods"]
@@ -1063,20 +1141,26 @@ def main() -> None:
                 st.rerun()
         with cqb3:
             if st.button("Все stable"):
-                st.session_state["selected_methods"] = list(STABLE_METHODS)
+                st.session_state["selected_methods"] = _pick_available(list(STABLE_METHODS))
                 st.rerun()
         with cqb4:
             if st.button("Corr + rank"):
-                st.session_state["selected_methods"] = [m for m in ["correlation_full", "correlation_spearman", "correlation_kendall", "correlation_partial"] if m in all_methods]
+                st.session_state["selected_methods"] = list(bundle_map.get("Corr + rank", []))
                 st.rerun()
         with cqb5:
             if st.button("MI + TE"):
-                st.session_state["selected_methods"] = [m for m in ["mutinf_full", "mutinf_partial", "te_full", "te_partial"] if m in all_methods]
+                st.session_state["selected_methods"] = list(bundle_map.get("MI + TE", []))
                 st.session_state["enable_experimental"] = True
                 st.rerun()
         with cqb6:
-            if st.button("Все методы"):
+            if st.button("Directed + causal"):
+                st.session_state["selected_methods"] = list(bundle_map.get("Directed + causal", []))
+                st.session_state["enable_experimental"] = True
+                st.rerun()
+        with cqb7:
+            if st.button("Всё"):
                 st.session_state["selected_methods"] = list(all_methods)
+                st.session_state["enable_experimental"] = True
                 st.rerun()
 
     run_plan = {
