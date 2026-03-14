@@ -157,7 +157,8 @@ def _preset_payload(name: str) -> dict:
 def _apply_preset_to_session(name: str) -> None:
     """Применяет выбранный пресет к session_state."""
     payload = _preset_payload(name)
-    st.session_state["launch_preset"] = name
+    # Нельзя вручную менять ключ виджета после его создания в том же run,
+    # иначе Streamlit выбрасывает StreamlitAPIException.
     for k, v in payload.items():
         st.session_state[k] = v
 
