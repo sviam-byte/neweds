@@ -17,7 +17,7 @@ import logging
 import os
 import warnings
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
 from itertools import chain, combinations
@@ -63,6 +63,46 @@ class RunLog:
 
     def as_text(self) -> str:
         return "\n".join(self.items)
+
+
+def _to_jsonable(obj):
+    """Приводит произвольные объекты к JSON-safe представлению."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, pd.Index):
+        return obj.tolist()
+    if isinstance(obj, pd.DataFrame):
+        return {"type": "DataFrame", "shape": [int(obj.shape[0]), int(obj.shape[1])], "columns": [str(c) for c in obj.columns[:50]]}
+    if isinstance(obj, pd.Series):
+        return {"type": "Series", "len": int(len(obj)), "name": str(obj.name)}
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+
+def _config_snapshot(cfg) -> dict:
+    """Снимок конфигурации для сохранения в артефакты без падений сериализации."""
+    try:
+        return asdict(cfg)
+    except Exception:
+        try:
+            return dict(getattr(cfg, "__dict__", {}) or {})
+        except Exception:
+            return {}
 
 # Опциональная зависимость: nolds (для части метрик)
 # На Python 3.13 часто ломается из-за pkg_resources (setuptools>=81).
@@ -1891,6 +1931,19 @@ class BigMasterTool:
                 logging.warning("Применено дифференцирование к %s нестационарным рядам.", diff_count)
 
         self.data_after_autodiff = self.data.copy()
+        try:
+            self.results_meta.setdefault("__run__", {})
+            run_meta = self.results_meta["__run__"]
+            run_meta.update(
+                {
+                    "input_file": str(filepath),
+                    "load_kwargs": _to_jsonable(kwargs),
+                    "data_shape_after_load": list(getattr(self, "data", pd.DataFrame()).shape),
+                    "coords_shape": list(getattr(self, "coords_df", pd.DataFrame()).shape) if isinstance(getattr(self, "coords_df", None), pd.DataFrame) else None,
+                }
+            )
+        except Exception:
+            pass
         logging.info("[BigMasterTool] Данные готовы: %s", self.data.shape)
         self._stage("Данные готовы", 0.70, shape=list(self.data.shape))
         return self.data
@@ -1994,7 +2047,8 @@ class BigMasterTool:
         # сохраняем параметры запуска (для UI/CLI пояснений)
         try:
             self.results_meta.setdefault("__run__", {})
-            self.results_meta["__run__"].update(
+            run_meta = self.results_meta["__run__"]
+            run_meta.update(
                 {
                     "variants": list(variants),
                     "max_lag": int(max_lag),
@@ -2006,6 +2060,18 @@ class BigMasterTool:
                     "control_strategy": kwargs.get("control_strategy", "none"),
                     "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
                     "dimred": dict(getattr(self, "dimred_report", {}) or {}),
+
+                    "scan_window_pos": bool(kwargs.get("scan_window_pos", False)),
+                    "scan_window_size": bool(kwargs.get("scan_window_size", False)),
+                    "scan_lag": bool(kwargs.get("scan_lag", False)),
+                    "scan_cube": bool(kwargs.get("scan_cube", False)),
+                    "window_sizes_grid": _to_jsonable(kwargs.get("window_sizes_grid")),
+                    "lag_grid": _to_jsonable(kwargs.get("lag_grid")),
+                    "cube_matrix_mode": kwargs.get("cube_matrix_mode"),
+                    "method_options": _to_jsonable(kwargs.get("method_options") or {}),
+                    "run_kwargs": _to_jsonable(kwargs),
+                    "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
+                    "data_shape_before_metrics": list(getattr(self, "data", pd.DataFrame()).shape),
                 }
             )
         except Exception:
@@ -2988,6 +3054,17 @@ class BigMasterTool:
                 datasets["COORDS"] = coords
         except Exception:
             pass
+        try:
+            data_main = getattr(self, "data", None)
+            if isinstance(data_main, pd.DataFrame) and not data_main.empty:
+                fmt = str(getattr(data_main, "attrs", {}).get("format", "")).lower()
+                if fmt == "spatial_bins":
+                    datasets["BINNED_TIMESERIES"] = data_main
+                    coords_attr = getattr(data_main, "attrs", {}).get("coords")
+                    if isinstance(coords_attr, pd.DataFrame) and not coords_attr.empty:
+                        datasets["BINNED_COORDS"] = coords_attr
+        except Exception:
+            pass
 
         save_path_obj = Path(save_path)
         warnings: list[str] = []
@@ -3027,11 +3104,86 @@ class BigMasterTool:
                 "preprocessing": self.get_preprocessing_summary(),
                 "methods": list(getattr(self, "results", {}).keys()),
                 "results_meta": getattr(self, "results_meta", {}),
+                "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
+                "data_attrs": _to_jsonable(getattr(getattr(self, "data", None), "attrs", {})),
             }
             meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
         return save_path
+
+
+    def export_binned_timeseries(
+        self,
+        save_path: str,
+        *,
+        coords_path: str | None = None,
+        metadata_path: str | None = None,
+    ) -> dict[str, str]:
+        """Сохраняет spatial-binned ряды и связанные метаданные в CSV/JSON."""
+        import json
+
+        data_main = getattr(self, "data", None)
+        if not isinstance(data_main, pd.DataFrame) or data_main.empty:
+            raise ValueError("Нет данных для сохранения binned time-series.")
+        fmt = str(getattr(data_main, "attrs", {}).get("format", "")).lower()
+        if fmt != "spatial_bins":
+            raise ValueError("Текущие данные не находятся в формате spatial_bins.")
+
+        save_obj = Path(save_path)
+        save_obj.parent.mkdir(parents=True, exist_ok=True)
+        data_main.to_csv(save_obj, index=False)
+        out = {"binned_timeseries_csv": str(save_obj)}
+
+        coords_df = None
+        try:
+            coords_df = getattr(data_main, "attrs", {}).get("coords")
+        except Exception:
+            coords_df = None
+        if not isinstance(coords_df, pd.DataFrame) or coords_df.empty:
+            coords_df = getattr(self, "coords_df", None)
+        if isinstance(coords_df, pd.DataFrame) and not coords_df.empty:
+            coords_obj = Path(coords_path) if coords_path else save_obj.with_name(f"{save_obj.stem}_coords.csv")
+            coords_obj.parent.mkdir(parents=True, exist_ok=True)
+            coords_df.to_csv(coords_obj, index=False)
+            out["binned_coords_csv"] = str(coords_obj)
+
+        meta_obj = Path(metadata_path) if metadata_path else save_obj.with_name(f"{save_obj.stem}_meta.json")
+        meta = {
+            "data_shape": list(data_main.shape),
+            "columns": [str(c) for c in data_main.columns],
+            "data_attrs": _to_jsonable(getattr(data_main, "attrs", {})),
+            "coords_shape": list(coords_df.shape) if isinstance(coords_df, pd.DataFrame) else None,
+            "results_meta_run": _to_jsonable((getattr(self, "results_meta", {}) or {}).get("__run__", {})),
+        }
+        meta_obj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        out["binned_meta_json"] = str(meta_obj)
+        return out
+
+    def export_run_manifest(self, save_path: str, *, extra: dict | None = None) -> str:
+        """Сохраняет manifest запуска с ключевыми параметрами и размерами данных."""
+        import json
+
+        payload = {
+            "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
+            "results_meta": _to_jsonable(getattr(self, "results_meta", {}) or {}),
+            "preprocessing_summary": _to_jsonable(self.get_preprocessing_summary()),
+            "data_shape": list(getattr(self, "data", pd.DataFrame()).shape),
+            "data_raw_shape": list(getattr(self, "data_raw", pd.DataFrame()).shape) if isinstance(getattr(self, "data_raw", None), pd.DataFrame) else None,
+            "data_preprocessed_shape": list(getattr(self, "data_preprocessed", pd.DataFrame()).shape) if isinstance(getattr(self, "data_preprocessed", None), pd.DataFrame) else None,
+            "data_after_autodiff_shape": list(getattr(self, "data_after_autodiff", pd.DataFrame()).shape) if isinstance(getattr(self, "data_after_autodiff", None), pd.DataFrame) else None,
+            "data_normalized_shape": list(getattr(self, "data_normalized", pd.DataFrame()).shape) if isinstance(getattr(self, "data_normalized", None), pd.DataFrame) else None,
+            "data_attrs": _to_jsonable(getattr(getattr(self, "data", None), "attrs", {})),
+            "coords_shape": list(getattr(self, "coords_df", pd.DataFrame()).shape) if isinstance(getattr(self, "coords_df", None), pd.DataFrame) else None,
+            "window_analysis": _to_jsonable(getattr(self, "window_analysis", {}) or {}),
+            "variant_lags": _to_jsonable(getattr(self, "variant_lags", {}) or {}),
+        }
+        if extra:
+            payload["extra"] = _to_jsonable(extra)
+        save_obj = Path(save_path)
+        save_obj.parent.mkdir(parents=True, exist_ok=True)
+        save_obj.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(save_obj)
 
 
     def _maybe_apply_dimred(self, **kwargs) -> None:

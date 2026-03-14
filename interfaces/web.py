@@ -39,16 +39,16 @@ PRESET_NAMES = [
 def _preset_payload(name: str) -> dict:
     """Возвращает пресет sane-defaults для типовых запусков."""
     fast_methods = [
-        m for m in ["correlation_full", "dcor_full", "ordinal_full"]
+        m for m in ["correlation_full", "correlation_spearman", "dcor_full", "ordinal_full"]
         if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
     ]
     stable_methods = [
         m for m in [
-            "correlation_full", "correlation_partial", "coherence_full",
+            "correlation_full", "correlation_spearman", "correlation_kendall", "correlation_partial", "coherence_full",
             "dcor_full", "ordinal_full", "granger_full",
         ] if m in (STABLE_METHODS + EXPERIMENTAL_METHODS)
     ]
-    all_heavy = [m for m in (STABLE_METHODS + EXPERIMENTAL_METHODS) if m not in {"te_partial"}]
+    all_heavy = list(STABLE_METHODS + EXPERIMENTAL_METHODS)
 
     presets = {
         "Fast stable": {
@@ -115,6 +115,8 @@ DEFAULT_STABLE_METHODS = [
     m
     for m in [
         "correlation_full",
+        "correlation_spearman",
+        "correlation_kendall",
         "correlation_partial",
         "coherence_full",
         "dcor_full",
@@ -1031,7 +1033,7 @@ def main() -> None:
         method_options_text = st.text_area(
             "method_options (JSON, ключ = метод)",
             value="",
-            placeholder='Напр.: {"te_directed": {"scan_cube": false, "cube_matrix_mode": "selected"}}',
+            placeholder='Напр.: {"te_full": {"bins": 8, "lag": 2}, "mutinf_full": {"k": 5}}',
             height=80,
         )
 
@@ -1050,7 +1052,7 @@ def main() -> None:
     )
 
     with st.expander("Быстрые кнопки", expanded=False):
-        cqb1, cqb2, cqb3, cqb4 = st.columns(4)
+        cqb1, cqb2, cqb3, cqb4, cqb5, cqb6 = st.columns(6)
         with cqb1:
             if st.button("Только fast stable"):
                 st.session_state["selected_methods"] = _preset_payload("Fast stable")["selected_methods"]
@@ -1064,6 +1066,15 @@ def main() -> None:
                 st.session_state["selected_methods"] = list(STABLE_METHODS)
                 st.rerun()
         with cqb4:
+            if st.button("Corr + rank"):
+                st.session_state["selected_methods"] = [m for m in ["correlation_full", "correlation_spearman", "correlation_kendall", "correlation_partial"] if m in all_methods]
+                st.rerun()
+        with cqb5:
+            if st.button("MI + TE"):
+                st.session_state["selected_methods"] = [m for m in ["mutinf_full", "mutinf_partial", "te_full", "te_partial"] if m in all_methods]
+                st.session_state["enable_experimental"] = True
+                st.rerun()
+        with cqb6:
             if st.button("Все методы"):
                 st.session_state["selected_methods"] = list(all_methods)
                 st.rerun()
@@ -1351,6 +1362,8 @@ def main() -> None:
 
                     series_path = run_dir / f"{safe_stem}_series.xlsx"
                     series_artifact_path = None
+                    binned_artifacts = {}
+                    run_manifest_path = run_dir / f"{safe_stem}_run_manifest.json"
 
                     if bool(save_series_bundle):
                         try:
@@ -1359,6 +1372,18 @@ def main() -> None:
                                 series_artifact_path = Path(exported)
                         except Exception as exc:
                             row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
+                    try:
+                        tool.export_run_manifest(str(run_manifest_path), extra={"run_dir": str(run_dir), "input_path": str(input_path)})
+                    except Exception as exc:
+                        row["error"] = (row["error"] + " | " if row["error"] else "") + f"manifest: {exc}"
+                    try:
+                        binned_artifacts = tool.export_binned_timeseries(
+                            str(run_dir / f"{safe_stem}_binned_timeseries.csv"),
+                            coords_path=str(run_dir / f"{safe_stem}_binned_coords.csv"),
+                            metadata_path=str(run_dir / f"{safe_stem}_binned_meta.json"),
+                        )
+                    except Exception:
+                        binned_artifacts = {}
 
                     excel_path = run_dir / f"{safe_stem}_full.xlsx"
                     html_path = run_dir / f"{safe_stem}_report.html"
@@ -1392,6 +1417,9 @@ def main() -> None:
                         if series_artifact_path is not None and series_artifact_path.exists()
                         else ""
                     )
+                    row["run_manifest_path"] = str(run_manifest_path) if run_manifest_path.exists() else ""
+                    row["binned_timeseries_csv"] = str(binned_artifacts.get("binned_timeseries_csv", ""))
+                    row["binned_coords_csv"] = str(binned_artifacts.get("binned_coords_csv", ""))
                     try:
                         tool.export_connectivity_bundle(
                             str(run_dir),
@@ -1677,6 +1705,8 @@ def main() -> None:
                 # Это может быть как .xlsx, так и директория с CSV.
                 series_path = run_dir / f"{stem}_series.xlsx"
                 series_artifact_path = None
+                binned_artifacts = {}
+                run_manifest_path = run_dir / f"{stem}_run_manifest.json"
 
                 if bool(save_series_bundle):
                     try:
@@ -1726,7 +1756,7 @@ def main() -> None:
                 except Exception:
                     pass
 
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 with c1:
                     if output_mode in {"excel", "both"} and excel_path.exists():
                         st.download_button("Скачать Excel", excel_path.read_bytes(), excel_path.name)
@@ -1754,12 +1784,25 @@ def main() -> None:
                                 series_zip_path.read_bytes(),
                                 series_zip_path.name,
                             )
+                with c4:
+                    _bt = binned_artifacts.get("binned_timeseries_csv", "")
+                    if _bt and Path(_bt).exists():
+                        _bt_path = Path(_bt)
+                        st.download_button("Скачать binned CSV", _bt_path.read_bytes(), _bt_path.name)
+                with c5:
+                    if run_manifest_path.exists():
+                        st.download_button("Скачать manifest", run_manifest_path.read_bytes(), run_manifest_path.name)
 
-                    if series_artifact_path is not None and series_artifact_path.exists():
-                        if series_artifact_path.is_file():
-                            st.caption(f"Ряды сохранены в файл: {series_artifact_path.name}")
-                        elif series_artifact_path.is_dir():
-                            st.caption(f"Ряды сохранены в папку: {series_artifact_path.name}")
+                if series_artifact_path is not None and series_artifact_path.exists():
+                    if series_artifact_path.is_file():
+                        st.caption(f"Ряды сохранены в файл: {series_artifact_path.name}")
+                    elif series_artifact_path.is_dir():
+                        st.caption(f"Ряды сохранены в папку: {series_artifact_path.name}")
+                _bc = binned_artifacts.get("binned_coords_csv", "")
+                if _bc:
+                    st.caption(f"Binned export: {Path(binned_artifacts.get('binned_timeseries_csv', '')).name} + {Path(_bc).name}")
+                if run_manifest_path.exists():
+                    st.caption(f"Manifest запуска: {run_manifest_path.name}")
 
                 status_payload = {
                     "input_file": str(input_path),
@@ -1772,6 +1815,10 @@ def main() -> None:
                         if series_artifact_path is not None and series_artifact_path.exists()
                         else ""
                     ),
+                    "run_manifest_path": str(run_manifest_path) if run_manifest_path.exists() else "",
+                    "binned_timeseries_csv": str(binned_artifacts.get("binned_timeseries_csv", "")),
+                    "binned_coords_csv": str(binned_artifacts.get("binned_coords_csv", "")),
+                    "binned_meta_json": str(binned_artifacts.get("binned_meta_json", "")),
                 }
                 _write_json(run_dir / "status.json", status_payload)
 

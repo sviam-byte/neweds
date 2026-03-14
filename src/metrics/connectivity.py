@@ -11,6 +11,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
+from scipy import stats
 from scipy.spatial import cKDTree
 from scipy.special import digamma
 from statsmodels.tsa.stattools import grangercausalitytests
@@ -163,6 +164,36 @@ def _corr_1d(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(xx, yy)[0, 1])
 
 
+def _spearman_1d(x: np.ndarray, y: np.ndarray) -> float:
+    """Безопасная оценка корреляции Спирмена для двух одномерных рядов."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(mask.sum()) < 3:
+        return float("nan")
+    xx = np.asarray(x[mask], dtype=np.float64)
+    yy = np.asarray(y[mask], dtype=np.float64)
+    if np.nanstd(xx) <= 1e-12 or np.nanstd(yy) <= 1e-12:
+        return float("nan")
+    try:
+        return float(stats.spearmanr(xx, yy, nan_policy="omit").statistic)
+    except Exception:
+        return float("nan")
+
+
+def _kendall_1d(x: np.ndarray, y: np.ndarray) -> float:
+    """Безопасная оценка Kendall tau-b для двух одномерных рядов."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(mask.sum()) < 3:
+        return float("nan")
+    xx = np.asarray(x[mask], dtype=np.float64)
+    yy = np.asarray(y[mask], dtype=np.float64)
+    if np.nanstd(xx) <= 1e-12 or np.nanstd(yy) <= 1e-12:
+        return float("nan")
+    try:
+        return float(stats.kendalltau(xx, yy, nan_policy="omit", variant="b").statistic)
+    except Exception:
+        return float("nan")
+
+
 def _as_2d_controls(df: pd.DataFrame, control: Optional[list[str]] = None, control_matrix: Optional[np.ndarray] = None) -> tuple[np.ndarray, list[str]]:
     """Возвращает (X_ctrl, desc).
 
@@ -260,6 +291,86 @@ def correlation_matrix(
     if not np.isfinite(X).all():
         return data.corr().values
     return _fast_corr_matrix(X)
+
+
+
+def spearman_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Матрица корреляции Спирмена (ранговая монотонная связь)."""
+    n_cols = int(data.shape[1])
+    if pairs is not None:
+        X = _prepare_numpy(data)
+        out = _init_matrix(n_cols, 0.0, diag=1.0)
+        for i, j in _iter_pairs(n_cols, pairs, directed=False):
+            val = _spearman_1d(X[:, i], X[:, j])
+            out[i, j] = out[j, i] = float(val) if np.isfinite(val) else 0.0
+        return out
+    try:
+        return data.corr(method="spearman").values
+    except Exception:
+        X = _prepare_numpy(data)
+        out = _init_matrix(n_cols, 0.0, diag=1.0)
+        for i in range(n_cols):
+            for j in range(i + 1, n_cols):
+                val = _spearman_1d(X[:, i], X[:, j])
+                out[i, j] = out[j, i] = float(val) if np.isfinite(val) else 0.0
+        return out
+
+
+def kendall_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Матрица Kendall tau-b (ранговая согласованность пар)."""
+    n_cols = int(data.shape[1])
+    if pairs is not None:
+        X = _prepare_numpy(data)
+        out = _init_matrix(n_cols, 0.0, diag=1.0)
+        for i, j in _iter_pairs(n_cols, pairs, directed=False):
+            val = _kendall_1d(X[:, i], X[:, j])
+            out[i, j] = out[j, i] = float(val) if np.isfinite(val) else 0.0
+        return out
+    try:
+        return data.corr(method="kendall").values
+    except Exception:
+        X = _prepare_numpy(data)
+        out = _init_matrix(n_cols, 0.0, diag=1.0)
+        for i in range(n_cols):
+            for j in range(i + 1, n_cols):
+                val = _kendall_1d(X[:, i], X[:, j])
+                out[i, j] = out[j, i] = float(val) if np.isfinite(val) else 0.0
+        return out
+
+
+
+def spearman_correlation_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **kwargs: dict,
+) -> np.ndarray:
+    """Совместимый алиас: ранговая корреляция Спирмена."""
+    return spearman_matrix(data, lag=lag, control=control, pairs=pairs, **kwargs)
+
+
+def kendall_correlation_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **kwargs: dict,
+) -> np.ndarray:
+    """Совместимый алиас: ранговая корреляция Кендалла tau-b."""
+    return kendall_matrix(data, lag=lag, control=control, pairs=pairs, **kwargs)
 
 def partial_correlation_matrix(
     df: pd.DataFrame,

@@ -34,6 +34,8 @@ PYINFORM_AVAILABLE = importlib.util.find_spec("pyinform") is not None
 # Стабильные методы
 STABLE_METHODS = [
     "correlation_full",
+    "correlation_spearman",
+    "correlation_kendall",
     "correlation_partial",
     "coherence_full",
     "coherence_partial",
@@ -56,12 +58,8 @@ EXPERIMENTAL_METHODS_BASE = [
     "ordinal_directed",
 ]
 
-# Если pyinform недоступен, скрываем TE-методы
-EXPERIMENTAL_METHODS = [
-    method
-    for method in EXPERIMENTAL_METHODS_BASE
-    if PYINFORM_AVAILABLE or not method.startswith("te_")
-]
+# TE-методы не скрываем: при отсутствии pyinform ядро использует fallback.
+EXPERIMENTAL_METHODS = list(EXPERIMENTAL_METHODS_BASE)
 
 # P-value методы
 PVAL_METHODS = {
@@ -87,8 +85,16 @@ DIRECTED_METHODS = {
 # Информация о методах
 METHOD_INFO = {
     "correlation_full": {
-        "title": "Корреляция (полная)",
+        "title": "Корреляция (Пирсон, полная)",
         "meaning": "Линейная связь. Значение в [-1, 1]. |value| ближе к 1 = сильнее.",
+    },
+    "correlation_spearman": {
+        "title": "Корреляция Спирмена",
+        "meaning": "Ранговая монотонная связь. Значение в [-1, 1]. Более устойчива к выбросам и нелинейной монотонности.",
+    },
+    "correlation_kendall": {
+        "title": "Корреляция Кендалла (tau-b)",
+        "meaning": "Ранговая согласованность пар. Значение в [-1, 1]. Обычно устойчивее при ties, но медленнее.",
     },
     "correlation_partial": {
         "title": "Частичная корреляция",

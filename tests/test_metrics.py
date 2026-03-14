@@ -3,7 +3,12 @@
 import numpy as np
 import pandas as pd
 
-from src.metrics.connectivity import correlation_matrix, granger_matrix
+from src.metrics.connectivity import (
+    correlation_matrix,
+    granger_matrix,
+    kendall_matrix,
+    spearman_matrix,
+)
 from src.metrics.registry import get_metric_func
 
 
@@ -34,3 +39,19 @@ def test_registry_lookup() -> None:
     func = get_metric_func("correlation_full")
     out = func(pd.DataFrame({"x": [0, 1], "y": [0, 1]}), lag=1, control=None)
     assert out.shape == (2, 2)
+
+
+def test_spearman_monotonic_detected() -> None:
+    """Спирмен должен показывать почти идеальную связь на строго монотонных рядах."""
+    df = pd.DataFrame({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30, 40, 50]})
+    matrix = spearman_matrix(df)
+    assert matrix.shape == (2, 2)
+    assert matrix[0, 1] > 0.99
+
+
+def test_kendall_monotonic_detected() -> None:
+    """Kendall tau-b должен показывать почти идеальную связь на монотонных рядах."""
+    df = pd.DataFrame({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30, 40, 50]})
+    matrix = kendall_matrix(df)
+    assert matrix.shape == (2, 2)
+    assert matrix[0, 1] > 0.99

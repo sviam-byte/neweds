@@ -22,6 +22,8 @@ def _h2_directed(df: pd.DataFrame, lag: int = 1, control: Optional[list[str]] = 
 
 METRICS_REGISTRY: dict[str, MetricFunc] = {
     "correlation_full": connectivity.correlation_matrix,
+    "correlation_spearman": connectivity.spearman_correlation_matrix,
+    "correlation_kendall": connectivity.kendall_correlation_matrix,
     "correlation_partial": connectivity.partial_correlation_matrix,
     "correlation_directed": connectivity.lagged_directed_correlation,
     "h2_full": _h2_full,
