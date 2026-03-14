@@ -122,6 +122,56 @@ def build_run_summary_ru(tool, *, run_dir: Optional[str] = None) -> str:
         except Exception:
             pass
 
+    # 3.5) Параметры запуска: явно дублируем ключевые run-настройки из manifest
+    # в человеко-читаемом summary, чтобы они были видны и в тексте, и в HTML.
+    try:
+        run_meta = (getattr(tool, "results_meta", {}) or {}).get("__run__", {}) or {}
+    except Exception:
+        run_meta = {}
+
+    if run_meta:
+        lines.append("Параметры запуска")
+
+        max_lag = run_meta.get("max_lag")
+        lag_selection = run_meta.get("lag_selection")
+        lag = run_meta.get("lag")
+        if max_lag is not None:
+            lines.append(f"- max_lag: {max_lag}")
+        if lag_selection is not None:
+            lines.append(f"- lag_selection: {lag_selection}")
+        if lag is not None:
+            lines.append(f"- lag: {lag}")
+
+        ws = run_meta.get("window_sizes")
+        wstride = run_meta.get("window_stride")
+        wpolicy = run_meta.get("window_policy")
+        if ws:
+            lines.append(f"- main windows: {ws}")
+        if wstride not in (None, "", 0):
+            lines.append(f"- window_stride: {wstride}")
+        elif "window_stride" in run_meta:
+            # Явно показываем режим auto, когда stride присутствует в настройках,
+            # но не задан числом (для совместимости со старыми конфигами/запусками).
+            lines.append("- window_stride: auto")
+        if wpolicy:
+            lines.append(f"- window_policy: {wpolicy}")
+
+        wgrid = run_meta.get("window_sizes_grid")
+        if wgrid:
+            lines.append(f"- window_sizes_grid: {wgrid}")
+
+        lgrid = run_meta.get("lag_grid")
+        if lgrid:
+            lines.append(f"- lag_grid: {lgrid}")
+
+        lines.append(
+            "- scans: "
+            f"pos={_fmt_bool(run_meta.get('scan_window_pos', False))}, "
+            f"size={_fmt_bool(run_meta.get('scan_window_size', False))}, "
+            f"lag={_fmt_bool(run_meta.get('scan_lag', False))}, "
+            f"cube={_fmt_bool(run_meta.get('scan_cube', False))}"
+        )
+
     # 4) Partial/Directed — по факту рассчитанных методов
     results_meta = getattr(tool, "results_meta", {}) or {}
     partial_methods = []
