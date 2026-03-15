@@ -662,9 +662,11 @@ def main() -> None:
             batch_start_number = st.number_input(
                 "Стартовать с номера",
                 min_value=1,
-                value=int(st.session_state.get("batch_start_number", 1)),
+                # Используем UI-ключ как источник истины, но сохраняем fallback
+                # на legacy-ключ для обратной совместимости со старыми сессиями.
+                value=int(st.session_state.get("ui_batch_start_number", st.session_state.get("batch_start_number", 1))),
                 step=1,
-                key="batch_start_number",
+                key="ui_batch_start_number",
                 help="Номер берётся из отсортированного списка preview ниже. Удобно для ручного resume после падения/остановки.",
             )
         with c_batch6:
@@ -682,7 +684,7 @@ def main() -> None:
                 recursive=bool(st.session_state.get("batch_recursive", False)),
                 allowed_exts=st.session_state.get("batch_allowed_exts"),
             )
-            st.caption(f"Найдено файлов: {len(preview_files)} | старт с номера: {int(st.session_state.get('batch_start_number', 1))}")
+            st.caption(f"Найдено файлов: {len(preview_files)} | старт с номера: {int(batch_start_number)}")
             if preview_files:
                 st.dataframe(
                     pd.DataFrame({
