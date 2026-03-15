@@ -20,6 +20,7 @@ from ..analysis import stats as analysis_stats
 import numpy as np
 from scipy import stats
 from scipy.io import loadmat
+from scipy.sparse import csr_matrix as _csr_matrix
 
 from src.io.loaders import load_h5_spatial_binned_lazy
 
@@ -49,12 +50,45 @@ def _looks_like_encoding_error(exc: Exception) -> bool:
     )
 
 
+def _probe_csv_encoding(filepath: str, *, engine: str = "") -> str:
+    """Быстро подбирает рабочую кодировку CSV по первым строкам файла.
+
+    Пытается прочитать небольшой префикс файла (32 строки) с типовыми
+    кодировками. Это позволяет избежать полного fallback-перебора на каждом
+    вызове ``read_csv`` в потоковом режиме.
+    """
+    base_engine = str(engine or "").strip().lower()
+    for enc in CSV_ENCODING_CANDIDATES:
+        kw: Dict[str, Any] = {"header": None, "nrows": 32, "encoding": enc}
+        if base_engine == "pyarrow" and enc not in {"utf-8", "utf8", "utf-8-sig"}:
+            kw["engine"] = "c"
+        else:
+            kw["engine"] = base_engine or None
+        if kw.get("engine") is None:
+            kw.pop("engine", None)
+        try:
+            pd.read_csv(filepath, **kw)
+            if enc != "utf-8":
+                logging.info("[CSV] encoding probe: %s -> %s", filepath, enc)
+            return enc
+        except Exception as exc:
+            if _looks_like_encoding_error(exc):
+                continue
+            raise
+    return "utf-8"
+
+
 def _read_csv_with_encoding_fallback(filepath: str, **kw):
     """Читает CSV/итератор CSV, перебирая частые кодировки Windows/UTF.
 
     Это нужно для giant voxel CSV, где один не-UTF8 байт ломал stream-path и
     заставлял код сваливаться в regular loader с риском OOM.
+
+    Если ``encoding`` уже передан, fallback-перебор не выполняется.
     """
+    if "encoding" in kw:
+        return pd.read_csv(filepath, **kw)
+
     last_exc: Exception | None = None
     base_engine = str(kw.get("engine", "") or "").strip().lower()
     tried: list[str] = []
@@ -2693,16 +2727,22 @@ def _iter_csv_voxel_wide_chunks(
     header: str = "auto",
     csv_engine: str = "auto",
     chunksize: int = 4096,
+    _layout: dict[str, Any] | None = None,
+    _encoding: str | None = None,
 ):
     """Итератор по чанкам CSV для формата x,y,z,t0..tN."""
-    layout = _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
+    layout = _layout or _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
     if not bool(layout.get("is_voxel_wide")):
         raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+
+    stream_engine = _csv_choose_stream_engine(csv_engine)
+    encoding = _encoding or _probe_csv_encoding(filepath, engine=stream_engine)
 
     kw: Dict[str, Any] = {
         "chunksize": max(1, int(chunksize)),
         "low_memory": False,
-        "engine": _csv_choose_stream_engine(csv_engine),
+        "engine": stream_engine,
+        "encoding": encoding,
     }
     if bool(layout.get("has_header")):
         kw["header"] = 0
@@ -2739,6 +2779,10 @@ def stream_csv_voxel_wide_to_timeseries(
     layout = _probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
     if not bool(layout.get("is_voxel_wide")):
         raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+
+    # Вычисляем кодировку один раз на файл и переиспользуем в каждом чанке.
+    _stream_engine = _csv_choose_stream_engine(csv_engine)
+    _encoding = _probe_csv_encoding(filepath, engine=_stream_engine)
 
     method_eff = str(spatial_bin_method or "mean").strip().lower()
     if method_eff not in {"mean", "sum"}:
@@ -2795,13 +2839,22 @@ def stream_csv_voxel_wide_to_timeseries(
         header=header,
         csv_engine=csv_engine,
         chunksize=chunksize,
+        _layout=layout,
+        _encoding=_encoding,
     ):
         n_chunks += 1
-        work = chunk[[xcol, ycol, zcol] + time_cols].copy()
-        x = pd.to_numeric(work[xcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-        y = pd.to_numeric(work[ycol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-        z = pd.to_numeric(work[zcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
-        ts_arr = work[time_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32, copy=False)
+        # Координаты читаем только из 3 колонок без полной копии чанка.
+        x = pd.to_numeric(chunk[xcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        y = pd.to_numeric(chunk[ycol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        z = pd.to_numeric(chunk[zcol], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+        # Для числового блока time_cols используем прямой to_numpy;
+        # fallback на pd.to_numeric применяем только к object/mixed dtype.
+        _tc_block = chunk[time_cols]
+        if _tc_block.dtypes.apply(lambda d: np.issubdtype(d, np.number)).all():
+            ts_arr = _tc_block.to_numpy(dtype=np.float32, copy=False)
+        else:
+            ts_arr = _tc_block.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32, copy=False)
         if order.size:
             ts_arr = ts_arr[:, order]
         if n_time is None:
@@ -2821,9 +2874,9 @@ def stream_csv_voxel_wide_to_timeseries(
         za = z[alive]
         ta = ts_arr[alive].astype(np.float64, copy=False)
 
-        bx = np.floor(xa / b).astype(np.int32)
-        by = np.floor(ya / b).astype(np.int32)
-        bz = np.floor(za / b).astype(np.int32)
+        bx = np.floor(xa / b).astype(np.int64)
+        by = np.floor(ya / b).astype(np.int64)
+        bz = np.floor(za / b).astype(np.int64)
         if fixed_range:
             in_range = (
                 (bx >= grid_bx_min) & (bx <= grid_bx_max)
@@ -2840,21 +2893,39 @@ def stream_csv_voxel_wide_to_timeseries(
             if bx.size == 0:
                 continue
 
-        coords = np.stack([bx, by, bz], axis=1)
-        uniq, inv = np.unique(coords, axis=0, return_inverse=True)
-        n_uniq = int(uniq.shape[0])
+        # Кодируем 3D-индексы в 1D ключи без коллизий внутри текущего чанка.
+        by_min = int(by.min())
+        bz_min = int(bz.min())
+        by_span = int(by.max() - by_min + 1)
+        bz_span = int(bz.max() - bz_min + 1)
+        by_off = by - by_min
+        bz_off = bz - bz_min
+        hash_keys = ((bx * by_span) + by_off) * bz_span + bz_off
+        uniq_hash, inv = np.unique(hash_keys, return_inverse=True)
+        n_uniq = int(uniq_hash.shape[0])
         if n_uniq == 0:
             continue
 
-        chunk_sums = np.zeros((n_uniq, ta.shape[1]), dtype=np.float64)
-        np.add.at(chunk_sums, inv, ta)
-        chunk_counts = np.bincount(inv, minlength=n_uniq).astype(np.int64)
-        chunk_xsum = np.bincount(inv, weights=xa, minlength=n_uniq).astype(np.float64)
-        chunk_ysum = np.bincount(inv, weights=ya, minlength=n_uniq).astype(np.float64)
-        chunk_zsum = np.bincount(inv, weights=za, minlength=n_uniq).astype(np.float64)
+        # Восстанавливаем (bx, by, bz) из хеша.
+        u_bx = uniq_hash // (by_span * bz_span)
+        rem = uniq_hash % (by_span * bz_span)
+        u_by = (rem // bz_span) + by_min
+        u_bz = (rem % bz_span) + bz_min
+
+        # Групповые суммы через sparse scatter (быстрее, чем np.add.at на больших чанках).
+        n_rows = int(ta.shape[0])
+        group_mat = _csr_matrix(
+            (np.ones(n_rows, dtype=np.float64), (inv, np.arange(n_rows, dtype=np.int32))),
+            shape=(n_uniq, n_rows),
+        )
+        chunk_sums = np.asarray(group_mat @ ta, dtype=np.float64)
+        chunk_counts = np.asarray(group_mat.sum(axis=1), dtype=np.int64).ravel()
+        chunk_xsum = np.asarray(group_mat @ xa.reshape(-1, 1), dtype=np.float64).ravel()
+        chunk_ysum = np.asarray(group_mat @ ya.reshape(-1, 1), dtype=np.float64).ravel()
+        chunk_zsum = np.asarray(group_mat @ za.reshape(-1, 1), dtype=np.float64).ravel()
 
         for j in range(n_uniq):
-            key = (int(uniq[j, 0]), int(uniq[j, 1]), int(uniq[j, 2]))
+            key = (int(u_bx[j]), int(u_by[j]), int(u_bz[j]))
             idx = bin_to_idx.get(key)
             if idx is None:
                 idx = len(bin_keys)
