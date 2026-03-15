@@ -8,6 +8,7 @@
 import logging
 import os
 import re
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +35,58 @@ MAX_RAW_VOXELS_FOR_GUI = 5000
 Ограничение применяется на этапе извлечения из 4D H5 до построения полного
 DataFrame time×voxel, чтобы избежать взрывного роста памяти.
 """
+
+CSV_ENCODING_CANDIDATES = ("utf-8", "utf-8-sig", "cp1251", "cp1252", "latin1")
+
+
+def _looks_like_encoding_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        isinstance(exc, UnicodeDecodeError)
+        or "codec can't decode" in msg
+        or "unicode" in msg
+        or "utf-8" in msg and "decode" in msg
+    )
+
+
+def _read_csv_with_encoding_fallback(filepath: str, **kw):
+    """Читает CSV/итератор CSV, перебирая частые кодировки Windows/UTF.
+
+    Это нужно для giant voxel CSV, где один не-UTF8 байт ломал stream-path и
+    заставлял код сваливаться в regular loader с риском OOM.
+    """
+    last_exc: Exception | None = None
+    base_engine = str(kw.get("engine", "") or "").strip().lower()
+    tried: list[str] = []
+
+    for enc in CSV_ENCODING_CANDIDATES:
+        trial = dict(kw)
+        trial["encoding"] = enc
+        # pyarrow далеко не всегда дружит с legacy-кодировками; для fallback
+        # принудительно уходим на pandas C-engine.
+        if base_engine == "pyarrow" and enc not in {"utf-8", "utf8", "utf-8-sig"}:
+            trial["engine"] = "c"
+        try:
+            obj = pd.read_csv(filepath, **trial)
+            if enc != "utf-8":
+                logging.info("[CSV] encoding fallback: %s -> %s", filepath, enc)
+            return obj
+        except Exception as exc:
+            if _looks_like_encoding_error(exc):
+                last_exc = exc
+                tried.append(enc)
+                continue
+            raise
+
+    if last_exc is not None:
+        raise UnicodeDecodeError(
+            "csv",
+            b"",
+            0,
+            1,
+            f"Could not decode CSV with encodings {tried}: {last_exc}",
+        )
+    return pd.read_csv(filepath, **kw)
 
 
 @dataclass
@@ -597,18 +650,28 @@ def _voxel_wide_spatial_bin(
 
 def _detect_time_like_col(col: pd.Series) -> bool:
     """Эвристика для авто-обнаружения временной/индексной колонки."""
-    try:
-        dt = pd.to_datetime(col, errors="coerce", utc=False)
-        if dt.notna().mean() >= 0.9:
-            return dt.is_monotonic_increasing or dt.is_monotonic_decreasing
-    except Exception:
-        pass
+    sample = col.dropna()
+    if sample.empty:
+        return False
 
-    c = pd.to_numeric(col, errors="coerce")
+    # Сначала проверяем числовой индекс: это дёшево и не вызывает dateutil-parse
+    # на сотнях/тысячах значений из voxel-wide матриц.
+    c = pd.to_numeric(sample, errors="coerce")
     if c.notna().mean() >= 0.95:
         dif = c.dropna().diff().dropna()
         if len(dif) >= 3 and (dif.abs() > 0).mean() >= 0.9:
             return True
+        return False
+
+    probe = sample.iloc[: min(len(sample), 2048)]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            dt = pd.to_datetime(probe, errors="coerce", utc=False)
+        if dt.notna().mean() >= 0.9:
+            return dt.is_monotonic_increasing or dt.is_monotonic_decreasing
+    except Exception:
+        pass
     return False
 
 
@@ -1196,7 +1259,7 @@ def _csv_probe_ncols(filepath: str, *, nrows: int = 2) -> int:
     Возвращает 0 при ошибке.
     """
     try:
-        probe = pd.read_csv(filepath, header=None, nrows=nrows)
+        probe = _read_csv_with_encoding_fallback(filepath, header=None, nrows=nrows, low_memory=False)
         return int(probe.shape[1])
     except Exception:
         return 0
@@ -1257,7 +1320,7 @@ def read_input_table(
         # чтобы избежать OOM на очень широких файлах (сотни тысяч вокселей).
         if usecols != "auto" and usecols is not None:
             kw["usecols"] = usecols
-        df0 = pd.read_csv(fp, **kw)
+        df0 = _read_csv_with_encoding_fallback(fp, **kw)
     else:
         xl_usecols = usecols
         excel_probe_single_col = False
@@ -2414,6 +2477,13 @@ def load_or_generate(
                             spatial_bin_range=spatial_bin_range,
                         )
                 except Exception as exc:
+                    _csv_ncols_probe = _csv_probe_ncols(str(filepath))
+                    if _csv_ncols_probe >= 50000:
+                        raise ValueError(
+                            "Streaming CSV spatial binning failed on a very wide CSV "
+                            f"(ncols≈{_csv_ncols_probe}). Regular fallback is blocked to avoid OOM. "
+                            f"Original error: {exc}"
+                        ) from exc
                     logging.warning("[CSV spatial bin stream] fallback to regular loader: %s", exc)
                     df = None
 
@@ -2574,7 +2644,7 @@ def _read_csv_probe_raw(
     """Читает небольшой сырой probe CSV без полной загрузки файла."""
     kw: Dict[str, Any] = {"header": None, "nrows": int(nrows), "low_memory": False}
     kw["engine"] = _csv_choose_stream_engine(csv_engine)
-    return pd.read_csv(filepath, **kw)
+    return _read_csv_with_encoding_fallback(filepath, **kw)
 
 
 def _probe_csv_voxel_wide_layout(
@@ -2640,7 +2710,7 @@ def _iter_csv_voxel_wide_chunks(
         kw["header"] = None
         kw["names"] = list(layout["columns"])
 
-    for chunk in pd.read_csv(filepath, **kw):
+    for chunk in _read_csv_with_encoding_fallback(filepath, **kw):
         yield chunk
 
 

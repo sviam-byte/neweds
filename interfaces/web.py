@@ -157,10 +157,13 @@ def _preset_payload(name: str) -> dict:
 def _apply_preset_to_session(name: str) -> None:
     """Применяет выбранный пресет к session_state."""
     payload = _preset_payload(name)
-    # Нельзя вручную менять ключ виджета после его создания в том же run,
-    # иначе Streamlit выбрасывает StreamlitAPIException.
+    # selected_methods часто связан с уже созданным widget-key, поэтому
+    # переносим его через pending-слот и применяем на следующем rerun.
     for k, v in payload.items():
-        st.session_state[k] = v
+        if k == "selected_methods":
+            _queue_widget_value("selected_methods", list(v))
+        else:
+            st.session_state[k] = v
 
 
 SUPPORTED_INPUT_EXTS = (".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5")
@@ -355,6 +358,11 @@ def _consume_pending_widget_value(widget_key: str) -> None:
     pending_key = f"__pending_{widget_key}"
     if pending_key in st.session_state:
         st.session_state[widget_key] = st.session_state.pop(pending_key)
+
+
+def _queue_widget_value(widget_key: str, value) -> None:
+    """Ставит новое значение в отложенную очередь для следующего rerun."""
+    st.session_state[f"__pending_{widget_key}"] = value
 
 
 def _make_run_dir(stem: str) -> Path:
@@ -560,6 +568,7 @@ def main() -> None:
     _consume_pending_widget_value("ui_local_file_path")
     _consume_pending_widget_value("ui_batch_input_folder")
     _consume_pending_widget_value("ui_batch_output_root")
+    _consume_pending_widget_value("selected_methods")
 
     source = st.radio(
         "Источник данных",
@@ -577,6 +586,7 @@ def main() -> None:
     batch_output_root = ""
     batch_recursive = False
     batch_skip_existing = True
+    batch_start_number = 1
     batch_allowed_exts = [".csv", ".xlsx", ".xls", ".parquet", ".mat", ".h5", ".hdf5"]
 
     if source.startswith("Файл"):
@@ -643,12 +653,21 @@ def main() -> None:
         with c_batch_out2:
             st.caption("Результаты будут сохранены в структуре time_series_analysis")
 
-        c_batch3, c_batch4, c_batch5 = st.columns([1, 1, 2])
+        c_batch3, c_batch4, c_batch5, c_batch6 = st.columns([1, 1, 1, 2])
         with c_batch3:
             batch_recursive = st.checkbox("Рекурсивно проходить подпапки", value=False, key="batch_recursive")
         with c_batch4:
             batch_skip_existing = st.checkbox("Пропускать уже обработанные файлы", value=True, key="batch_skip_existing")
         with c_batch5:
+            batch_start_number = st.number_input(
+                "Стартовать с номера",
+                min_value=1,
+                value=int(st.session_state.get("batch_start_number", 1)),
+                step=1,
+                key="batch_start_number",
+                help="Номер берётся из отсортированного списка preview ниже. Удобно для ручного resume после падения/остановки.",
+            )
+        with c_batch6:
             batch_allowed_exts = st.multiselect(
                 "Какие расширения брать",
                 options=list(SUPPORTED_INPUT_EXTS),
@@ -663,10 +682,13 @@ def main() -> None:
                 recursive=bool(st.session_state.get("batch_recursive", False)),
                 allowed_exts=st.session_state.get("batch_allowed_exts"),
             )
-            st.caption(f"Найдено файлов: {len(preview_files)}")
+            st.caption(f"Найдено файлов: {len(preview_files)} | старт с номера: {int(st.session_state.get('batch_start_number', 1))}")
             if preview_files:
                 st.dataframe(
-                    pd.DataFrame({"file": [str(p) for p in preview_files[:30]]}),
+                    pd.DataFrame({
+                        "index": list(range(1, min(len(preview_files), 30) + 1)),
+                        "file": [str(p) for p in preview_files[:30]],
+                    }),
                     use_container_width=True,
                     height=220,
                 )
@@ -750,6 +772,7 @@ def main() -> None:
     st.session_state["local_file_path"] = local_file_path
     st.session_state["batch_input_folder"] = batch_input_folder
     st.session_state["batch_output_root"] = batch_output_root
+    st.session_state["batch_start_number"] = int(batch_start_number)
 
     # === БЛОК 1: ПРЕДОБРАБОТКА (с пояснениями) ===
     with st.expander("🛠️ 1. Подготовка данных (Preprocessing & DimRed)", expanded=False):
@@ -1115,7 +1138,7 @@ def main() -> None:
         if st.button("Применить набор"):
             if bundle_choice != "Пользовательский":
                 chosen = list(bundle_map.get(bundle_choice, []))
-                st.session_state["selected_methods"] = chosen
+                _queue_widget_value("selected_methods", chosen)
                 if any(m not in STABLE_METHODS for m in chosen):
                     st.session_state["enable_experimental"] = True
                 st.rerun()
@@ -1134,33 +1157,33 @@ def main() -> None:
         cqb1, cqb2, cqb3, cqb4, cqb5, cqb6, cqb7 = st.columns(7)
         with cqb1:
             if st.button("Только fast stable"):
-                st.session_state["selected_methods"] = _preset_payload("Fast stable")["selected_methods"]
+                _queue_widget_value("selected_methods", list(_preset_payload("Fast stable")["selected_methods"]))
                 st.rerun()
         with cqb2:
             if st.button("Только default stable"):
-                st.session_state["selected_methods"] = _preset_payload("Default stable")["selected_methods"]
+                _queue_widget_value("selected_methods", list(_preset_payload("Default stable")["selected_methods"]))
                 st.rerun()
         with cqb3:
             if st.button("Все stable"):
-                st.session_state["selected_methods"] = _pick_available(list(STABLE_METHODS))
+                _queue_widget_value("selected_methods", list(_pick_available(list(STABLE_METHODS))))
                 st.rerun()
         with cqb4:
             if st.button("Corr + rank"):
-                st.session_state["selected_methods"] = list(bundle_map.get("Corr + rank", []))
+                _queue_widget_value("selected_methods", list(bundle_map.get("Corr + rank", [])))
                 st.rerun()
         with cqb5:
             if st.button("MI + TE"):
-                st.session_state["selected_methods"] = list(bundle_map.get("MI + TE", []))
+                _queue_widget_value("selected_methods", list(bundle_map.get("MI + TE", [])))
                 st.session_state["enable_experimental"] = True
                 st.rerun()
         with cqb6:
             if st.button("Directed + causal"):
-                st.session_state["selected_methods"] = list(bundle_map.get("Directed + causal", []))
+                _queue_widget_value("selected_methods", list(bundle_map.get("Directed + causal", [])))
                 st.session_state["enable_experimental"] = True
                 st.rerun()
         with cqb7:
             if st.button("Всё"):
-                st.session_state["selected_methods"] = list(all_methods)
+                _queue_widget_value("selected_methods", list(all_methods))
                 st.session_state["enable_experimental"] = True
                 st.rerun()
 
@@ -1230,6 +1253,12 @@ def main() -> None:
                 st.error("В указанной папке не найдено поддерживаемых файлов.")
                 return
 
+            batch_start_number = max(1, int(st.session_state.get("batch_start_number", 1)))
+            if batch_start_number > len(files):
+                st.error(f"Стартовый номер {batch_start_number} больше числа найденных файлов ({len(files)}).")
+                return
+            indexed_files = list(enumerate(files, start=1))[batch_start_number - 1 :]
+
             batch_root = Path(batch_output_root.strip() or _default_batch_output_root(str(input_root))).expanduser()
             batch_root.mkdir(parents=True, exist_ok=True)
 
@@ -1238,16 +1267,18 @@ def main() -> None:
             batch_log = batch_root / "batch_log.txt"
             run_config_path = batch_root / "run_config.json"
             _write_json(run_config_path, run_plan)
-            _append_text(batch_log, f"[START] {datetime.now().isoformat()} | input_root={input_root} | files={len(files)}")
+            _append_text(batch_log, f"[START] {datetime.now().isoformat()} | input_root={input_root} | files_total={len(files)} | start_from={batch_start_number} | files_to_run={len(indexed_files)}")
 
             manifest_rows: list[dict] = []
+            durations_sec: list[float] = []
             # Два индикатора прогресса: общий по набору и локальный по текущему файлу.
             overall_box = st.empty()
             current_box = st.empty()
             prog_overall = st.progress(0)
             prog_current = st.progress(0)
-            for i, src_path in enumerate(files, start=1):
-                overall_box.markdown(f"**Набор данных:** {i}/{len(files)} — `{Path(src_path).name}`")
+            for local_i, (i, src_path) in enumerate(indexed_files, start=1):
+                file_started_at = datetime.now()
+                overall_box.markdown(f"**Набор данных:** {local_i}/{len(indexed_files)} (глобально {i}/{len(files)}) — `{Path(src_path).name}`")
                 current_box.markdown("**Этап текущего файла:** подготовка")
                 prog_current.progress(0)
                 p = Path(src_path)
@@ -1279,8 +1310,8 @@ def main() -> None:
                                 "error": "",
                             }
                             manifest_rows.append(row)
-                            _append_text(batch_log, f"[SKIP ] {p}")
-                            prog_overall.progress(int(100 * i / max(1, len(files))))
+                            _append_text(batch_log, f"[SKIP ] #{i} {p}")
+                            prog_overall.progress(int(100 * local_i / max(1, len(indexed_files))))
                             continue
                     except Exception:
                         pass
@@ -1288,6 +1319,7 @@ def main() -> None:
                 run_dir.mkdir(parents=True, exist_ok=True)
                 row = {
                     "index": i,
+                    "batch_position": local_i,
                     "input_file": str(p),
                     "relative_parent": str(rel_parent),
                     "run_dir": str(run_dir),
@@ -1296,6 +1328,8 @@ def main() -> None:
                     "html_path": "",
                     "series_path": "",
                     "status_json": str(status_json),
+                    "started_at": file_started_at.isoformat(),
+                    "duration_sec": 0.0,
                     "error": "",
                 }
                 tool = None
@@ -1458,7 +1492,7 @@ def main() -> None:
                         except Exception as exc:
                             row["error"] = (row["error"] + " | " if row["error"] else "") + f"series: {exc}"
                     try:
-                        tool.export_run_manifest(str(run_manifest_path), extra={"run_dir": str(run_dir), "input_path": str(input_path)})
+                        tool.export_run_manifest(str(run_manifest_path), extra={"run_dir": str(run_dir), "input_path": str(src_path), "global_index": int(i), "batch_position": int(local_i)})
                     except Exception as exc:
                         row["error"] = (row["error"] + " | " if row["error"] else "") + f"manifest: {exc}"
                     try:
@@ -1516,13 +1550,22 @@ def main() -> None:
 
                     row["status"] = "ok" if not row["error"] else "partial"
                     prog_current.progress(100)
-                    _append_text(batch_log, f"[OK   ] {p} | status={row['status']}")
+                    _append_text(batch_log, f"[OK   ] #{i} {p} | status={row['status']}")
                 except Exception as exc:
                     row["status"] = "error"
                     row["error"] = str(exc)
-                    _append_text(batch_log, f"[ERROR] {p} | {exc}")
+                    _append_text(batch_log, f"[ERROR] #{i} {p} | {exc}")
                     _append_text(batch_log, traceback.format_exc())
                 finally:
+                    row["duration_sec"] = round((datetime.now() - file_started_at).total_seconds(), 3)
+                    durations_sec.append(float(row["duration_sec"]))
+                    avg_sec = float(np.mean(durations_sec)) if durations_sec else 0.0
+                    remaining = max(0, len(indexed_files) - local_i)
+                    eta_sec = avg_sec * remaining
+                    _append_text(
+                        batch_log,
+                        f"[TIME ] #{i} duration={row['duration_sec']:.3f}s | avg={avg_sec:.3f}s | eta_left≈{eta_sec/3600.0:.2f}h",
+                    )
                     _write_json(status_json, row)
                     manifest_rows.append(row)
                     try:
@@ -1530,7 +1573,7 @@ def main() -> None:
                     except Exception:
                         pass
                     gc.collect()
-                    prog_overall.progress(int(100 * i / max(1, len(files))))
+                    prog_overall.progress(int(100 * local_i / max(1, len(indexed_files))))
 
             manifest_df = pd.DataFrame(manifest_rows)
             manifest_df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
