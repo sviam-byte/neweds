@@ -16,7 +16,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.config import METHOD_INFO, is_directed_method, is_pvalue_method
+from src.core.results import AnalysisResult, tool_adapter_from_result
 from src.visualization import plots
+
+
+def write_html_report(
+    result: AnalysisResult,
+    out_dir: str,
+    *,
+    filename: str = "report.html",
+    **kwargs,
+) -> str:
+    """Write HTML report from public AnalysisResult contract."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    tool = tool_adapter_from_result(result)
+    save_path = out / filename
+    generator = HTMLReportGenerator(tool)
+    return generator.generate(str(save_path), **kwargs)
+
 
 
 @dataclass(slots=True)

@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,25 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 from src.config import is_directed_method, is_pvalue_method
+from src.core.results import AnalysisResult, tool_adapter_from_result
 from src.visualization import plots
+
+
+def write_excel_report(
+    result: AnalysisResult,
+    out_dir: str,
+    *,
+    filename: str = "report.xlsx",
+    **kwargs,
+) -> str:
+    """Write Excel report from public AnalysisResult contract."""
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    tool = tool_adapter_from_result(result)
+    return ExcelReportWriter(tool).write(str(out / filename), **kwargs)
+
 
 
 @dataclass(slots=True)

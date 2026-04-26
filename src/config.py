@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Конфигурация и константы для Time Series Analysis Tool.
+Configuration and shared constants for the Time Series Analysis Tool.
 """
 
 import importlib.util
@@ -251,30 +251,33 @@ class ComputationContract:
 
 @dataclass(slots=True)
 class AnalysisConfig:
-    """Контейнер конфигурации анализа."""
+    """Configuration for the modern public analysis pipeline."""
 
     max_lag: int = DEFAULT_MAX_LAG
     p_value_alpha: float = DEFAULT_PVALUE_ALPHA
     graph_threshold: float = DEFAULT_EDGE_THRESHOLD
     enable_experimental: bool = False
-    # Автоматически делать diff() если ряд нестационарен.
     auto_difference: bool = False
-    # Поправка на множественные сравнения: 'none' | 'fdr_bh'.
     pvalue_correction: str = "none"
 
-    # Настройки окон/лагов для связности
-    # Если задано, расчёты могут выполняться на скользящих окнах.
-    # В результирующую матрицу по методу попадёт "лучшая" матрица (см. window_policy).
     window_sizes: list[int] | None = None
-    # Шаг окна (в точках). Если None — дефолт = max(1, window_size//5).
     window_stride: int | None = None
-    # Политика агрегации по окнам: 'best' | 'mean'.
     window_policy: str = "best"
 
-    # Подбор лага: 'fixed' | 'optimize'
-    # - fixed: используем lag=1 (или явно заданный)
-    # - optimize: перебираем 1..max_lag и выбираем лучший по quality-score
     lag_selection: str = "optimize"
+    master_seed: int = 12345
+
+    spatial_bin_size: int = 1
+    spatial_bin_method: str = "mean"
+
+    spatial_grid_size: int = 10
+    spatial_grid_method: str = "mean"
+    lazy_spatial_bin: bool = False
+    time_chunk: int = 50
+
+    # Explicit metric list for the modern public pipeline.
+    # If None, the CLI/pipeline uses a small stable default.
+    variants: list[str] | None = None
 
     # Единый master-seed для воспроизводимых стохастических шагов
     master_seed: int = 12345

@@ -477,14 +477,13 @@ def lagged_directed_correlation(
                 for j in range(arr.shape[1]):
                     arr[nan_mask[:, j], j] = col_means[j]
 
-        t_eff = past.shape[0]
         past_centered = past - past.mean(axis=0, keepdims=True)
         fut_centered = future - future.mean(axis=0, keepdims=True)
         sp = np.sqrt((past_centered**2).sum(axis=0, keepdims=True))
         sf = np.sqrt((fut_centered**2).sum(axis=0, keepdims=True))
         sp[sp < 1e-12] = 1.0
         sf[sf < 1e-12] = 1.0
-        out = (past_centered / sp).T @ (fut_centered / sf) / t_eff
+        out = (past_centered / sp).T @ (fut_centered / sf)
         np.fill_diagonal(out, 0.0)
         return out
 

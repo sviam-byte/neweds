@@ -1,3741 +1,782 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Legacy analysis engine.
 
+This module contains the original BigMasterTool implementation kept for
+backward compatibility with the GUI/web interfaces.
+
+New portfolio-facing code should use:
+    src.core.pipeline.run_analysis
+    src.core.metric_runner.compute_metric
+    src.core.results.AnalysisResult
+
+Do not add new public pipeline logic here.
 """
-Главный движок анализа временных рядов.
-Содержит класс BigMasterTool и все функции расчета метрик.
-
-
-"""
-
-import argparse
-import html
-import datetime as _dt
-import importlib
-import importlib.util
-import logging
-import os
-import warnings
-from collections import Counter
-from dataclasses import asdict, dataclass
-from io import BytesIO
-from pathlib import Path
-from itertools import chain, combinations
+import argparse, logging, os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
-from src.analysis.dimred import apply_dimred
 
 import numpy as np
 import pandas as pd
-import scipy.signal as signal
-try:
-    from hurst import compute_Hc
-except ImportError:  # pragma: no cover - optional dependency path
-    compute_Hc = None
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image
-from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.dataframe import dataframe_to_rows
-from scipy import stats
-from scipy.fft import fft
-from scipy.signal import coherence, find_peaks
 from scipy.spatial import cKDTree
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.vector_ar.var_model import VAR
 
-
-class RunLog:
-    """Мини-лог для сообщений пайплайна (без зависимости от внешних классов).
-
-    Нужен, чтобы UI/отчёты могли аккуратно показывать, что было сделано,
-    и чтобы вызовы вида self.log.add(...) не падали.
-    """
-
-    def __init__(self) -> None:
-        self.items: List[str] = []
-
-    def add(self, msg: object) -> None:
-        try:
-            self.items.append(str(msg))
-        except Exception:
-            pass
-
-    def as_text(self) -> str:
-        return "\n".join(self.items)
-
-
-def _to_jsonable(obj):
-    """Приводит произвольные объекты к JSON-safe представлению."""
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, pd.Index):
-        return obj.tolist()
-    if isinstance(obj, pd.DataFrame):
-        return {"type": "DataFrame", "shape": [int(obj.shape[0]), int(obj.shape[1])], "columns": [str(c) for c in obj.columns[:50]]}
-    if isinstance(obj, pd.Series):
-        return {"type": "Series", "len": int(len(obj)), "name": str(obj.name)}
-    try:
-        if pd.isna(obj):
-            return None
-    except Exception:
-        pass
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
-
-
-def _config_snapshot(cfg) -> dict:
-    """Снимок конфигурации для сохранения в артефакты без падений сериализации."""
-    try:
-        return asdict(cfg)
-    except Exception:
-        try:
-            return dict(getattr(cfg, "__dict__", {}) or {})
-        except Exception:
-            return {}
-
-# Опциональная зависимость: nolds (для части метрик)
-# На Python 3.13 часто ломается из-за pkg_resources (setuptools>=81).
-# Типичный симптом:
-#   ModuleNotFoundError: No module named 'pkg_resources'
-# Если nolds недоступен, возвращаем NaN и логируем причину один раз.
-_NOLDS_IMPORT_ERROR: Optional[str] = None
-try:
-    import nolds  # type: ignore
-except Exception as _e:  # pragma: no cover
-    nolds = None  # type: ignore
-    _NOLDS_IMPORT_ERROR = str(_e)
-
-_NOLDS_WARNED = False
-
-
-def _nolds_or_warn() -> bool:
-    """Return True if nolds is available; otherwise log a clear hint once."""
-    global _NOLDS_WARNED
-    if nolds is not None:
-        return True
-    if not _NOLDS_WARNED:
-        _NOLDS_WARNED = True
-        msg = (
-            "[nolds] недоступен. Метрики, зависящие от nolds (sampen/dfa/hurst_rs fallback), "
-            "будут возвращать NaN.\n"
-            "Частая причина на Python 3.13: setuptools>=81 удалил pkg_resources. "
-            "Решение: установи setuptools<81 (см. requirements.txt)."
-        )
-        if _NOLDS_IMPORT_ERROR:
-            msg += f"\nПричина импорта: {_NOLDS_IMPORT_ERROR}"
-        logging.error(msg)
-    return False
-
-
-def _safe_parallel_config(requested_n_jobs: int | None = None, backend: str | None = None) -> tuple[int, str]:
-    """Возвращает безопасную конфигурацию параллелизма для UI/desktop сценариев.
-
-    По умолчанию избегаем process-based loky, т.к. он дублирует память и
-    часто нестабилен внутри Streamlit/desktop GUI. Поведение можно
-    переопределить через env TS_TOOL_PARALLEL_BACKEND / TS_TOOL_N_JOBS.
-    """
-    env_jobs = os.getenv("TS_TOOL_N_JOBS", "").strip()
-    env_backend = os.getenv("TS_TOOL_PARALLEL_BACKEND", "").strip().lower()
-
-    if env_jobs:
-        try:
-            requested_n_jobs = int(env_jobs)
-        except Exception:
-            pass
-    if env_backend:
-        backend = env_backend
-
-    try:
-        cpu_n = max(1, int(os.cpu_count() or 1))
-    except Exception:
-        cpu_n = 1
-
-    try:
-        nj = int(requested_n_jobs) if requested_n_jobs is not None else 1
-    except Exception:
-        nj = 1
-
-    if nj == -1:
-        nj = max(1, min(cpu_n - 1 if cpu_n > 1 else 1, 4))
-    nj = max(1, min(int(nj), max(1, cpu_n)))
-
-    be = str(backend or "threading").strip().lower()
-    if be not in {"threading", "loky", "multiprocessing", "sequential"}:
-        be = "threading"
-    if be == "sequential" or nj <= 1:
-        return 1, "sequential"
-    return nj, be
-
-# Импорты из нашей новой структуры
-from ..config import *
+from ..config import (
+    DEFAULT_EMBED_DIM, DEFAULT_EMBED_TAU, DEFAULT_MAX_LAG, DEFAULT_PVALUE_ALPHA,
+    SAVE_FOLDER, AnalysisConfig,
+    is_control_sensitive_method, is_directed_method, is_pvalue_method,
+)
 from ..analysis import stats as analysis_stats
-from ..metrics import connectivity
+from ..analysis.dimred import apply_dimred
+from ..metrics import connectivity as metrics_connectivity
 from ..metrics.registry import METRICS_REGISTRY, get_metric_func, register_metric
-from ..metrics.connectivity import set_module_seed as _set_connectivity_seed
 from ..reporting import ExcelReportWriter, HTMLReportGenerator
 from ..visualization import plots
+from .data_loader import load_or_generate, preprocess_timeseries
+from .fft_analysis import fft_analysis, frequency_analysis, plot_coherence_vs_frequency
+from .pair_resolver import resolve_pairs
+from .preprocessing import configure_warnings
+from .statistics import (
+    apply_pvalue_correction_matrix, as_float64_1d,
+    lag_quality, pair_score, select_best_median_worst,
+)
+from .window_scanner import analyze_sliding_windows
 
-# plt берём из visualization.plots, чтобы единообразно управлять бэкендом графиков.
 plt = plots.plt
 
-from .data_loader import load_or_generate, preprocess_timeseries
-from .preprocessing import configure_warnings, spatial_bin_channels
+# ── RunLog ───────────────────────────────────────────────────────────────
+class RunLog:
+    def __init__(self): self.items: List[str] = []
+    def add(self, msg):
+        try: self.items.append(str(msg))
+        except: pass
+    def as_text(self): return "\n".join(self.items)
 
-
-# Метрики
-def correlation_matrix(data: pd.DataFrame, **kwargs) -> np.ndarray:
-    """Legacy API shim: перенаправление в connectivity.correlation_matrix."""
-    return connectivity.correlation_matrix(data, **kwargs)
-
-
-def partial_correlation_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
-    """Legacy API shim для частичной корреляции."""
-    return connectivity.partial_correlation_matrix(df, control=control, **kwargs)
-
-
-def partial_h2_matrix(df: pd.DataFrame, control: list = None, **kwargs) -> np.ndarray:
-    """Legacy API shim: H² как квадрат partial-correlation."""
-    pcor = connectivity.partial_correlation_matrix(df, control=control, **kwargs)
-    return np.asarray(pcor, dtype=float) ** 2
-
-
-def lagged_directed_correlation(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
-    """Legacy API shim для lagged directed correlation."""
-    return connectivity.lagged_directed_correlation(df, lag=lag, **kwargs)
-
-
-def h2_matrix(df: pd.DataFrame, **kwargs) -> np.ndarray:
-    """Legacy API shim: H² = corr²."""
-    return np.asarray(connectivity.correlation_matrix(df, **kwargs), dtype=float) ** 2
-
-
-def lagged_directed_h2(df: pd.DataFrame, lag: int, **kwargs) -> np.ndarray:
-    """Legacy API shim: lagged directed H²."""
-    return np.asarray(connectivity.lagged_directed_correlation(df, lag=lag, **kwargs), dtype=float) ** 2
-
-
-def coherence_matrix(data: pd.DataFrame, **kwargs):
-    """Legacy API shim для когерентности."""
-    return connectivity.coherence_matrix(data, **kwargs)
-
-
-def mutual_info_matrix(data: pd.DataFrame, k=DEFAULT_K_MI, **kwargs):
-    """Legacy API shim для mutual information matrix."""
-    return connectivity.mutual_info_matrix(data, k=k, **kwargs)
-
-
-def mutual_info_matrix_partial(
-    data: pd.DataFrame,
-    k=DEFAULT_K_MI,
-    control: Optional[list[str]] = None,
-    **kwargs,
-) -> np.ndarray:
-    """Legacy API shim для partial mutual information."""
-    return connectivity.mutual_info_matrix_partial(data, k=k, control=control, **kwargs)
-
-
-def compute_granger_matrix(df: pd.DataFrame, lags: int = DEFAULT_MAX_LAG, **kwargs) -> np.ndarray:
-    """Legacy API shim для Granger full."""
-    return connectivity.granger_matrix(df, lag=lags, **kwargs)
-
-
-def TE_matrix(df: pd.DataFrame, lag: int = 1, bins: int = DEFAULT_BINS, **kwargs):
-    """Legacy API shim для TE full."""
-    return connectivity.transfer_entropy_matrix(df, lag=lag, bins=bins, **kwargs)
-
-
-def TE_matrix_partial(
-    df: pd.DataFrame,
-    lag: int = 1,
-    bins: int = DEFAULT_BINS,
-    control: Optional[list[str]] = None,
-    **kwargs,
-) -> np.ndarray:
-    """Legacy API shim для TE partial."""
-    return connectivity.transfer_entropy_matrix_partial(df, lag=lag, bins=bins, control=control, **kwargs)
-
-
-def granger_dict(df: pd.DataFrame, maxlag: int = 4) -> dict:
-    """Legacy API shim: исторически возвращался dict, сейчас не используется."""
-    return {"maxlag": int(maxlag), "columns": list(df.columns)}
-
-
-def granger_matrix(df: pd.DataFrame, granger_dict_result: dict | None = None) -> np.ndarray:
-    """Legacy API shim для матрицы Granger (игнорирует устаревший dict-аргумент)."""
-    lag = int((granger_dict_result or {}).get("maxlag", DEFAULT_MAX_LAG))
-    return connectivity.granger_matrix(df, lag=lag)
-
-
-def granger_matrix_partial(df: pd.DataFrame, maxlag=DEFAULT_MAX_LAG, control=None) -> np.ndarray:
-    """Legacy API shim для partial Granger."""
-    return connectivity.granger_matrix_partial(df, lag=int(max(1, maxlag)), control=control)
-
-
-def AH_matrix(df: pd.DataFrame, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU,
-              pairs=None, **_kwargs) -> np.ndarray:
-    """
-    Конвенция: M[src, tgt] = мера src → tgt.
-    Оптимизировано: поддержка pairs, joblib parallel.
-    """
-    df = df.dropna(axis=0, how='any')
-    N = df.shape[1]
-    out = np.zeros((N, N))
-    arr = df.values
-
-    # Определяем пары
-    if pairs is not None:
-        from src.metrics.connectivity import _iter_pairs
-        effective = _iter_pairs(N, pairs, directed=True)
-    else:
-        n_full = N * (N - 1)
-        if n_full > 10_000_000:
-            logging.warning("[AH] N=%d -> %d pairs, auto random sample.", N, n_full)
-            max_p = min(500_000, N * 5)
-            rng = np.random.default_rng(42)
-            effective_set: set[tuple[int, int]] = set()
-            bi = rng.integers(0, N, size=max_p * 3)
-            bj = rng.integers(0, N, size=max_p * 3)
-            for ii, jj in zip(bi, bj):
-                if ii != jj:
-                    effective_set.add((int(ii), int(jj)))
-                    if len(effective_set) >= max_p:
-                        break
-            effective = list(effective_set)
-        else:
-            effective = [(s, t) for s in range(N) for t in range(N) if s != t]
-
-    def _compute_ah_pair(pair):
-        src, tgt = pair
-        H_val = _H_ratio_direction(arr[:, src], arr[:, tgt], m=embed_dim, tau=tau)
-        if H_val is None or H_val <= 0:
-            return (src, tgt, 0.0)
-        AH = min(1.0, 1.0 / H_val)
-        return (src, tgt, AH)
-
-    # Parallel для больших наборов
-    if len(effective) > 800:
-        try:
-            from joblib import Parallel, delayed
-            nj, backend = _safe_parallel_config(-1, None)
-            if nj <= 1 or backend == "sequential":
-                results = [_compute_ah_pair(p) for p in effective]
-            else:
-                results = Parallel(n_jobs=nj, backend=backend)(
-                    delayed(_compute_ah_pair)(p) for p in effective
-                )
-        except ImportError:
-            results = [_compute_ah_pair(p) for p in effective]
-    else:
-        results = [_compute_ah_pair(p) for p in effective]
-
-    for src, tgt, val in results:
-        out[src, tgt] = val
-    return out
-
+# ── AH metrics ───────────────────────────────────────────────────────────
 def _H_ratio_direction(X, Y, m=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU):
     n = len(X)
-    if len(Y) != n or n < 2:
-        return None
-    L = n - (m - 1) * tau
-    if L < 2:
-        return None
-    
-    X_state = np.zeros((L, m))
-    Y_state = np.zeros((L, m))
+    if len(Y) != n or n < 2: return None
+    L = n - (m-1)*tau
+    if L < 2: return None
+    Xs = np.zeros((L, m)); Ys = np.zeros((L, m))
     for j in range(m):
-        X_state[:, j] = X[j*tau : j*tau + L]
-        Y_state[:, j] = Y[j*tau : j*tau + L]
-    
-    valid_indices = ~np.isnan(X_state).any(axis=1) & ~np.isnan(Y_state).any(axis=1)
-    if not np.any(valid_indices):
-        return None
-        
-    X_state_valid = X_state[valid_indices]
-    Y_state_valid = Y_state[valid_indices]
-    
-    if len(X_state_valid) < 2:
-        return None
+        Xs[:, j] = X[j*tau:j*tau+L]; Ys[:, j] = Y[j*tau:j*tau+L]
+    v = ~np.isnan(Xs).any(1) & ~np.isnan(Ys).any(1)
+    if not np.any(v): return None
+    Xv, Yv = Xs[v], Ys[v]
+    if len(Xv) < 2: return None
+    tX = cKDTree(Xv); _, iX = tX.query(Xv, k=2)
+    if iX.shape[1] < 2: return None
+    nn = iX[:, 1]; dY1 = np.sqrt(np.sum((Yv - Yv[nn])**2, axis=1))
+    tY = cKDTree(Yv); dY, _ = tY.query(Yv, k=2)
+    dY2 = np.where(dY[:, 1] == 0, 1e-10, dY[:, 1])
+    r = dY1/dY2; r = r[np.isfinite(r)]
+    return float(np.mean(r)) if len(r) > 0 else None
 
-    tree_X = cKDTree(X_state_valid)
-    tree_Y = cKDTree(Y_state_valid)
-    
-    dists_X, idx_X = tree_X.query(X_state_valid, k=2)
-    
-    
-    if idx_X.shape[1] < 2: 
-        return None 
-    
-    nn_idx = idx_X[:, 1] 
-    diff = Y_state_valid - Y_state_valid[nn_idx]
-    dY1 = np.sqrt(np.sum(diff**2, axis=1))
-    
-    dists_Y, _ = tree_Y.query(Y_state_valid, k=2)
-    dY2 = dists_Y[:, 1]
-    dY2 = np.where(dY2 == 0, 1e-10, dY2) 
-    
-    ratios = dY1 / dY2
-    ratios = ratios[np.isfinite(ratios)] 
-    
-    if len(ratios) == 0:
-        return None
-
-    H_val = np.mean(ratios)
-    return H_val
-
-def compute_partial_AH_matrix(data: pd.DataFrame,
-                               max_lag: int = DEFAULT_MAX_LAG,
-                               embed_dim: int = DEFAULT_EMBED_DIM,
-                               tau: int = DEFAULT_EMBED_TAU,
-                               control: List[str] = None,
-                               pairs=None) -> np.ndarray:
-    df = data.dropna(axis=0, how='any')
-    N = df.shape[1]
-    if N < 2:
-        return np.zeros((N, N))
-
-    if control and len(control) > 0:
-        resid_df = pd.DataFrame(index=df.index)
-        for col in df.columns:
-            X_ctrl = df[control]
-            y = df[col]
-            if len(X_ctrl) > 0 and len(y) == len(X_ctrl) and not X_ctrl.isnull().any().any():
-                try:
-                    model = LinearRegression().fit(X_ctrl.values, y.values)
-                    resid = y.values - model.predict(X_ctrl.values)
-                    resid_df[col] = resid
-                except ValueError: 
-                    resid_df[col] = y 
-            else:
-                resid_df[col] = y
+def AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU, pairs=None, **_kw):
+    from ..metrics.connectivity import _get_effective_pairs, _iter_pairs
+    df = df.dropna(axis=0, how='any'); N = df.shape[1]; out = np.zeros((N, N)); arr = df.values
+    if pairs is not None: eff = _iter_pairs(N, pairs, directed=True)
     else:
-        T = int(df.shape[0])
-        # VAR с N переменными требует O(N²·T) памяти и O(N³·T) вычислений.
-        # При N > min(T, 50) это невычислимо / бессмысленно.
-        if N > min(T, 50):
-            logging.warning(
-                "[partial AH] N=%d > min(T=%d, 50), VAR infeasible. Using raw data.", N, T
-            )
-            resid_df = df
-        else:
-            try:
-                model = VAR(df.values)
-                res_full = model.fit(max_lag, ic=None)
-                resid_df = pd.DataFrame(res_full.resid, columns=df.columns)
-            except Exception as e:
-                logging.error(f"VAR fit error (partial AH, fallback to raw): {e}")
-                resid_df = df 
-
-    return AH_matrix(resid_df, embed_dim=embed_dim, tau=tau, pairs=pairs)
-
-
-def directional_AH_matrix(df: pd.DataFrame, maxlags: int = 5, **kwargs) -> np.ndarray:
-    return AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU, pairs=kwargs.get("pairs"))
-
-def plt_fft_analysis(series: pd.Series, *, fs: float = 1.0):
-    """Быстрый FFT-анализ.
-
-    Важно: частотная шкала зависит от частоты дискретизации fs (Гц).
-    По умолчанию fs=1.0 (частоты в "циклах на отсчёт").
-    """
-    arr = _as_float64_1d(series.dropna().values)
-    if arr.size == 0:
-        return np.array([]), np.array([]), np.array([]), np.array([])
-    n = int(arr.size)
-    fs = float(fs) if fs and np.isfinite(fs) and fs > 0 else 1.0
-    dt = 1.0 / fs
-    freqs = np.fft.fftfreq(n, d=dt)
-    fft_vals = fft(arr)
-    amplitude = np.abs(fft_vals)
-    phase = np.angle(fft_vals)
-    pos_mask = freqs >= 0
-    freqs, amplitude, phase = freqs[pos_mask], amplitude[pos_mask], phase[pos_mask]
-    peaks, _ = find_peaks(amplitude, height=(np.max(amplitude) * 0.2 if amplitude.size > 0 else 0))
-    logging.debug(f"[FFT] Найдено пиков на частотах: {freqs[peaks] if peaks.size > 0 else 'Нет пиков'}")
-    return freqs, amplitude, phase, peaks
-
-def plot_amplitude_response(series: pd.Series, title: str) -> BytesIO:
-    freqs, amplitude, phase, peaks = plt_fft_analysis(series)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(freqs, amplitude, label="АЧХ")
-    if peaks.size > 0:
-        ax.plot(freqs[peaks], amplitude[peaks], "x", label="Пики")
-    ax.set_title(title)
-    ax.set_xlabel("Частота")
-    ax.set_ylabel("Амплитуда")
-    ax.legend()
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-def plot_phase_response(series: pd.Series, title: str) -> BytesIO:
-    freqs, amplitude, phase, peaks = plt_fft_analysis(series)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(freqs, phase, label="ФЧХ", color="orange")
-    ax.set_title(title)
-    ax.set_xlabel("Частота")
-    ax.set_ylabel("Фаза (рад)")
-    ax.legend()
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-def plot_combined_ac_fch(data: pd.DataFrame, title: str) -> BytesIO:
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
-    for col in data.columns:
-        series = data[col]
-        freqs, amplitude, phase, _ = plt_fft_analysis(series)
-        if freqs.size > 0:
-            ax1.plot(freqs, amplitude, label=col)
-            ax2.plot(freqs, phase, label=col)
-    ax1.set_title(title + " - АЧХ")
-    ax1.set_ylabel("Амплитуда")
-    ax1.legend()
-    ax2.set_title(title + " - ФЧХ")
-    ax2.set_xlabel("Частота")
-    ax2.set_ylabel("Фаза (рад)")
-    ax2.legend()
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-##############################################
-# индивидуальный AC & PH для каждого ряда
-##############################################
-def plot_individual_ac_ph(data: pd.DataFrame, title: str) -> dict:
-    plots = {}
-    for col in data.columns:
-        series = data[col]
-        # График АЧХ
-        fig1, ax1 = plt.subplots(figsize=(6, 4))
-        freqs, amplitude, _, peaks = plt_fft_analysis(series)
-        ax1.plot(freqs, amplitude, label=f"АЧХ {col}")
-        if peaks.size > 0:
-            ax1.plot(freqs[peaks], amplitude[peaks], "x", label="Пики")
-        ax1.set_title(f"АЧХ {col}")
-        ax1.set_xlabel("Частота")
-        ax1.set_ylabel("Амплитуда")
-        ax1.legend()
-        buf1 = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf1, format="png", dpi=100)
-        buf1.seek(0)
-        plt.close(fig1)
-        # График ФЧХ
-        fig2, ax2 = plt.subplots(figsize=(6, 4))
-        freqs, _, phase, _ = plt_fft_analysis(series)
-        ax2.plot(freqs, phase, label=f"ФЧХ {col}", color="orange")
-        ax2.set_title(f"ФЧХ {col}")
-        ax2.set_xlabel("Частота")
-        ax2.set_ylabel("Фаза (рад)")
-        ax2.legend()
-        buf2 = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf2, format="png", dpi=100)
-        buf2.seek(0)
-        plt.close(fig2)
-        plots[col] = {"AC": buf1, "PH": buf2}
-    return plots
-
-##############################################
-# sample entropy
-##############################################
-def compute_sample_entropy(series: pd.Series) -> float:
-    """Compatibility wrapper for sample entropy computation."""
-    return analysis_stats.compute_sample_entropy(series)
-
-
-def _as_float64_1d(x) -> np.ndarray:
-    """Безопасно приводит вход к 1D float64 без NaN/inf."""
-    arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    if arr.size == 0:
-        return arr
-    m = np.isfinite(arr)
-    return arr[m]
-
-##############################################
-# Функции для частотного анализа когерентности
-##############################################
-def plot_coherence_vs_frequency(
-    series1: pd.Series,
-    series2: pd.Series,
-    title: str,
-    *,
-    fs: float = 1.0,
-    nperseg: Optional[int] = None,
-) -> BytesIO:
-    s1 = _as_float64_1d(series1.dropna().values)
-    s2 = _as_float64_1d(series2.dropna().values)
-    n = int(min(s1.size, s2.size))
-    if n <= 3:
-        return BytesIO()
-    s1 = s1[:n]
-    s2 = s2[:n]
-    fs = float(fs) if fs and np.isfinite(fs) and fs > 0 else 1.0
-    if nperseg is None:
-        # для коротких рядов дефолт scipy (256) даёт вырожденную оценку
-        nperseg = int(max(8, min(64, n // 2)))
-    nperseg = int(max(8, min(nperseg, n)))
-    freqs, cxy = coherence(s1, s2, fs=fs, nperseg=nperseg, detrend="constant")
-    if cxy.size:
-        cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0)
-        cxy[~np.isfinite(cxy)] = np.nan
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(freqs, cxy, label="Когерентность")
-    if cxy.size > 0:
-        # np.nanargmax падает на all-nan
-        max_idx = int(np.nanargmax(cxy)) if np.isfinite(cxy).any() else 0
-        max_freq = freqs[max_idx]
-        max_coh = cxy[max_idx]
-        ax.plot(max_freq, max_coh, "ro", label=f"Макс. связь: {max_coh:.3f} на {max_freq:.3f}Hz")
-        ax.annotate(f"{max_freq:.3f} Hz", xy=(max_freq, max_coh), xytext=(max_freq, max_coh+0.05),
-                    arrowprops=dict(facecolor='black', shrink=0.05))
-    ax.set_title(title)
-    ax.set_xlabel("Частота (Hz)")
-    ax.set_ylabel("Когерентность")
-    ax.set_ylim(0, 1)
-    ax.legend()
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-##############################################
-# Функции для экспорта данных в Excel
-##############################################
-def add_raw_data_sheet(wb: Workbook, df: pd.DataFrame) -> None:
-    """Добавляет лист с исходными данными."""
-    ws = wb.create_sheet("Raw Data")
-    ws.append(list(df.columns))
-    for _, row in df.iterrows():
-        ws.append(list(row))
-
-def plot_heatmap(matrix: np.ndarray, title: str, legend_text: str = "", annotate: bool = False, vmin=None, vmax=None) -> BytesIO:
-    """Compatibility wrapper around src.visualization.plots.plot_heatmap."""
-    return plots.plot_heatmap(matrix, title, legend_text=legend_text, annotate=annotate, vmin=vmin, vmax=vmax)
-
-def plot_connectome(matrix: np.ndarray, method_name: str, threshold: float = 0.2,
-                    directed: bool = False, invert_threshold: bool = False, legend_text: str = "") -> BytesIO:
-    """Compatibility wrapper around src.visualization.plots.plot_connectome."""
-    return plots.plot_connectome(
-        matrix,
-        method_name,
-        threshold=threshold,
-        directed=directed,
-        invert_threshold=invert_threshold,
-        legend_text=legend_text,
-    )
-
-def add_method_to_sheet(ws, row: int, title: str, matrix: np.ndarray, directed: bool = False, legend_text: str = "") -> int:
-    ws.append([title])
-    if matrix is None:
-        ws.append(["Метод не работает для этих данных."])
-        return ws.max_row
-    df_mat = pd.DataFrame(matrix)
-    for r in dataframe_to_rows(df_mat, index=False, header=True):
-        ws.append(r)
-    buf_heat = plot_heatmap(matrix, title + " Heatmap", legend_text=legend_text)
-    img_heat = Image(buf_heat)
-    img_heat.width = 400
-    img_heat.height = 300
-    ws.add_image(img_heat, f"A{ws.max_row + 2}")
-    buf_conn = plot_connectome(matrix, title + " Connectome", threshold=0.2, directed=directed, invert_threshold=False, legend_text=legend_text)
-    img_conn = Image(buf_conn)
-    img_conn.width = 400
-    img_conn.height = 400
-    ws.add_image(img_conn, f"G{ws.max_row + 2}")
-    return ws.max_row
-
-def fmt_val(v):
-    try:
-        f = float(v)
-        if np.isnan(f):
-            return "N/A"
-        return f"{f:.3f}"
-    except Exception:
-        return "N/A"
-
-def fdr_bh(pvals: np.ndarray) -> np.ndarray:
-    """Benjamini–Hochberg FDR correction. Returns q-values (same shape)."""
-    p = np.asarray(pvals, dtype=float)
-    q = np.full(p.shape, np.nan, dtype=float)
-    mask = np.isfinite(p)
-    if mask.sum() == 0:
-        return q
-    pv = p[mask].ravel()
-    m = pv.size
-    order = np.argsort(pv)
-    ranked = pv[order]
-    q_raw = ranked * m / (np.arange(1, m + 1))
-    # monotone
-    q_mono = np.minimum.accumulate(q_raw[::-1])[::-1]
-    q_mono = np.clip(q_mono, 0.0, 1.0)
-    out = np.empty_like(pv)
-    out[order] = q_mono
-    q[mask] = out
-    return q
-
-def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarray:
-    """Apply FDR correction to a p-value matrix (off-diagonal entries)."""
-    M = np.array(mat, dtype=float, copy=True)
-    n = M.shape[0]
-    if n == 0:
-        return M
-    mask = np.isfinite(M)
-    # ignore diagonal
-    np.fill_diagonal(mask, False)
-    if not directed:
-        # use only upper triangle to avoid double-counting, then mirror
-        tri = np.triu(mask, 1)
-        q = fdr_bh(M[tri])
-        # BUG FIX: обнулить нижний треугольник ПЕРЕД зеркалированием,
-        # иначе M + M.T суммирует скорректированные q-values с оригинальными p-values.
-        M = np.zeros_like(M)
-        M[tri] = q
-        M = M + M.T
-        np.fill_diagonal(M, 0.0)
-        return M
-    else:
-        q = fdr_bh(M[mask])
-        M[mask] = q
-        np.fill_diagonal(M, 0.0)
-        return M
-
-#
-# МАППИНГ
-#
-# МАППИНГ
-###
-# Metric registry lives in src.metrics.registry to keep engine as orchestrator.
-# AH methods are still implemented in this module, so they are registered here.
-def _metric_ah_full(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    return AH_matrix(data, pairs=kwargs.get("pairs"))
-
-
-def _metric_ah_partial(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    return compute_partial_AH_matrix(data, max_lag=lag, control=control, pairs=kwargs.get("pairs"))
-
-
-def _metric_ah_directed(data: pd.DataFrame, lag: int = 1, control=None, **kwargs) -> np.ndarray:
-    """Направленный AH как влияние src(t) -> tgt(t+lag) через сдвинутую матрицу признаков."""
-    lag = int(max(1, lag))
-    cols = list(data.columns)
-    n = len(cols)
-    shifted = pd.DataFrame(index=data.index)
-    for col in cols:
-        shifted[col] = pd.to_numeric(data[col], errors="coerce").shift(-lag)
-    aligned = pd.DataFrame(index=data.index)
-    for col in cols:
-        aligned[f"src::{col}"] = pd.to_numeric(data[col], errors="coerce")
-        aligned[f"tgt::{col}"] = shifted[col]
-    aligned = aligned.dropna(axis=0, how="any")
-    if aligned.empty:
-        return np.zeros((n, n), dtype=float)
-    # Считаем AH только для перекрёстных пар src[i] -> tgt[j], а не все (2N)².
-    cross_pairs = [(i, n + j) for i in range(n) for j in range(n) if i != j]
-    ah_raw = AH_matrix(aligned, pairs=cross_pairs)
-    out = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            out[i, j] = float(ah_raw[i, n + j])
-    return out
-
-
-for _name, _func in {
-    "ah_full": _metric_ah_full,
-    "ah_partial": _metric_ah_partial,
-    "ah_directed": _metric_ah_directed,
-}.items():
-    register_metric(_name, _func)
-
-method_mapping = METRICS_REGISTRY
-
-
-@dataclass(frozen=True)
-class MethodSpec:
-    directed: bool
-    is_p_value: bool
-    control_dependent: bool
-    supports_lag: bool
-    description: str = ""
-
-
-# Метод-метаданные и логика
-# (PVAL_METHODS, DIRECTED_METHODS, METHOD_INFO импортированы из config.py
-#  через `from ..config import *` выше)
-
-
-# is_pvalue_method, is_directed_method, is_control_sensitive_method
-# уже импортированы из config.py через `from ..config import *`
-
-
-def _pair_score(variant: str, mat: np.ndarray, i: int, j: int) -> float:
-    """Скалярная метрика для одной пары (i,j) из матрицы связности.
-
-    Используется для 3D-"кубиков" по парам.
-
-    Правила:
-    - p-value методы: чем меньше p, тем "лучше" связь -> score = 1 - p (в [0,1])
-    - directed методы: берём i -> j
-    - undirected: берём max(|A[i,j]|, |A[j,i]|)
-    """
-    if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
-        return float("nan")
-    n = int(mat.shape[0])
-    if i < 0 or j < 0 or i >= n or j >= n or i == j:
-        return float("nan")
-
-    try:
-        if is_directed_method(variant):
-            v = float(mat[i, j])
-        else:
-            v = float(mat[i, j])
-            v2 = float(mat[j, i])
-            v = float(max(abs(v), abs(v2)))
-
-        if is_pvalue_method(variant):
-            # p-value: меньше = лучше -> инвертируем.
-            if not np.isfinite(v):
-                return float("nan")
-            v = float(np.clip(v, 0.0, 1.0))
-            return float(1.0 - v)
-
-        return float(abs(v)) if np.isfinite(v) else float("nan")
-    except Exception:
-        return float("nan")
-
-
-# is_control_sensitive_method — из config.py
-
-
-# METHOD_INFO — из config.py (через `from ..config import *`)
-
-
-def _is_pvalue_method(variant: str) -> bool:
-    return is_pvalue_method(variant)
-
-
-def _is_directed_method(variant: str) -> bool:
-    return is_directed_method(variant)
-
-def _lag_quality(variant: str, mat: np.ndarray) -> float:
-    """Скалярная метрика качества лага: больше => лучше (единая конвенция)."""
-    if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
-        return np.nan
-    n = mat.shape[0]
-    if n < 2:
-        return np.nan
-    mask = ~np.eye(n, dtype=bool)
-    vals = mat[mask]
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return np.nan
-    if _is_pvalue_method(variant):
-        # p-value: меньше лучше -> переводим в "evidence" (больше лучше)
-        vals = np.clip(vals, 1e-12, 1.0)
-        return float(np.mean(-np.log10(vals)))
-    return float(np.mean(np.abs(vals)))
-
-
-def get_method_spec(variant: str) -> MethodSpec:
-    """Совместимость со старым API: возвращает MethodSpec на основе новых семантических множеств."""
-    return MethodSpec(
-        directed=is_directed_method(variant),
-        is_p_value=is_pvalue_method(variant),
-        control_dependent=is_control_sensitive_method(variant),
-        supports_lag=is_directed_method(variant),
-    )
-
-
-def _residualize_series(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """Возвращает остатки регрессии y ~ X (с константой)."""
-    y = np.asarray(y, dtype=float)
-    if X is None or np.size(X) == 0:
-        return y - np.nanmean(y)
-    X = np.asarray(X, dtype=float)
-
-    # синхронно выкидываем nan
-    mask = np.isfinite(y)
-    if X.ndim == 1:
-        mask &= np.isfinite(X)
-    else:
-        mask &= np.all(np.isfinite(X), axis=1)
-
-    y2 = y[mask]
-    X2 = X[mask]
-    if y2.size < 5:
-        return y - np.nanmean(y)
-
-    if X2.ndim == 1:
-        X2 = X2.reshape(-1, 1)
-    X2 = np.column_stack([np.ones(len(X2)), X2])
-
-    try:
-        beta, *_ = np.linalg.lstsq(X2, y2, rcond=None)
-        resid = np.full_like(y, np.nan, dtype=float)
-        resid[mask] = y2 - (X2 @ beta)
-        m = np.nanmean(resid)
-        resid = np.where(np.isfinite(resid), resid, m)
-        return resid
-    except Exception:
-        return y - np.nanmean(y)
-
-
-def _pairwise_partial_value(
-    data: pd.DataFrame,
-    i: int,
-    j: int,
-    controls: List[int],
-    *,
-    metric: str,
-    lag: int = 1,
-) -> float:
-    """
-    Частичная мера между (i,j) с индивидуальным набором контролей (по индексам колонок).
-    metric: 'corr' | 'h2' | 'mi'
-    Используем directed-сдвиг: x[t] -> y[t+lag].
-    """
-    x = data.iloc[:, i].to_numpy(dtype=float)
-    y = data.iloc[:, j].to_numpy(dtype=float)
-
-    lag = max(1, int(lag or 1))
-    if lag >= len(x) or lag >= len(y):
-        return np.nan
-
-    x2 = x[:-lag]
-    y2 = y[lag:]
-
-    if controls:
-        Z = data.iloc[:, controls].to_numpy(dtype=float)
-        Z2 = Z[:-lag, :]
-        rx = _residualize_series(x2, Z2)
-        ry = _residualize_series(y2, Z2)
-    else:
-        rx = x2 - np.nanmean(x2)
-        ry = y2 - np.nanmean(y2)
-
-    if rx.size < 2 or ry.size < 2:
-        return np.nan
-
-    if metric == "corr":
-        return float(np.corrcoef(rx, ry)[0, 1])
-    if metric == "h2":
-        c = float(np.corrcoef(rx, ry)[0, 1])
-        return float(c * c)
-    if metric == "mi":
-        # Используем единую реализацию MI из connectivity для согласованности сигнатур.
-        return float(connectivity._knn_mutual_info(rx, ry, k=DEFAULT_K_MI))
-    return np.nan
-
-
-def _pairwise_partial_matrix(
-    data: pd.DataFrame,
-    *,
-    metric: str,
-    lag: int,
-    policy: str,
-    custom_controls: Optional[List[str]] = None,
-    pairs: Optional[list[tuple[int, int]]] = None,
-) -> np.ndarray:
-    """
-    NxN матрица частичной меры, где control-set выбирается ПО ПАРЕ.
-    Оптимизировано: _get_effective_pairs для больших N.
-    """
-    from src.metrics.connectivity import _get_effective_pairs
-
-    cols = list(data.columns)
-    n = len(cols)
-    M = np.full((n, n), np.nan, dtype=float)
-    for i in range(n):
-        M[i, i] = 1.0
-
-    name_to_idx = {c: k for k, c in enumerate(cols)}
-    custom_controls = list(custom_controls) if custom_controls else []
-    custom_idx = [name_to_idx[c] for c in custom_controls if c in name_to_idx]
-
-    effective = _get_effective_pairs(n, pairs, directed=False)
-    for i, j in effective:
-        if policy == "others":
-            controls = [k for k in range(n) if k not in (i, j)]
-        elif policy == "custom":
-            controls = [k for k in custom_idx if k not in (i, j)]
-        elif policy == "none":
-            controls = []
-        else:
-            controls = []
-        v = _pairwise_partial_value(data, i, j, controls, metric=metric, lag=lag)
-        M[i, j] = v
-        M[j, i] = v
-    return M
-
-def compute_connectivity_variant(
-    data,
-    variant,
-    lag=1,
-    control=None,
-    *,
-    pairs: Optional[list[tuple[int, int]]] = None,
-    partial_mode: str = "global",
-    pairwise_policy: str = "others",
-    custom_controls: Optional[List[str]] = None,
-    control_strategy: str = "none",
-    control_pca_k: int = 0,
-):
-    """
-    variant: ключ из method_mapping.
-    control: список колонок для GLOBAL partial (как раньше).
-    partial_mode:
-      - "global"   : прежнее поведение (control применяется ко всей матрице)
-      - "pairwise" : control-set выбирается по паре (для *_partial методов, где это реализовано)
-    pairwise_policy (для partial_mode="pairwise"):
-      - "others" : контролируем все остальные переменные (по умолчанию)
-      - "custom" : контролируем custom_controls (пересечение с остальными)
-      - "none"   : без контролей
-    """
-    try:
-        if control is not None and len(control) == 0:
-            control = None
-
-        # Универсальные «контроли» для partial: global mean / trend / PCA.
-        # Это важно для больших N (например, 165 вокселей), где "контроль = все остальные"
-        # превращается в плохо интерпретируемый и вычислительно тяжёлый режим.
-        control_matrix = None
-        control_desc: list[str] = []
-        if isinstance(variant, str) and variant.endswith("_partial") and control is None and control_strategy != "none":
-            try:
-                n = int(len(data))
-                ctrls = []
-                if control_strategy in {"global", "global_mean", "global_mean_trend", "mean_trend"}:
-                    gm = pd.to_numeric(data.mean(axis=1), errors="coerce").to_numpy(dtype=np.float64)
-                    ctrls.append(gm)
-                    control_desc.append("global_mean")
-                if control_strategy in {"global_mean_trend", "mean_trend", "trend"}:
-                    t = np.arange(n, dtype=np.float64)
-                    t = (t - t.mean()) / (t.std() + 1e-12) if n > 1 else t
-                    ctrls.append(t)
-                    control_desc.append("linear_trend")
-                k = int(max(0, control_pca_k))
-                if k > 0:
-                    X = data.to_numpy(dtype=np.float64)
-                    X = np.nan_to_num(X, nan=0.0)
-                    # SVD: time×features
-                    U, S, _Vt = np.linalg.svd(X, full_matrices=False)
-                    kk = int(min(k, U.shape[1]))
-                    if kk > 0:
-                        for i in range(kk):
-                            ctrls.append(U[:, i] * S[i])
-                            control_desc.append(f"pca[{i+1}]")
-                if ctrls:
-                    control_matrix = np.vstack(ctrls).T
-            except Exception:
-                control_matrix = None
-                control_desc = []
-
-        # pairwise-partial (нужно для N=3..4)
-        if partial_mode == "pairwise" and isinstance(variant, str) and variant.endswith("_partial"):
-            if variant == "correlation_partial":
-                return _pairwise_partial_matrix(
-                    data,
-                    metric="corr",
-                    lag=max(1, int(lag or 1)),
-                    policy=pairwise_policy,
-                    custom_controls=custom_controls,
-                    pairs=pairs,
-                )
-            if variant == "h2_partial":
-                return _pairwise_partial_matrix(
-                    data,
-                    metric="h2",
-                    lag=max(1, int(lag or 1)),
-                    policy=pairwise_policy,
-                    custom_controls=custom_controls,
-                    pairs=pairs,
-                )
-            if variant == "mutinf_partial":
-                return _pairwise_partial_matrix(
-                    data,
-                    metric="mi",
-                    lag=max(1, int(lag or 1)),
-                    policy=pairwise_policy,
-                    custom_controls=custom_controls,
-                    pairs=pairs,
-                )
-            # Остальные partial пока считаем GLOBAL-режимом (через control):
-            # корректное "pairwise partial" для TE/AH/Granger требует отдельной
-            # условной постановки и другого API.
-
-        if variant in method_mapping:
-            metric_func = get_metric_func(variant)
-            return metric_func(
-                data,
-                lag=lag,
-                control=control,
-                control_matrix=control_matrix,
-                control_desc=control_desc,
-                pairs=pairs,
-            )
-
-        return connectivity.correlation_matrix(data)
-    except Exception as e:
-        logging.error(f"[ComputeVariant] Метод {variant} не работает: {e}")
-        return None
-
-
-def powerset(iterable):
-    s = list(iterable)
-    return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
-
-##############################################
-#  диагностика коэффициентов регрессии
-##############################################
-def regression_diagnostics(df: pd.DataFrame, target: str, controls: list):
-    """
-    Рассчитывает линейную регрессию вида: target ~ controls.
-    Возвращает строку с R².
-    """
-    # Если нет контрольных переменных — выходим
-    if not controls:
-        return f"Нет контрольных переменных для {target}."
-    # Иначе строим модель и возвращаем R²
-    X = df[controls]
-    y = df[target]
-    model = LinearRegression().fit(X, y)
-    r2 = model.score(X, y)
-    return f"{target} ~ {controls}: R² = {r2:.3f}"
-
-
-##############################################
-# Частотный анализ: возвращает пиковые значения
-##############################################
-def frequency_analysis(series: pd.Series, peak_height_ratio: float = 0.2, *, fs: float = 1.0):
-    freqs, amplitude, phase, peaks = plt_fft_analysis(series, fs=fs)
-    if freqs.size == 0 or peaks.size == 0:
-        return None, None, None
-    peak_freqs = freqs[peaks]
-    peak_amps = amplitude[peaks]
-    periods = 1 / peak_freqs
-    return peak_freqs, peak_amps, periods
-
-def sliding_fft_analysis(data: pd.DataFrame, window_size: int, overlap: int) -> dict:
-    """Экспериментальный анализ скользящего FFT (по умолчанию отключён)."""
-    logging.info("[Sliding FFT] Экспериментальная функция отключена.")
-    return {}
-
-
-def analyze_sliding_windows_with_metric(
-    data: pd.DataFrame,
-    variant: str,
-    window_size: int,
-    stride: int,
-    *,
-    lag: int = 1,
-    pairs: Optional[list[tuple[int, int]]] = None,
-    cache: Optional[dict] = None,
-    start_min: int | None = None,
-    start_max: int | None = None,
-    max_windows: int = 400,
-    return_matrices: bool = False,
-    n_jobs: int | None = None,
-    parallel_backend: str | None = None,
-) -> dict:
-    """Анализ скользящих окон для заданного window_size.
-
-    Возвращает структуру для HTML-отчёта:
-      {
-        "best_window": {"start": int, "end": int, "metric": float, "matrix": np.ndarray},
-        "curve": {"x": [start_idx...], "y": [metric...]},
-        "ticks": [{"start":..,"end":..,"metric":..,"matrix":..|None}, ...],
-        "extremes": {"best": idx|None, "median": idx|None, "worst": idx|None}
-      }
-
-    stride — шаг сдвига окна (в точках), lag — лаг (только для lagged-методов).
-    """
-    if data is None or data.empty:
-        return {}
-
-    n = len(data)
-    w = int(max(2, min(window_size, n)))
-    s = int(max(1, stride))
-
-    xs: List[int] = []
-    ys: List[float] = []
-    ticks: list[dict] = []
-
-    best = {
-        "start": 0,
-        "end": w,
-        "metric": float("-inf"),
-        "matrix": None,
-    }
-
-    # Диапазон позиций окна (включительно по start, end=start+w).
-    st0 = int(max(0, start_min)) if start_min is not None else 0
-    st1 = int(min(n - w, start_max)) if start_max is not None else (n - w)
-    st1 = int(max(st0, st1))
-
-    # Ограничиваем количество окон, чтобы не взорваться по времени на длинных рядах.
-    # Это не запрещает пользователю уменьшить stride, но даёт безопасный дефолт.
-    max_windows = int(max(1, max_windows))
-    starts = list(range(st0, st1 + 1, s))
-    if len(starts) > max_windows:
-        # равномерная подвыборка
-        idx = np.linspace(0, len(starts) - 1, max_windows).round().astype(int)
-        starts = [starts[i] for i in idx]
-
-    # Параллелизация только внутри прохода по стартам окна.
-    # По умолчанию работаем в 1 потоке ради предсказуемого поведения UI.
-    nj, safe_backend = _safe_parallel_config(n_jobs, parallel_backend)
-
-    def _compute_one_start(start: int) -> tuple[int, int, float, Optional[np.ndarray]]:
-        end = start + w
-        if end > n:
-            return int(start), int(end), float("nan"), None
-        chunk = data.iloc[start:end]
-        cache_key = (variant, int(lag), int(start), int(end))
-        try:
-            if cache is not None and cache_key in cache:
-                mat = cache[cache_key]
-            else:
-                mat = compute_connectivity_variant(chunk, variant, lag=int(max(1, lag)), pairs=pairs)
-                if cache is not None:
-                    cache[cache_key] = mat
-            score = _lag_quality(variant, mat)
-            score_f = float(score) if np.isfinite(score) else float("nan")
-            return int(start), int(end), score_f, (mat if return_matrices else None)
-        except Exception as ex:
-            logging.error(f"[SlidingWindow] {variant} win={w} start={start}: {ex}")
-            return int(start), int(end), float("nan"), None
-
-    if nj == 1 or len(starts) <= 1:
-        computed = [_compute_one_start(st) for st in starts]
-    else:
+        nf = N*(N-1)
+        if nf > 10_000_000:
+            mp = min(500_000, N*5); rng = np.random.default_rng(42); es = set()
+            bi, bj = rng.integers(0, N, size=mp*3), rng.integers(0, N, size=mp*3)
+            for ii, jj in zip(bi, bj):
+                if ii != jj: es.add((int(ii), int(jj)))
+                if len(es) >= mp: break
+            eff = list(es)
+        else: eff = [(s,t) for s in range(N) for t in range(N) if s != t]
+    def _ah(pair):
+        s, t = pair; H = _H_ratio_direction(arr[:,s], arr[:,t], m=embed_dim, tau=tau)
+        return (s, t, 0.0) if H is None or H <= 0 else (s, t, min(1.0, 1.0/H))
+    if len(eff) > 800:
         try:
             from joblib import Parallel, delayed
-        except Exception:
-            Parallel = None  # type: ignore
-            delayed = None  # type: ignore
+            res = Parallel(n_jobs=-1, backend="loky")(delayed(_ah)(p) for p in eff)
+        except ImportError: res = [_ah(p) for p in eff]
+    else: res = [_ah(p) for p in eff]
+    for s, t, v in res: out[s, t] = v
+    return out
 
-        if Parallel is None:
-            computed = [_compute_one_start(st) for st in starts]
-        else:
-            if safe_backend == "sequential":
-                computed = [_compute_one_start(st) for st in starts]
-            else:
-                computed = Parallel(n_jobs=nj, backend=safe_backend)(delayed(_compute_one_start)(st) for st in starts)
-
-    for start, end, score_f, mat in computed:
-        xs.append(int(start))
-        ys.append(float(score_f) if np.isfinite(score_f) else float("nan"))
-        ticks.append(
-            {
-                "start": int(start),
-                "end": int(end),
-                "metric": float(score_f) if np.isfinite(score_f) else float("nan"),
-                "matrix": mat if return_matrices else None,
-            }
-        )
-
-        if np.isfinite(score_f) and float(score_f) > float(best["metric"]):
-            best = {
-                "start": int(start),
-                "end": int(end),
-                "metric": float(score_f),
-                "matrix": mat,
-            }
-
-    return {
-        "best_window": best,
-        "curve": {"x": xs, "y": ys},
-        "ticks": ticks,
-        "extremes": _select_best_median_worst(ticks, key="metric"),
-    }
-
-
-def _select_best_median_worst(items: list[dict], *, key: str = "metric") -> dict:
-    """Возвращает индексы best/median/worst по значению key (с учётом NaN)."""
-    if not items:
-        return {"best": None, "median": None, "worst": None}
-
-    vals: list[tuple[int, float]] = []
-    for i, it in enumerate(items):
-        try:
-            v = float(it.get(key, float("nan")))
-        except Exception:
-            v = float("nan")
-        if np.isfinite(v):
-            vals.append((i, v))
-
-    if not vals:
-        return {"best": None, "median": None, "worst": None}
-
-    vals_sorted = sorted(vals, key=lambda t: t[1])
-    worst_i = int(vals_sorted[0][0])
-    best_i = int(vals_sorted[-1][0])
-    med_val = float(np.median([v for _, v in vals_sorted]))
-    median_i = int(min(vals_sorted, key=lambda t: abs(t[1] - med_val))[0])
-    return {"best": best_i, "median": median_i, "worst": worst_i}
-
-
-def sliding_window_pairwise_analysis(
-    data: pd.DataFrame,
-    method: str,
-    window_size: int,
-    overlap: int,
-) -> dict:
-    """Экспериментальный парный анализ скользящих окон (по умолчанию отключён)."""
-    logging.info("[Sliding Pairwise] Экспериментальная функция отключена.")
-    return {}
-
-##############################################
-# Листы с коэффициентами и частотным анализом
-##############################################
-def export_coefficients_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Coefficients & Explanations")
-    ws.append(["Описание:", "Лист содержит краткие пояснения коэффициентов регрессий и матриц связей."])
-    ws.append(["Например, коэффициенты регрессии показывают, как контрольные переменные влияют на связь между переменными."])
-    ws.append([])
-    ws.append(["Регрессионная диагностика:"])
-    ws.append(["Переменная", "Контроль", "Диагностика"])
-    for target in tool.data.columns:
-        controls = [c for c in tool.data.columns if c != target]
-        diag_str = regression_diagnostics(tool.data, target, controls)
-        ws.append([target, str(controls), diag_str])
-    ws.append([])
-    ws.append(["Матрицы связей:"])
-    ws.append(["Метод", "Описание"])
-    methods_info = [
-        ("correlation_full", "Стандартная корреляционная матрица."),
-        ("correlation_partial", "Частичная корреляция (с контролем)."),
-        ("mutinf_full", "Полная взаимная информация."),
-        ("coherence_full", "Когерентность между переменными.")
-    ]
-    for m, info in methods_info:
-        ws.append([m, info])
-    logging.info("[Coefficients] Лист 'Coefficients & Explanations' сформирован.")
-
-def export_frequency_summary_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Frequency Summary")
-    ws.append(["Столбец", "Пиковые частоты", "Пиковые амплитуды", "Периоды", "Пояснение"])
-    for col in tool.data.columns:
-        s = tool.data[col].dropna()
-        freq, amps, periods = frequency_analysis(s)
-        if freq is not None:
-            freq_str = ", ".join([f"{f:.3f}" for f in freq])
-            amps_str = ", ".join([f"{f:.3f}" for f in amps])
-            period_str = ", ".join([f"{p:.1f}" for p in periods])
-            note = f"Макс. связь на {freq[np.argmax(amps)]:.3f} Hz"
-        else:
-            freq_str = amps_str = period_str = "Нет пиков"
-            note = "Пиковые частоты не выявлены"
-        ws.append([col, freq_str, amps_str, period_str, note])
-    for col in ws.columns:
-        max_length = max(len(str(cell.value)) for cell in col if cell.value is not None)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = max_length
-    logging.info("[Frequency] Лист 'Frequency Summary' сформирован.")
-
-##############################################
-# Новый лист: Индивидуальные АЧХ и ФЧХ (раздельно)
-##############################################
-def export_individual_ac_ph_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Individual AC & PH")
-    ws.append(["Столбец", "АЧХ", "ФЧХ"])
-    plots = plot_individual_ac_ph(tool.data_normalized, "Individual AC & PH")
-    for col, imgs in plots.items():
-        ws.append([col])
-        img_ac = Image(imgs["AC"])
-        img_ac.width = 400
-        img_ac.height = 300
-        ws.add_image(img_ac, f"B{ws.max_row}")
-        img_ph = Image(imgs["PH"])
-        img_ph.width = 400
-        img_ph.height = 300
-        ws.add_image(img_ph, f"G{ws.max_row}")
-    logging.info("[Individual AC & PH] Лист сформирован.")
-
-##############################################
-# Новый лист: Анализ энтропии
-##############################################
-def export_entropy_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Entropy Analysis")
-    ws.append(["Столбец", "Sample Entropy (sampen)"])
-    for col in tool.data.columns:
-        s = tool.data[col].dropna()
-        ent = compute_sample_entropy(s)
-        ws.append([col, f"{ent:.3f}" if not np.isnan(ent) else "N/A"])
-    logging.info("[Entropy Analysis] Лист сформирован.")
-
-##############################################
-# Новый лист
-##############################################
-def export_combined_informational_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Combined Informational Analysis")
-    current_row = 1
-    ws.cell(row=current_row, column=1, value="Combined Informational Analysis")
-    current_row += 2
-    ws.cell(row=current_row, column=1, value="Lag Analysis Summary (Aggregated)")
-    current_row += 1
-    buf_lag = tool.plot_all_methods_lag_comparison(tool.lag_results)
-    img_lag = Image(buf_lag)
-    img_lag.width = 800
-    img_lag.height = 600
-    ws.add_image(img_lag, f"A{current_row}")
-    current_row += 30
-    ws.cell(row=current_row, column=1, value="Sliding Window Analysis Summary (Aggregated)")
-    current_row += 1
-    sw_res = tool.analyze_sliding_windows(
-        "coherence_full",
-        window_size=min(50, len(tool.data_normalized) // 2),
-        overlap=min(25, len(tool.data_normalized) // 4),
-    )
-    if sw_res:
-        legend_text = "Метод: coherence_full, Окно: 50"
-        buf_sw = tool.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
-        img_sw = Image(buf_sw)
-        img_sw.width = 700
-        img_sw.height = 400
-        ws.add_image(img_sw, f"A{current_row}")
-        current_row += 20
+def compute_partial_AH_matrix(data, max_lag=DEFAULT_MAX_LAG, embed_dim=DEFAULT_EMBED_DIM,
+                               tau=DEFAULT_EMBED_TAU, control=None, pairs=None):
+    df = data.dropna(axis=0, how='any'); N = df.shape[1]
+    if N < 2: return np.zeros((N, N))
+    if control and len(control) > 0:
+        rdf = pd.DataFrame(index=df.index)
+        for col in df.columns:
+            Xc = df[control]; y = df[col]
+            if len(Xc) > 0 and not Xc.isnull().any().any():
+                try: mdl = LinearRegression().fit(Xc.values, y.values); rdf[col] = y.values - mdl.predict(Xc.values)
+                except: rdf[col] = y
+            else: rdf[col] = y
     else:
-        ws.append(["Sliding Window Analysis отключён или нет данных."])
-        current_row += 2
-    ws.cell(row=current_row, column=1, value="Pairwise Lag Analysis (пример для первой пары)")
-    current_row += 1
-    if len(tool.data.columns) >= 2:
-        pair = list(combinations(tool.data.columns, 2))[0]
-        col1, col2 = pair
-        series1 = tool.data[col1].dropna().values
-        series2 = tool.data[col2].dropna().values
-        n = min(len(series1), len(series2))
-        lag_metrics = {}
-        for lag in range(1, 21):
-            if n > lag:
-                corr = np.corrcoef(series1[lag:], series2[:n-lag])[0, 1] if len(series1[lag:]) > 1 and len(series2[:n-lag]) > 1 else np.nan
-                lag_metrics[lag] = corr
-        if lag_metrics:
-            lags = list(lag_metrics.keys())
-            correlations = [lag_metrics[lag] for lag in lags]
-            fig, ax = plt.subplots(figsize=(4, 3))
-            ax.plot(lags, correlations, marker='o')
-            ax.set_title(f"Lag Analysis: {col1}-{col2}")
-            legend_text_pair = f"Пара: {col1}-{col2}, Метод: Lag Correlation"
-            ax.text(0.5, 0.1, legend_text_pair, transform=ax.transAxes, fontsize=8, 
-                    verticalalignment='bottom', bbox=dict(facecolor='white', alpha=0.5))
-            buf_plag = BytesIO()
-            plt.tight_layout()
-            plt.savefig(buf_plag, format="png", dpi=100)
-            buf_plag.seek(0)
-            plt.close(fig)
-            img_plag = Image(buf_plag)
-            img_plag.width = 400
-            img_plag.height = 300
-            ws.add_image(img_plag, f"A{current_row}")
-        else:
-            ws.append(["Недостаточно данных для Pairwise Lag Analysis."])
-        current_row += 20
-        # (пример для первой пары)
-        ws.cell(row=current_row, column=1, value="Extended Spectral Analysis (пример для первой пары)")
-        current_row += 1
-        title_es = f"Coherence {col1}-{col2}"
-        buf_es = plot_coherence_vs_frequency(tool.data[col1], tool.data[col2], title_es, fs=getattr(tool, "fs", 1.0))
-        img_es = Image(buf_es)
-        img_es.width = 400
-        img_es.height = 300
-        ws.add_image(img_es, f"A{current_row}")
-        current_row += 20
-        # (пример для первой пары)
-        ws.cell(row=current_row, column=1, value="Frequency Demonstration (пример для первой пары)")
-        current_row += 1
-        buf_fd = plot_coherence_vs_frequency(tool.data[col1], tool.data[col2], title_es, fs=getattr(tool, "fs", 1.0))
-        img_fd = Image(buf_fd)
-        img_fd.width = 400
-        img_fd.height = 300
-        ws.add_image(img_fd, f"A{current_row}")
-        current_row += 20
-    else:
-        ws.append(["Недостаточно столбцов для Pairwise Lag Analysis или Spectral Analysis."])
-        current_row += 60 
-    ws.cell(row=current_row, column=1, value="End of Combined Informational Analysis")
-    logging.info("[Combined Informational Analysis] Лист сформирован.")
+        try: r = VAR(df.values).fit(max_lag, ic=None); rdf = pd.DataFrame(r.resid, columns=df.columns)
+        except: rdf = df
+    return AH_matrix(rdf, embed_dim=embed_dim, tau=tau, pairs=pairs)
 
-##############################################
-#Combined Time Series (агрегированный + индивидуальные графики)
-##############################################
-def export_combined_ts_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Combined Time Series")
-    ws.append(["Aggregated Time Series: Оригинальные и Нормализованные (на одном графике)"])
-    buf_orig = tool.plot_time_series(tool.data, "Aggregated Original Time Series")
-    img_orig = Image(buf_orig)
-    img_orig.width = 600
-    img_orig.height = 300
-    ws.add_image(img_orig, "A2")
-    
-    ws.append([])
-    buf_norm = tool.plot_time_series(tool.data_normalized, "Aggregated Normalized Time Series")
-    img_norm = Image(buf_norm)
-    img_norm.width = 600
-    img_norm.height = 300
-    ws.add_image(img_norm, "A10")
-    
-    ws.append(["Individual Time Series Plots:"])
-    row = ws.max_row + 2
-    for col in tool.data.columns:
-        buf_ind = tool.plot_single_time_series(tool.data[col], f"Original: {col}")
-        img_ind = Image(buf_ind)
-        img_ind.width = 300
-        img_ind.height = 200
-        ws.add_image(img_ind, f"A{row}")
-        buf_ind_norm = tool.plot_single_time_series(tool.data_normalized[col], f"Normalized: {col}")
-        img_ind_norm = Image(buf_ind_norm)
-        img_ind_norm.width = 300
-        img_ind_norm.height = 200
-        ws.add_image(img_ind_norm, f"E{row}")
-        row += 15
-    logging.info("[Combined Time Series] Лист сформирован.")
+for _n, _f in {
+    "ah_full": lambda d, lag=1, control=None, **kw: AH_matrix(d, pairs=kw.get("pairs")),
+    "ah_partial": lambda d, lag=1, control=None, **kw: compute_partial_AH_matrix(d, max_lag=lag, control=control, pairs=kw.get("pairs")),
+    "ah_directed": lambda d, lag=1, control=None, **kw: (AH_matrix(d, pairs=kw.get("pairs")) if not control
+        else compute_partial_AH_matrix(d, max_lag=lag, control=control, pairs=kw.get("pairs"))),
+}.items():
+    register_metric(_n, _f)
 
-##############################################
-# Combined FFT (агрегированный + индивидуальные графики)
-##############################################
-def export_all_fft_sheet(tool, wb: Workbook):
-    ws = wb.create_sheet("Combined FFT")
-    ws.append(["Combined FFT Analysis (Aggregated) - Original"])
-    buf_fft_orig = tool.plot_fft(tool.data, "Aggregated Original FFT")
-    img_fft_orig = Image(buf_fft_orig)
-    img_fft_orig.width = 600
-    img_fft_orig.height = 400
-    ws.add_image(img_fft_orig, "A2")
-    
-    ws.append([])
-    ws.append(["Combined FFT Analysis (Aggregated) - Normalized"])
-    buf_fft_norm = tool.plot_fft(tool.data_normalized, "Aggregated Normalized FFT")
-    img_fft_norm = Image(buf_fft_norm)
-    img_fft_norm.width = 600
-    img_fft_norm.height = 400
-    ws.add_image(img_fft_norm, "A20")
-    
-    ws.append(["Individual FFT Analysis:"])
-    row = ws.max_row + 2
-    for col in tool.data.columns:
-        buf_fft_ind = tool.plot_single_fft(tool.data[col], f"Original FFT: {col}")
-        img_fft_ind = Image(buf_fft_ind)
-        img_fft_ind.width = 300
-        img_fft_ind.height = 200
-        ws.add_image(img_fft_ind, f"A{row}")
-        buf_fft_ind_norm = tool.plot_single_fft(tool.data_normalized[col], f"Normalized FFT: {col}")
-        img_fft_ind_norm = Image(buf_fft_ind_norm)
-        img_fft_ind_norm.width = 300
-        img_fft_ind_norm.height = 200
-        ws.add_image(img_fft_ind_norm, f"E{row}")
-        row += 15
-    logging.info("[Combined FFT] Лист сформирован.")
+method_mapping = dict(METRICS_REGISTRY)
 
-##############################################
-# Создание оглавления с гиперссылками
-##############################################
-def create_table_of_contents(wb: Workbook):
-    if "Table of Contents" in wb.sheetnames:
-        old_sheet = wb["Table of Contents"]
-        wb.remove(old_sheet)
-    toc = wb.create_sheet("Table of Contents", 0)
-    row = 1
-    for sheet_name in wb.sheetnames:
-        if sheet_name == "Table of Contents":
-            continue
-        link = f"#{sheet_name}!A1"
-        cell = toc.cell(row=row, column=1)
-        cell.value = sheet_name
-        cell.hyperlink = link
-        cell.style = "Hyperlink"
-        row += 1
+# Legacy metric API re-exports kept for compatibility with older tests and callers.
+correlation_matrix = metrics_connectivity.correlation_matrix
+partial_correlation_matrix = metrics_connectivity.partial_correlation_matrix
+partial_h2_matrix = metrics_connectivity.partial_h2_matrix
+lagged_directed_correlation = metrics_connectivity.lagged_directed_correlation
+coherence_matrix = metrics_connectivity.coherence_matrix
+mutual_info_matrix = metrics_connectivity.mutual_info_matrix
+mutual_info_matrix_partial = metrics_connectivity.mutual_info_matrix_partial
+granger_matrix = metrics_connectivity.granger_matrix
+granger_matrix_partial = metrics_connectivity.granger_matrix_partial
+compute_granger_matrix = metrics_connectivity.granger_matrix
+TE_matrix = metrics_connectivity.transfer_entropy_matrix
+TE_matrix_partial = metrics_connectivity.transfer_entropy_matrix_partial
 
-##############################################
-# Класс BigMasterTool 
-##############################################
+def h2_matrix(df, lag=1, control=None, **kwargs):
+    return metrics_connectivity.correlation_matrix(df, lag=lag, control=control, **kwargs) ** 2
+
+
+def lagged_directed_h2(df, lag=1, control=None, **kwargs):
+    return metrics_connectivity.lagged_directed_correlation(df, lag=lag, control=control, **kwargs) ** 2
+
+
+def granger_dict(df, lag=1, control=None, **kwargs):
+    return {"matrix": metrics_connectivity.granger_matrix(df, lag=lag, control=control, **kwargs)}
+
+# ── Method metadata ──────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class MethodSpec:
+    directed: bool; is_p_value: bool; control_dependent: bool; supports_lag: bool; description: str = ""
+
+def get_method_spec(v):
+    return MethodSpec(directed=is_directed_method(v), is_p_value=is_pvalue_method(v),
+                      control_dependent=is_control_sensitive_method(v), supports_lag=is_directed_method(v))
+
+# ── Connectivity dispatcher ──────────────────────────────────────────────
+def compute_connectivity_variant(data, variant, lag=1, control=None, *, pairs=None,
+    partial_mode="global", pairwise_policy="others", custom_controls=None,
+    control_strategy="none", control_pca_k=0):
+    try:
+        if control is not None and len(control) == 0: control = None
+        control_matrix = None; control_desc = []
+        if isinstance(variant, str) and variant.endswith("_partial") and control is None and control_strategy != "none":
+            try:
+                n = len(data); ctrls = []
+                if control_strategy in {"global","global_mean","global_mean_trend","mean_trend"}:
+                    ctrls.append(pd.to_numeric(data.mean(axis=1), errors="coerce").to_numpy(dtype=np.float64))
+                    control_desc.append("global_mean")
+                if control_strategy in {"global_mean_trend","mean_trend","trend"}:
+                    t = np.arange(n, dtype=np.float64)
+                    t = (t-t.mean())/(t.std()+1e-12) if n > 1 else t
+                    ctrls.append(t); control_desc.append("linear_trend")
+                k = int(max(0, control_pca_k))
+                if k > 0:
+                    X = np.nan_to_num(data.to_numpy(dtype=np.float64), nan=0.0)
+                    U, S, _ = np.linalg.svd(X, full_matrices=False)
+                    for i in range(min(k, U.shape[1])):
+                        ctrls.append(U[:,i]*S[i]); control_desc.append(f"pca[{i+1}]")
+                if ctrls: control_matrix = np.vstack(ctrls).T
+            except: control_matrix = None; control_desc = []
+        if variant in method_mapping:
+            return get_metric_func(variant)(data, lag=lag, control=control,
+                control_matrix=control_matrix, control_desc=control_desc, pairs=pairs)
+        from ..metrics import connectivity
+        return connectivity.correlation_matrix(data)
+    except Exception as e:
+        logging.error("[ComputeVariant] %s failed: %s", variant, e)
+        return None
+
+
+# ── BigMasterTool ────────────────────────────────────────────────────────
+
 class BigMasterTool:
-    """
-    Главный класс-оркестратор.
-    Управляет загрузкой данных, запуском расчетов и вызовом генераторов отчетов.
-    """
+    """Main orchestrator for time series connectivity analysis."""
 
-    def __init__(
-        self,
-        data: pd.DataFrame = None,
-        enable_experimental: bool = False,
-        config: Optional[AnalysisConfig] = None,
-        stage_callback=None,
-    ) -> None:
-        # Внутренний лог пайплайна (для UI/отчётов). Не путать с модулем logging.
+    def __init__(self, data=None, enable_experimental=False, config=None, stage_callback=None):
         self.log = RunLog()
-
-        # Инициализация данных
-        # Снимки для отчёта: raw -> preprocessed -> after auto-diff.
         self.data_raw = pd.DataFrame()
         self.data_preprocessed = pd.DataFrame()
         self.data_after_autodiff = pd.DataFrame()
-        self.preprocessing_report = None  # type: ignore
+        self.preprocessing_report = None
         self.autodiff_report = {"enabled": False, "differenced": []}
-        # Уменьшение размерности: снимок состояния текущего запуска.
         self.dimred_report = {"enabled": False, "method": "none"}
-        self.dimred_mapping: pd.DataFrame = pd.DataFrame()
-        self.data_dimred: pd.DataFrame = pd.DataFrame()
-        self.data_dimred_base: Optional[pd.DataFrame] = None
+        self.dimred_mapping = pd.DataFrame()
+        self.data_dimred = pd.DataFrame()
+        self.data_dimred_base = None
         self.pairwise_summaries = {}
+        self.coords_df = None
+        self.qc_raw = self.qc_clean = None
+        self.graph_results = {}
         if data is not None:
-            # Чистка константных колонок
             data = data.loc[:, (data != data.iloc[0]).any()]
             self.data = data.copy()
-            # ВАЖНО: матрица рядов не должна таскать тяжелые attrs (coords и пр.).
-            # Иначе при self.data[col] pandas может сделать deepcopy(attrs) и резко увеличить память.
-            try:
-                self.data.attrs = {}
-            except Exception:
-                try:
-                    self.data.attrs.clear()
-                except Exception:
-                    pass
-            # Приведение к числам
+            try: self.data.attrs = {}
+            except: pass
             for c in list(self.data.columns):
                 self.data[c] = pd.to_numeric(self.data[c], errors="coerce")
-            # Если нет имен колонок, даем стандартные c1, c2...
             if len(self.data.columns) > 0 and isinstance(self.data.columns[0], int):
-                self.data.columns = [f"c{i + 1}" for i in range(self.data.shape[1])]
+                self.data.columns = [f"c{i+1}" for i in range(self.data.shape[1])]
         else:
             self.data = pd.DataFrame()
-
-        self.data_normalized: pd.DataFrame = pd.DataFrame()
-        self.results: dict = {}
-        self.results_meta: dict = {}
-        self.variant_lags: dict = {}
-        self.window_analysis: dict = {}
-        self.config: AnalysisConfig = config or AnalysisConfig(enable_experimental=enable_experimental)
-        # Пробрасываем master_seed в модуль метрик для воспроизводимости стохастики.
-        _set_connectivity_seed(int(self.config.master_seed))
-
-        # Коллбек прогресса/этапов для UI/CLI.
-        # Сигнатура: cb(stage: str, progress: float|None, meta: dict)
+        self.data_normalized = pd.DataFrame()
+        self.results = {}
+        self.results_meta = {}
+        self.variant_lags = {}
+        self.window_analysis = {}
+        self.config = config or AnalysisConfig(enable_experimental=enable_experimental)
         self._stage_callback = stage_callback
-
-        # Настройки
-        self.fs: float = 1.0  # Частота дискретизации
-
-        # Определяем списки методов
+        self.fs = 1.0
         self.undirected_methods = [m for m in method_mapping if not get_method_spec(m).directed]
         self.directed_methods = [m for m in method_mapping if get_method_spec(m).directed]
 
-    def set_stage_callback(self, cb) -> None:
-        """Установить коллбек прогресса/этапов (для GUI/Web/CLI)."""
+    def set_stage_callback(self, cb):
         self._stage_callback = cb
 
-    def _stage(self, stage: str, progress: Optional[float] = None, **meta) -> None:
-        """Сообщить текущий этап. progress ∈ [0..1] или None."""
-        try:
-            logging.info("[Stage] %s", stage)
-        except Exception:
-            pass
+    def _stage(self, stage, progress=None, **meta):
+        try: logging.info("[Stage] %s", stage)
+        except: pass
         cb = getattr(self, "_stage_callback", None)
-        if cb is None:
-            return
-        try:
-            cb(stage, progress, dict(meta or {}))
-        except Exception:
-            # UI не должен валить вычисления.
-            return
+        if cb:
+            try: cb(stage, progress, dict(meta or {}))
+            except: pass
 
-    def _build_ar_diagnostics_dataframe(self) -> pd.DataFrame:
-        """Собирает lag-wise AR-диагностику из preprocessing_report.notes['autocorr']."""
-        try:
-            rep = getattr(self, "preprocessing_report", None)
-            notes = getattr(rep, "notes", {}) if rep is not None else {}
-            ac = (notes or {}).get("autocorr") or {}
-            before = ac.get("before") or {}
-            after = ac.get("after") or {}
+    # ── Data loading ─────────────────────────────────────────────────
 
-            corr_b = before.get("corr_by_lag") or {}
-            corr_a = after.get("corr_by_lag") or {}
-            lb_b = before.get("ljungbox_p_by_lag") or {}
-            lb_a = after.get("ljungbox_p_by_lag") or {}
-            frac_b = before.get("frac_lb_p_lt_0_05_by_lag") or {}
-            frac_a = after.get("frac_lb_p_lt_0_05_by_lag") or {}
-            red = ac.get("lag_reduction_median_by_lag") or {}
-
-            keys = set(corr_b.keys()) | set(corr_a.keys()) | set(lb_b.keys()) | set(lb_a.keys()) | set(frac_b.keys()) | set(frac_a.keys()) | set(red.keys())
-            if not keys:
-                return pd.DataFrame()
-
-            def _lag_num(k: str) -> int:
-                try:
-                    return int(str(k).replace("lag", "").strip())
-                except Exception:
-                    return 10**9
-
-            rows = []
-            for lag_key in sorted(keys, key=_lag_num):
-                cb = corr_b.get(lag_key) or {}
-                ca = corr_a.get(lag_key) or {}
-                lb1 = lb_b.get(lag_key) or {}
-                lb2 = lb_a.get(lag_key) or {}
-                rows.append({
-                    "lag": _lag_num(lag_key),
-                    "corr_before_n": cb.get("n"),
-                    "corr_before_mean": cb.get("mean"),
-                    "corr_before_median": cb.get("median"),
-                    "corr_before_p25": cb.get("p25"),
-                    "corr_before_p75": cb.get("p75"),
-                    "corr_after_n": ca.get("n"),
-                    "corr_after_mean": ca.get("mean"),
-                    "corr_after_median": ca.get("median"),
-                    "corr_after_p25": ca.get("p25"),
-                    "corr_after_p75": ca.get("p75"),
-                    "ljungbox_p_before_mean": lb1.get("mean"),
-                    "ljungbox_p_before_median": lb1.get("median"),
-                    "ljungbox_p_after_mean": lb2.get("mean"),
-                    "ljungbox_p_after_median": lb2.get("median"),
-                    "frac_lb_p_lt_0_05_before": frac_b.get(lag_key),
-                    "frac_lb_p_lt_0_05_after": frac_a.get(lag_key),
-                    "lag_reduction_median": red.get(lag_key),
-                })
-            return pd.DataFrame(rows)
-        except Exception:
-            return pd.DataFrame()
-
-    def _render_ar_diagnostics_html(self) -> str:
-        """HTML-блок lag-wise AR-диагностики для включения в отчёты."""
-        try:
-            rep = getattr(self, "preprocessing_report", None)
-            notes = getattr(rep, "notes", {}) if rep is not None else {}
-            ac = (notes or {}).get("autocorr") or {}
-            if not ac:
-                return ""
-
-            ar_df = self._build_ar_diagnostics_dataframe()
-            if ar_df.empty:
-                return ""
-
-            phi1_before = ((ac.get("before") or {}).get("phi1") or {}).get("median")
-            phi1_after = ((ac.get("after") or {}).get("phi1") or {}).get("median")
-            lag1_reduction = ac.get("lag1_reduction_median")
-
-            def _fmt(x, nd=4):
-                try:
-                    if x is None:
-                        return "NaN"
-                    v = float(x)
-                    return "NaN" if not np.isfinite(v) else f"{v:.{nd}f}"
-                except Exception:
-                    return html.escape(str(x))
-
-            table_df = ar_df[[
-                "lag",
-                "corr_before_median",
-                "corr_after_median",
-                "lag_reduction_median",
-                "frac_lb_p_lt_0_05_before",
-                "frac_lb_p_lt_0_05_after",
-            ]].copy()
-            table_html = table_df.to_html(index=False, border=0, classes=["tsa-table"])
-
-            return (
-                "<section id='ar_diag'>"
-                "<h2>AR(p) / Autocorrelation diagnostics</h2>"
-                "<p>"
-                f"<b>Median phi1 before:</b> {_fmt(phi1_before)}<br>"
-                f"<b>Median phi1 after:</b> {_fmt(phi1_after)}<br>"
-                f"<b>Lag-1 median reduction:</b> {_fmt(lag1_reduction)}"
-                "</p>"
-                "<p>Таблица ниже показывает по лагам 1..p медианную автокорреляцию до/после, "
-                "снижение и долю рядов с Ljung–Box p&lt;0.05.</p>"
-                f"{table_html}"
-                "</section>"
-            )
-        except Exception:
-            return ""
-
-    def load_data_excel(self, filepath: str, **kwargs) -> pd.DataFrame:
-        """Загружает данные, чистит их и опционально устраняет нестационарность."""
-        self._stage("Загрузка данных", 0.0, file=str(filepath))
+    def load_data_excel(self, filepath, **kwargs):
+        self._stage("Загрузка данных", 0.0)
         qc_enabled = bool(kwargs.pop("qc_enabled", True))
-        # Подмешиваем дефолты из AnalysisConfig для HDF5/spatial-параметров,
-        # если они не переданы напрямую в kwargs.
-        for _k in ("spatial_bin_size", "spatial_bin_method", "spatial_grid_size", "spatial_grid_method", "lazy_spatial_bin", "time_chunk"):
-            if _k not in kwargs:
-                try:
-                    if hasattr(self.config, _k):
-                        kwargs[_k] = getattr(self.config, _k)
-                except Exception:
-                    pass
-
-        # 1) Сырой numeric-слепок без предобработки для честного before/after в отчёте.
-        # Пробрасываем параметры больших данных в RAW-загрузку,
-        # чтобы HDF5 4D файлы не пытались загрузить все 700K+ вокселей.
-        _big_data_keys = (
-            "feature_limit", "feature_sampling", "feature_seed", "h5_spatial_bin",
-            "spatial_grid_size", "spatial_grid_method", "spatial_bin_range",
-            "lazy_spatial_bin", "time_chunk",
-            "time_start", "time_end", "time_stride",
-            "dtype", "auto_float32",
-            "save_aggregated_h5", "aggregated_h5_dir", "reuse_existing_aggregated_h5",
-        )
-        _big_data_kwargs = {k: kwargs[k] for k in _big_data_keys if k in kwargs}
         try:
-            self._stage("Загрузка RAW (без предобработки)", 0.05)
-            self.data_raw = load_or_generate(
-                filepath,
-                preprocess=False,
-                normalize=False,
-                remove_outliers=False,
-                fill_missing=False,
-                check_stationarity=False,
-                **_big_data_kwargs,
-            )
-        except Exception:
-            self.data_raw = pd.DataFrame()
-
-        # spatial_bin_* относится к пост-загрузочному биннингу каналов и не
-        # должно уходить в load_or_generate(), где есть только spatial_grid_* для HDF5.
-        spatial_bin_size = int(kwargs.pop("spatial_bin_size", getattr(self.config, "spatial_bin_size", 1)) or 1)
-        spatial_bin_method = str(kwargs.pop("spatial_bin_method", getattr(self.config, "spatial_bin_method", "mean")))
-
-        # 2) Основной путь загрузки (с учётом выбранных опций) + структурированный отчёт.
+            self._stage("Загрузка RAW", 0.05)
+            self.data_raw = load_or_generate(filepath, preprocess=False, normalize=False,
+                remove_outliers=False, fill_missing=False, check_stationarity=False)
+        except: self.data_raw = pd.DataFrame()
         self._stage("Загрузка + предобработка", 0.15)
         df_out = load_or_generate(filepath, return_report=True, **kwargs)
-        if isinstance(df_out, tuple):
-            self.data, self.preprocessing_report = df_out
-        else:
-            self.data, self.preprocessing_report = df_out, None
-        # Опциональная пространственная агрегация каналов (channel binning).
-        # Выполняем после базовой загрузки/очистки, но до последующих этапов
-        # (QC, автодифф, расчёты), чтобы снизить размерность на ранней стадии.
-        if spatial_bin_size > 1:
-            self.data, spatial_desc = spatial_bin_channels(
-                self.data,
-                bin_size=spatial_bin_size,
-                method=spatial_bin_method,
-            )
-            try:
-                if self.preprocessing_report is not None:
-                    self.preprocessing_report.add(spatial_desc)
-            except Exception:
-                pass
-            try:
-                getattr(self, "log", RunLog()).add(spatial_desc)
-            except Exception:
-                logging.info(spatial_desc)
-
+        if isinstance(df_out, tuple): self.data, self.preprocessing_report = df_out
+        else: self.data, self.preprocessing_report = df_out, None
         self.data_preprocessed = self.data.copy()
-
-        self._stage("Данные загружены", 0.35, shape=list(self.data.shape))
-
-        # Координаты (для voxel-wide формата) и QC
-        self.coords_df = None
-        self.qc_raw = None
-        self.qc_clean = None
+        self._stage("Данные загружены", 0.35)
         try:
-            notes = (self.preprocessing_report.notes if self.preprocessing_report is not None else {}) or {}
+            notes = (self.preprocessing_report.notes if self.preprocessing_report else {}) or {}
             coords = notes.get("coords")
-            if isinstance(coords, list) and coords:
-                self.coords_df = pd.DataFrame(coords)
-        except Exception:
-            self.coords_df = None
-
-        # QC только если включено и (есть много рядов или есть coords)
+            if isinstance(coords, list) and coords: self.coords_df = pd.DataFrame(coords)
+        except: pass
         try:
-            from ..analysis import stats as _stats
-            if qc_enabled and (self.coords_df is not None or int(self.data.shape[1]) >= 20):
-                self._stage("QC (качество вокселей/рядов)", 0.45)
-                if getattr(self, "data_raw", pd.DataFrame()).empty is False:
-                    self.qc_raw = _stats.voxel_qc(self.data_raw, coords=self.coords_df)
-                self.qc_clean = _stats.voxel_qc(self.data, coords=self.coords_df)
-        except Exception:
-            self.qc_raw = None
-            self.qc_clean = None
-
-        # Запоминаем настройку QC (нужно для отчётов/пояснений)
-        try:
-            self.results_meta.setdefault("__run__", {})
-            self.results_meta["__run__"].setdefault("qc_enabled", qc_enabled)
-        except Exception:
-            pass
-
+            if qc_enabled and (self.coords_df is not None or self.data.shape[1] >= 20):
+                self._stage("QC", 0.45)
+                if not self.data_raw.empty:
+                    self.qc_raw = analysis_stats.voxel_qc(self.data_raw, coords=self.coords_df)
+                self.qc_clean = analysis_stats.voxel_qc(self.data, coords=self.coords_df)
+        except: pass
+        try: self.results_meta.setdefault("__run__", {}).setdefault("qc_enabled", qc_enabled)
+        except: pass
         self.data = self.data.fillna(self.data.mean(numeric_only=True))
-
-        if self.config.auto_difference:
-            self.autodiff_report = {"enabled": True, "differenced": []}
-            self._stage("Проверка стационарности + авто-дифференцирование", 0.55)
-            logging.info("Запущена проверка стационарности и авто-дифференцирование...")
-            diff_count = 0
-            for col in self.data.columns:
-                if not pd.api.types.is_numeric_dtype(self.data[col]):
-                    continue
-
-                stat, pval = analysis_stats.test_stationarity(self.data[col])
-                if stat is None:
-                    continue
-                if pval is not None and pval > 0.05:
-                    # ВАЖНО: после diff первый элемент становится NaN; если просто fillna(0),
-                    # в ряде появляется искусственный «ступенчатый» артефакт.
-                    # Поэтому явно задаём первый элемент и выполняем стабилизацию масштаба.
-                    s = pd.to_numeric(self.data[col], errors="coerce").astype(float)
-                    d = s.diff()
-                    if len(d) > 0:
-                        d.iloc[0] = 0.0
-
-                    # Центрирование/масштабирование после дифференцирования:
-                    # это снижает риск доминирования отдельных рядов по дисперсии.
-                    mean_d = d.mean(skipna=True)
-                    mu = float(mean_d) if np.isfinite(mean_d) else 0.0
-                    d = d - mu
-                    std_d = d.std(skipna=True)
-                    sd = float(std_d) if np.isfinite(std_d) else 0.0
-                    if sd > 1e-12:
-                        d = d / sd
-
-                    self.data[col] = d.fillna(0.0)
-                    diff_count += 1
-                    self.autodiff_report.setdefault("differenced", []).append(col)
-
-                    # Метаданные для прозрачности отчёта: что именно было сделано.
-                    try:
-                        self.autodiff_report.setdefault("stabilized", {})
-                        self.autodiff_report["stabilized"][str(col)] = {
-                            "centered": True,
-                            "scaled": bool(sd > 1e-12),
-                            "mean_removed": float(mu),
-                            "std_after_diff": float(sd),
-                        }
-                    except Exception:
-                        pass
-
-            if diff_count > 0:
-                logging.warning("Применено дифференцирование к %s нестационарным рядам.", diff_count)
-
+        if self.config.auto_difference: self._apply_auto_diff()
         self.data_after_autodiff = self.data.copy()
-        try:
-            self.results_meta.setdefault("__run__", {})
-            run_meta = self.results_meta["__run__"]
-            run_meta.update(
-                {
-                    "input_file": str(filepath),
-                    "load_kwargs": _to_jsonable(kwargs),
-                    "data_shape_after_load": list(getattr(self, "data", pd.DataFrame()).shape),
-                    "coords_shape": list(getattr(self, "coords_df", pd.DataFrame()).shape) if isinstance(getattr(self, "coords_df", None), pd.DataFrame) else None,
-                }
-            )
-        except Exception:
-            pass
-        logging.info("[BigMasterTool] Данные готовы: %s", self.data.shape)
-        self._stage("Данные готовы", 0.70, shape=list(self.data.shape))
+        self._stage("Данные готовы", 0.70)
         return self.data
 
-    def normalize_data(self) -> None:
-        """Нормализация данных (Z-score). Векторизовано через numpy."""
-        if self.data.empty:
-            logging.warning("Нет данных для нормализации.")
-            return
+    def _apply_auto_diff(self):
+        self.autodiff_report = {"enabled": True, "differenced": []}
+        self._stage("Авто-дифференцирование", 0.55)
+        cnt = 0
+        for col in self.data.columns:
+            if not pd.api.types.is_numeric_dtype(self.data[col]): continue
+            _, pval = analysis_stats.test_stationarity(self.data[col])
+            if pval is None or pval <= 0.05: continue
+            s = pd.to_numeric(self.data[col], errors="coerce").astype(float)
+            d = s.diff()
+            if len(d) > 0: d.iloc[0] = 0.0
+            mu = float(d.mean(skipna=True)) if np.isfinite(d.mean(skipna=True)) else 0.0
+            d -= mu
+            sd = float(d.std(skipna=True)) if np.isfinite(d.std(skipna=True)) else 0.0
+            if sd > 1e-12: d /= sd
+            self.data[col] = d.fillna(0.0); cnt += 1
+            self.autodiff_report["differenced"].append(col)
+        if cnt > 0: logging.warning("Differenced %d non-stationary series.", cnt)
 
+    def normalize_data(self):
+        if self.data.empty: return
         self._stage("Нормализация", 0.75)
-
         cols = [c for c in self.data.columns if pd.api.types.is_numeric_dtype(self.data[c])]
         self.data_normalized = self.data.copy()
         arr = self.data_normalized[cols].to_numpy(dtype=np.float64)
-        means = np.nanmean(arr, axis=0)
-        stds = np.nanstd(arr, axis=0)
-        stds[stds < 1e-12] = 1.0
-        self.data_normalized[cols] = (arr - means[np.newaxis, :]) / stds[np.newaxis, :]
-        logging.info("Данные нормализованы.")
+        means = np.nanmean(arr, axis=0); stds = np.nanstd(arr, axis=0); stds[stds < 1e-12] = 1.0
+        self.data_normalized[cols] = (arr - means) / stds
 
-    def _apply_fdr_correction(self) -> None:
-        """Применяет поправку Бенджамини-Хохберга к p-value методам."""
-        if self.config.pvalue_correction != "fdr_bh":
-            return
+    def _apply_fdr_correction(self):
+        if self.config.pvalue_correction != "fdr_bh": return
+        for v, mat in self.results.items():
+            if mat is not None and is_pvalue_method(v):
+                self.results[v] = apply_pvalue_correction_matrix(mat, directed=get_method_spec(v).directed)
 
-        for variant, mat in self.results.items():
-            if mat is None or not is_pvalue_method(variant):
-                continue
-            self.results[variant] = apply_pvalue_correction_matrix(
-                mat,
-                directed=get_method_spec(variant).directed,
-            )
-            logging.info("Применена FDR коррекция к %s", variant)
+    # ── Run methods ──────────────────────────────────────────────────
 
-    def run_all_methods(self, **kwargs) -> None:
-        """Запуск всех доступных методов анализа."""
-        self._stage("Подготовка: dimred/нормализация", 0.72)
-        # Опционально уменьшаем размерность до нормализации/оценки связности.
-        self._maybe_apply_dimred(**kwargs)
-        self._maybe_post_preprocess(**kwargs)
+    def run_all_methods(self, **kwargs):
+        self._stage("Подготовка", 0.72)
+        self._maybe_apply_dimred(**kwargs); self._maybe_post_preprocess(**kwargs)
         self.normalize_data()
-        if self.data_normalized.empty:
-            return
-
-        prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
-        self.results = {}
-        # Метаданные (лаг, окна, partial-контроль и т.п.) — чтобы отчёты могли
-        # объяснять пользователю «что именно было исключено/подобрано».
-        self.results_meta = {}
-        if prev_run_meta:
-            self.results_meta["__run__"] = prev_run_meta
-        self.variant_lags = {}
-        self.window_analysis = {}
-
-        variants_all = list(method_mapping.keys())
-        n_total = max(1, len(variants_all))
-        for idx, variant in enumerate(variants_all, start=1):
-            self._stage(
-                f"Расчёт: {variant} ({idx}/{n_total})",
-                0.80 + 0.18 * (idx - 1) / n_total,
-                variant=variant,
-                i=idx,
-                n=n_total,
-            )
-            logging.info("Расчет метода: %s...", variant)
+        if self.data_normalized.empty: return
+        prev = dict((self.results_meta or {}).get("__run__", {}) or {})
+        self.results = {}; self.results_meta = {"__run__": prev} if prev else {}
+        self.variant_lags = {}; self.window_analysis = {}
+        variants = list(method_mapping.keys()); nt = max(1, len(variants))
+        for i, v in enumerate(variants, 1):
+            self._stage(f"Расчёт: {v} ({i}/{nt})", 0.80 + 0.18*(i-1)/nt)
             try:
-                mat, meta = self._compute_variant_auto(variant, **kwargs)
-                self.results[variant] = mat
-                self.results_meta[variant] = meta
-                if meta.get("chosen_lag") is not None:
-                    self.variant_lags[variant] = int(meta["chosen_lag"])
-                if meta.get("window") is not None:
-                    self.window_analysis[variant] = meta["window"]
+                mat, meta = self._compute_variant_auto(v, **kwargs)
+                self.results[v] = mat; self.results_meta[v] = meta
+                if meta.get("chosen_lag"): self.variant_lags[v] = int(meta["chosen_lag"])
+                if meta.get("window"): self.window_analysis[v] = meta["window"]
             except Exception as e:
-                logging.exception("Ошибка метода %s", variant)
-                self.results[variant] = None
-                self.results_meta[variant] = {"error": str(e)}
+                logging.error("Error %s: %s", v, e)
+                self.results[v] = None; self.results_meta[v] = {"error": str(e)}
+        self._apply_fdr_correction(); self._stage("Готово", 1.0)
 
-        self._apply_fdr_correction()
-        self._stage("Готово: расчёты завершены", 1.0)
-        logging.info("Все расчеты завершены.")
-
-    def run_selected_methods(self, variants: List[str], max_lag: int = 5, **kwargs) -> Dict[str, int]:
-        """
-        Запуск конкретных выбранных методов.
-        Возвращает словарь {метод: использованный_лаг}.
-        """
-        self._stage("Подготовка: dimred/нормализация", 0.72)
-        # Опционально уменьшаем размерность до нормализации/оценки связности.
-        self._maybe_apply_dimred(**kwargs)
-        self._maybe_post_preprocess(**kwargs)
+    def run_selected_methods(self, variants, max_lag=5, **kwargs):
+        self._stage("Подготовка", 0.72)
+        self._maybe_apply_dimred(**kwargs); self._maybe_post_preprocess(**kwargs)
         self.normalize_data()
-        prev_run_meta = dict((getattr(self, "results_meta", {}) or {}).get("__run__", {}) or {})
-        self.results = {}
-        self.results_meta = {}
-        if prev_run_meta:
-            self.results_meta["__run__"] = prev_run_meta
+        prev = dict((self.results_meta or {}).get("__run__", {}) or {})
+        self.results = {}; self.results_meta = {"__run__": prev} if prev else {}
         self.window_analysis = {}
-
-        # сохраняем параметры запуска (для UI/CLI пояснений)
-        try:
-            self.results_meta.setdefault("__run__", {})
-            run_meta = self.results_meta["__run__"]
-            run_meta.update(
-                {
-                    "variants": list(variants),
-                    "max_lag": int(max_lag),
-                    "lag_selection": (kwargs.get("lag_selection") or self.config.lag_selection),
-                    "lag": kwargs.get("lag"),
-                    "window_sizes": kwargs.get("window_sizes"),
-                    "window_stride": kwargs.get("window_stride"),
-                    "window_policy": kwargs.get("window_policy"),
-                    "control_strategy": kwargs.get("control_strategy", "none"),
-                    "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
-                    "dimred": dict(getattr(self, "dimred_report", {}) or {}),
-
-                    "scan_window_pos": bool(kwargs.get("scan_window_pos", False)),
-                    "scan_window_size": bool(kwargs.get("scan_window_size", False)),
-                    "scan_lag": bool(kwargs.get("scan_lag", False)),
-                    "scan_cube": bool(kwargs.get("scan_cube", False)),
-                    "window_sizes_grid": _to_jsonable(kwargs.get("window_sizes_grid")),
-                    "lag_grid": _to_jsonable(kwargs.get("lag_grid")),
-                    "cube_matrix_mode": kwargs.get("cube_matrix_mode"),
-                    "method_options": _to_jsonable(kwargs.get("method_options") or {}),
-                    "run_kwargs": _to_jsonable(kwargs),
-                    "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
-                    "data_shape_before_metrics": list(getattr(self, "data", pd.DataFrame()).shape),
-                }
-            )
-        except Exception:
-            pass
-
-        # max_lag аргументом оставляем, но если задан self.config.max_lag —
-        # берём максимум из них (чтобы не ломать старые вызовы).
-        self.config.max_lag = int(max(self.config.max_lag, int(max_lag)))
-
+        self.config.max_lag = max(self.config.max_lag, int(max_lag))
         method_options = kwargs.get("method_options") or {}
-        if method_options is None:
-            method_options = {}
-
-        used_lags: Dict[str, int] = {}
-        n_total = max(1, len(variants))
-        for idx, variant in enumerate(variants, start=1):
-            self._stage(
-                f"Расчёт: {variant} ({idx}/{n_total})",
-                0.80 + 0.18 * (idx - 1) / n_total,
-                variant=variant,
-                i=idx,
-                n=n_total,
-            )
-            if variant not in method_mapping:
-                continue
+        used_lags: Dict[str, int] = {}; nt = max(1, len(variants))
+        for i, v in enumerate(variants, 1):
+            self._stage(f"Расчёт: {v} ({i}/{nt})", 0.80 + 0.18*(i-1)/nt)
+            if v not in method_mapping: continue
             try:
-                v_kwargs = dict(kwargs)
-                if isinstance(method_options, dict) and isinstance(method_options.get(variant), dict):
-                    # Локальные опции метода перекрывают глобальные kwargs.
-                    v_kwargs.update(method_options.get(variant) or {})
-                mat, meta = self._compute_variant_auto(variant, **v_kwargs)
-                self.results[variant] = mat
-                self.results_meta[variant] = meta
-                if meta.get("chosen_lag") is not None:
-                    used_lags[variant] = int(meta["chosen_lag"])
-                if meta.get("window") is not None:
-                    self.window_analysis[variant] = meta["window"]
+                vkw = dict(kwargs)
+                if isinstance(method_options.get(v), dict): vkw.update(method_options[v])
+                mat, meta = self._compute_variant_auto(v, **vkw)
+                self.results[v] = mat; self.results_meta[v] = meta
+                if meta.get("chosen_lag"): used_lags[v] = int(meta["chosen_lag"])
+                if meta.get("window"): self.window_analysis[v] = meta["window"]
             except Exception as e:
-                logging.exception("Ошибка метода %s", variant)
-                self.results[variant] = None
-                self.results_meta[variant] = {"error": str(e)}
+                logging.error("Error %s: %s", v, e)
+                self.results[v] = None; self.results_meta[v] = {"error": str(e)}
+        self.variant_lags = used_lags; self._apply_fdr_correction()
+        self._stage("Готово", 1.0); return used_lags
 
-        self.variant_lags = used_lags
-        self._stage("Готово: расчёты завершены", 1.0)
-        return used_lags
+    # ── Core variant computation ─────────────────────────────────────
 
-    def calculate_graph_metrics(self, threshold: float = 0.2) -> None:
-        """[PATCH] Рассчитать топологические метрики для уже посчитанных матриц.
-
-        Метод безопасен для повторного вызова: каждый запуск перезаписывает
-        ``self.graph_results`` и анализирует только непустые матрицы из ``self.results``.
-        """
-        from ..analysis.graph import analyze_graph_topology
-
-        self.graph_results = {}
-        names = list(self.data.columns)
-
-        for variant, mat in (self.results or {}).items():
-            if mat is None:
-                continue
-
-            is_directed = get_method_spec(variant).directed
-
-            # Для p-value матриц: строим "силу связи" как (1 - p),
-            # но только для статистически значимых пар p < threshold.
-            if is_pvalue_method(variant):
-                clean_mat = np.zeros_like(mat, dtype=float)
-                mask = (mat < float(threshold)) & (~np.eye(mat.shape[0], dtype=bool))
-                clean_mat[mask] = 1.0 - mat[mask]
-                analysis = analyze_graph_topology(clean_mat, names, threshold=0.01, directed=is_directed)
-            else:
-                analysis = analyze_graph_topology(mat, names, threshold=float(threshold), directed=is_directed)
-
-            self.graph_results[variant] = analysis
-            logging.info("[Graph] Analyzed topology for %s", variant)
-
-    def _compute_variant_auto(self, variant: str, **kwargs) -> tuple[np.ndarray | None, dict]:
-        """Единая точка расчёта: лаг (fixed/optimize) + окна (none/best/mean).
-
-        Архитектуру сохраняем: наружу по-прежнему отдаём матрицу, но параллельно
-        собираем meta для отчётов.
-        """
+    def _compute_variant_auto(self, variant, **kwargs):
         df = self.data_normalized
-        if df is None or df.empty:
-            return None, {"error": "empty data"}
-
-        # Описание control-переменных для partial-вариантов
-        meta: dict = {"variant": variant}
-        contract = ComputationContract(
-            variant=variant,
-            input_channels=int(df.shape[1]),
-            input_T=int(df.shape[0]),
-            input_missing_frac=float(pd.isna(df).mean().mean()) if len(df.columns) else 0.0,
-            directed=bool(is_directed_method(variant)),
-            seed=int(getattr(self.config, "master_seed", 12345)),
-        )
+        if df is None or df.empty: return None, {"error": "empty data"}
+        meta = {"variant": variant}
         if is_control_sensitive_method(variant):
-            # В текущей реализации (pairwise_policy='others' по умолчанию) это значит:
-            # для пары (Xi, Xj) исключаем влияние всех остальных переменных.
-            meta["partial"] = {
-                "mode": kwargs.get("partial_mode", "pairwise"),
+            meta["partial"] = {"mode": kwargs.get("partial_mode", "pairwise"),
                 "pairwise_policy": kwargs.get("pairwise_policy", "others"),
-                "custom_controls": kwargs.get("custom_controls"),
-                "control_strategy": kwargs.get("control_strategy", "none"),
-                "control_pca_k": int(kwargs.get("control_pca_k", 0) or 0),
-                "explain": "Для каждой пары (Xi, Xj) исключено линейное влияние набора control.",
-            }
-
-        # Упрощение для большого N: полная матрица / пары / соседства по координатам
-        n_cols = int(df.shape[1])
-        pair_mode = str(kwargs.get("pair_mode") or "auto").lower()
-        auto_thr = int(kwargs.get("pair_auto_threshold") or 0)
-        if auto_thr <= 0:
-            auto_thr = 500
-
-        def _parse_pairs_text(text: str) -> list[tuple[int, int]]:
-            """Parse user pairs like: a-b; a->b; 0-1; 0->1.
-
-            Names are matched against df.columns.
-            """
-            text = (text or "").strip()
-            if not text:
-                return []
-            # Нормализация разделителей
-            raw_items: list[str] = []
-            for token in text.replace("—", "-").replace(",", ";").split(";"):
-                tt = token.strip()
-                if tt:
-                    raw_items.append(tt)
-            col_to_idx = {str(c): i for i, c in enumerate(df.columns)}
-            pairs_out: list[tuple[int, int]] = []
-            for it in raw_items:
-                if "->" in it:
-                    a, b = [x.strip() for x in it.split("->", 1)]
-                elif "-" in it:
-                    a, b = [x.strip() for x in it.split("-", 1)]
-                else:
-                    continue
-                def _to_idx(x: str) -> Optional[int]:
-                    if x.isdigit():
-                        ix = int(x)
-                        return ix if 0 <= ix < n_cols else None
-                    return col_to_idx.get(x)
-                ia = _to_idx(a)
-                ib = _to_idx(b)
-                if ia is None or ib is None or ia == ib:
-                    continue
-                pairs_out.append((int(ia), int(ib)))
-            return pairs_out
-
-        def _build_neighbor_pairs(kind: str, radius: int) -> list[tuple[int, int]]:
-            """Spatial neighborhood pairs from coords_df (voxel_id/x/y/z).
-
-            If coords are missing, returns empty list.
-            """
-            if getattr(self, "coords_df", None) is None or self.coords_df is None:
-                return []
-            coords = self.coords_df
-            if coords.empty:
-                return []
-            # Карта voxel_id -> индекс колонки
-            col_to_idx = {str(c): i for i, c in enumerate(df.columns)}
-            # Словарь coord -> индекс
-            coord_to_idx: dict[tuple[int, int, int], int] = {}
-            for _, r in coords.iterrows():
-                vid = str(r.get("voxel_id"))
-                if vid not in col_to_idx:
-                    continue
-                try:
-                    x = int(r.get("x"))
-                    y = int(r.get("y"))
-                    z = int(r.get("z"))
-                except Exception:
-                    continue
-                coord_to_idx[(x, y, z)] = int(col_to_idx[vid])
-
-            if not coord_to_idx:
-                return []
-            kind = str(kind or "26")
-            radius = int(max(1, radius))
-            pairs_out: list[tuple[int, int]] = []
-            # Смещения соседей
-            offsets: list[tuple[int, int, int]] = []
-            for dx in range(-radius, radius + 1):
-                for dy in range(-radius, radius + 1):
-                    for dz in range(-radius, radius + 1):
-                        if dx == dy == dz == 0:
-                            continue
-                        if kind == "6":
-                            if abs(dx) + abs(dy) + abs(dz) == 1:
-                                offsets.append((dx, dy, dz))
-                        else:
-                            # 26-соседство (метрика Чебышёва)
-                            if max(abs(dx), abs(dy), abs(dz)) <= radius:
-                                offsets.append((dx, dy, dz))
-
-            seen = set()
-            for (x, y, z), i in coord_to_idx.items():
-                for dx, dy, dz in offsets:
-                    j = coord_to_idx.get((x + dx, y + dy, z + dz))
-                    if j is None or j == i:
-                        continue
-                    a, b = (i, j) if i < j else (j, i)
-                    key = (a, b)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    pairs_out.append((a, b))
-            return pairs_out
-
-        # Определяем итоговый список пар
-        pairs_idx: Optional[list[tuple[int, int]]] = None
-        if pair_mode == "auto":
-            _has_coords = (
-                getattr(self, "coords_df", None) is not None
-                and self.coords_df is not None
-                and not getattr(self.coords_df, "empty", True)
-            )
-            if n_cols >= auto_thr and _has_coords:
-                pair_mode = "neighbors"
-            elif n_cols >= auto_thr:
-                pair_mode = "random"
-                logging.info("[auto pair_mode] N=%d >= %d, no coords -> random", n_cols, auto_thr)
-            else:
-                pair_mode = "full"
-        if pair_mode == "pairs":
-            pairs_idx = _parse_pairs_text(str(kwargs.get("pairs_text") or ""))
-        elif pair_mode == "neighbors":
-            pairs_idx = _build_neighbor_pairs(str(kwargs.get("neighbor_kind") or "26"), int(kwargs.get("neighbor_radius") or 1))
-            if not pairs_idx and n_cols >= auto_thr:
-                logging.info("[pair_mode] neighbors empty, fallback -> random for N=%d", n_cols)
-                pair_mode = "random"
-        elif pair_mode == "random":
-            # Случайные неориентированные пары (если нет coords), с фиксированным seed.
-            max_pairs = int(max(1, kwargs.get("max_pairs") or 50000))
-            rng = np.random.default_rng(int(getattr(self.config, "master_seed", 12345)))
-            # Выбор индексов в верхнем треугольнике
-            m = min(max_pairs, max(1, n_cols * 5))
-            pairs_out = set()
-            while len(pairs_out) < m:
-                i = int(rng.integers(0, n_cols))
-                j = int(rng.integers(0, n_cols))
-                if i == j:
-                    continue
-                a, b = (i, j) if i < j else (j, i)
-                pairs_out.add((a, b))
-            pairs_idx = list(pairs_out)
-        else:
-            pairs_idx = None
-
-        if pairs_idx is not None:
-            meta["pair_mode"] = str(pair_mode)
-            meta["pairs_count"] = int(len(pairs_idx))
-            meta["pairs_explain"] = (
-                "Матрица считается упрощённо: только по выбранным парам (остальные пары заполняются дефолтом метода)."
-            )
-
-        # Выбор лага
-        # OOM guard для режимов, где может собираться полная NxN матрица.
-        _mat_gb = (n_cols * n_cols * 8) / (1024**3)
-        if pairs_idx is None and _mat_gb > 8.0:
-            logging.error("[memory] Matrix %dx%d=%.1fGB>8GB, forcing random.", n_cols, n_cols, _mat_gb)
-            _rng = np.random.default_rng(int(getattr(self.config, "master_seed", 12345)))
-            _mp = min(n_cols * 5, 500_000)
-            _ps: set[tuple[int, int]] = set()
-            _bi = _rng.integers(0, n_cols, size=_mp * 3)
-            _bj = _rng.integers(0, n_cols, size=_mp * 3)
-            for _ii, _jj in zip(_bi, _bj):
-                if _ii != _jj:
-                    _ps.add((int(min(_ii, _jj)), int(max(_ii, _jj))))
-                if len(_ps) >= _mp:
-                    break
-            pairs_idx = list(_ps)
-            meta["pair_mode"] = "random (OOM guard)"
-            meta["pairs_count"] = len(pairs_idx)
-
-        supports_lag = is_directed_method(variant) or variant.startswith("granger") or variant.startswith("te_") or variant.startswith("ah_")
+                "control_strategy": kwargs.get("control_strategy", "none")}
+        n_cols = df.shape[1]
+        pairs_idx, pair_mode, pair_meta = resolve_pairs(
+            n_cols, df.columns, getattr(self, "coords_df", None),
+            str(kwargs.get("pair_mode") or "auto").lower(),
+            int(kwargs.get("pair_auto_threshold") or 500), **kwargs)
+        meta.update(pair_meta)
+        supports_lag = is_directed_method(variant) or variant.startswith(("granger","te_","ah_"))
         lag_sel = (kwargs.get("lag_selection") or self.config.lag_selection or "optimize").lower()
-        if is_pvalue_method(variant) and "lag_selection" not in kwargs:
-            # Для p-value метрик фиксируем лаг по умолчанию, чтобы не вносить смещение отбора.
-            lag_sel = "fixed"
-            meta["lag_policy"] = "fixed_for_pvalue_method"
-        max_lag = int(kwargs.get("max_lag") or self.config.max_lag or 1)
-        max_lag = int(max(1, max_lag))
+        max_lag_v = int(max(1, kwargs.get("max_lag") or self.config.max_lag or 1))
 
-        def _compute_at_lag(d: pd.DataFrame, lag: int) -> np.ndarray | None:
-            return compute_connectivity_variant(
-                d,
-                variant,
-                lag=int(max(1, lag)),
-                control=kwargs.get("control"),
-                pairs=pairs_idx,
+        def _at_lag(d, lag):
+            return compute_connectivity_variant(d, variant, lag=int(max(1, lag)),
+                control=kwargs.get("control"), pairs=pairs_idx,
                 partial_mode=kwargs.get("partial_mode", "pairwise"),
                 pairwise_policy=kwargs.get("pairwise_policy", "others"),
                 custom_controls=kwargs.get("custom_controls"),
                 control_strategy=kwargs.get("control_strategy", "none"),
-                control_pca_k=int(kwargs.get("control_pca_k", 0) or 0),
-            )
-
-        # Shared dict-кеш матриц для переиспользования между scan и window mode.
-        _matrix_cache: dict[tuple[str, int, int, int], np.ndarray | None] = {}
-
-        def _cached_compute_at_lag(d: pd.DataFrame, lag: int, start: int = 0, end: int = -1) -> np.ndarray | None:
-            key = (variant, int(lag), int(start), int(end))
-            if key in _matrix_cache:
-                return _matrix_cache[key]
-            mat = _compute_at_lag(d, lag)
-            _matrix_cache[key] = mat
-            return mat
-
-        def _store_contract(mat_obj: np.ndarray | None) -> None:
-            try:
-                contract.output_shape = tuple(np.asarray(mat_obj).shape) if mat_obj is not None else (0, 0)
-            except Exception:
-                contract.output_shape = (0, 0)
-            try:
-                preprocess_steps: list[str] = []
-                for rep_name in ("preprocessing_report", "autodiff_report", "dimred_report"):
-                    rep = getattr(self, rep_name, None) or {}
-                    if isinstance(rep, dict):
-                        for k, v in rep.items():
-                            if v not in (None, False, "", [], {}):
-                                preprocess_steps.append(f"{rep_name}:{k}={v}")
-                contract.preprocess_steps = preprocess_steps
-                if isinstance(meta.get("partial"), dict):
-                    contract.control_strategy = str(meta["partial"].get("control_strategy", "none"))
-                    cc = meta["partial"].get("custom_controls")
-                    if isinstance(cc, (list, tuple)):
-                        contract.controls = [str(x) for x in cc]
-                meta["contract"] = contract.as_dict()
-            except Exception:
-                pass
+                control_pca_k=int(kwargs.get("control_pca_k", 0) or 0))
 
         chosen_lag = 1
-        if not supports_lag:
-            chosen_lag = 1
-        elif lag_sel == "fixed":
+        if not supports_lag or lag_sel == "fixed":
             chosen_lag = int(max(1, kwargs.get("lag", 1)))
         else:
-            # Оптимизация лага
-            # Для больших N с pairs: матрица уже ограничена парами, ок.
-            # Для больших max_lag: early stop если score не улучшается.
-            best_score = float("-inf")
-            best_lag = 1
-            no_improve_count = 0
-            for lag in range(1, max_lag + 1):
-                mat = _compute_at_lag(df, lag)
-                score = _lag_quality(variant, mat)
-                if np.isfinite(score) and float(score) > best_score:
-                    best_score = float(score)
-                    best_lag = int(lag)
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
-                # Early stop: если 3 лага подряд без улучшения
-                if no_improve_count >= 3 and lag >= 3:
-                    break
-            chosen_lag = int(best_lag)
-            meta["lag_optimization"] = {
-                "max_lag": int(max_lag),
-                "criterion": "mean(|offdiag|)" if not is_pvalue_method(variant) else "mean(-log10(p))",
-            }
-            if is_pvalue_method(variant):
-                meta["warning"] = "selection_bias"
-                contract.validity_warnings.append("lag optimization over p-values can introduce selection bias")
-        meta["chosen_lag"] = int(chosen_lag)
-        contract.directed_lag = int(chosen_lag)
-        contract.lag_selection = str(lag_sel)
+            best_s, best_l, no_imp = float("-inf"), 1, 0
+            for lag in range(1, max_lag_v+1):
+                mat = _at_lag(df, lag)
+                sc = lag_quality(variant, mat, is_pvalue_method(variant))
+                if np.isfinite(sc) and sc > best_s: best_s, best_l, no_imp = sc, lag, 0
+                else: no_imp += 1
+                if no_imp >= 3 and lag >= 3: break
+            chosen_lag = best_l
+        meta["chosen_lag"] = chosen_lag
 
-        # --- Диагностические сканы по окнам/лагам/позициям ---
-        scans = {
-            "window_pos": bool(kwargs.get("scan_window_pos", False)),
-            "window_size": bool(kwargs.get("scan_window_size", False)),
-            "lag": bool(kwargs.get("scan_lag", False)),
-            "cube": bool(kwargs.get("scan_cube", False)),
-        }
-
-        # Параллель диагностических сканов по окнам и 3D-кубу по умолчанию выключаем.
-        # Это безопаснее для Streamlit/UI и не ломает порядок этапов через stage_callback.
-        try:
-            scan_n_jobs = int(kwargs.get("scan_n_jobs") or kwargs.get("n_jobs") or 1)
-        except Exception:
-            scan_n_jobs = 1
-        scan_n_jobs = int(max(1, scan_n_jobs))
-        scan_backend = str(kwargs.get("scan_backend") or "loky")
-        try:
-            cube_n_jobs = int(kwargs.get("cube_n_jobs") or 1)
-        except Exception:
-            cube_n_jobs = 1
-        cube_n_jobs = int(max(1, cube_n_jobs))
-
-        w_start_min = kwargs.get("window_start_min")
-        w_start_max = kwargs.get("window_start_max")
-        w_stride = kwargs.get("window_stride")
-        w_max_windows = int(kwargs.get("window_max_windows", 250))
-
-        lag_grid = kwargs.get("lag_grid")
-        if lag_grid is None:
-            lmin = max(1, int(kwargs.get("lag_min", 1)))
-            lmax = max(lmin, int(kwargs.get("lag_max", max_lag)))
-            lstep = max(1, int(kwargs.get("lag_step", 1)))
-            lag_grid = list(range(lmin, lmax + 1, lstep))
-        else:
-            try:
-                lag_grid = [int(x) for x in lag_grid if int(x) >= 1]
-            except Exception:
-                lag_grid = [1]
-            if not lag_grid:
-                lag_grid = [1]
-
-        window_sizes_grid = kwargs.get("window_sizes_grid")
-        if window_sizes_grid is not None:
-            try:
-                window_sizes_grid = [int(x) for x in window_sizes_grid if int(x) >= 2]
-            except Exception:
-                window_sizes_grid = []
-        else:
-            window_sizes_grid = []
-
+        # Diagnostic scans
+        scans = {k: bool(kwargs.get(f"scan_{k}", False)) for k in ("window_pos","window_size","lag","cube")}
         if any(scans.values()):
-            scan_meta: dict = {"flags": scans}
-            ws_fallback = kwargs.get("window_sizes") or self.config.window_sizes or []
-            ws_fallback = [int(w) for w in ws_fallback if int(w) >= 2]
-            ws_list = window_sizes_grid if window_sizes_grid else ws_fallback
+            self._run_diagnostic_scans(df, variant, chosen_lag, pairs_idx, meta, kwargs,
+                                        _at_lag, supports_lag, max_lag_v, scans)
 
-            # Если список размеров окна пуст — можно собрать его из window_min/max/step.
-            if not ws_list:
-                try:
-                    wmin = int(kwargs.get("window_min", 0) or 0)
-                    wmax = int(kwargs.get("window_max", 0) or 0)
-                    wstep = int(kwargs.get("window_step", 0) or 0)
-                    if wmin >= 2 and wmax >= wmin and wstep >= 1:
-                        ws_list = list(range(wmin, wmax + 1, wstep))
-                except Exception:
-                    ws_list = []
-
-            default_w = int(kwargs.get("window_size", ws_list[0] if ws_list else min(200, max(10, len(df) // 5))))
-            default_w = int(max(2, min(default_w, len(df))))
-
-            if scans["window_pos"]:
-                stride = int(w_stride) if w_stride is not None else int(max(1, default_w // 5))
-                info = analyze_sliding_windows_with_metric(
-                    df, variant, window_size=default_w, stride=stride, lag=int(chosen_lag),
-                    start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
-                    return_matrices=True,
-                    pairs=pairs_idx,
-                    cache=_matrix_cache,
-                    n_jobs=scan_n_jobs,
-                    parallel_backend=scan_backend,
-                )
-                ticks = []
-                for i, t in enumerate((info or {}).get("ticks") or []):
-                    tid = f"pos_w{default_w}_l{int(chosen_lag)}_i{i}_s{int(t.get('start', 0))}"
-                    ticks.append({"id": tid, **t})
-                ext = (info or {}).get("extremes") or {}
-                ext_ids = {
-                    "best": ticks[ext.get("best")]["id"] if ticks and ext.get("best") is not None else None,
-                    "median": ticks[ext.get("median")]["id"] if ticks and ext.get("median") is not None else None,
-                    "worst": ticks[ext.get("worst")]["id"] if ticks and ext.get("worst") is not None else None,
-                }
-                scan_meta["window_pos"] = {
-                    "window_size": default_w, "stride": stride, "lag": int(chosen_lag),
-                    "curve": info.get("curve") if info else None,
-                    "best_window": info.get("best_window") if info else None,
-                    "ticks": ticks,
-                    "extremes": ext_ids,
-                }
-
-            if scans["window_size"] and ws_list:
-                xs, ys = [], []
-                ticks = []
-                for w in ws_list:
-                    stride = int(w_stride) if w_stride is not None else int(max(1, int(w) // 5))
-                    info = analyze_sliding_windows_with_metric(
-                        df, variant, window_size=int(w), stride=stride, lag=int(chosen_lag),
-                        start_min=w_start_min, start_max=w_start_max, max_windows=w_max_windows,
-                        return_matrices=False,
-                        pairs=pairs_idx,
-                        cache=_matrix_cache,
-                        n_jobs=scan_n_jobs,
-                        parallel_backend=scan_backend,
-                    )
-                    bw = (info or {}).get("best_window") or {}
-                    q = bw.get("metric", float("nan"))
-                    xs.append(int(w))
-                    ys.append(float(q) if np.isfinite(q) else float("nan"))
-                    tid = f"size_w{int(w)}_l{int(chosen_lag)}"
-                    ticks.append({
-                        "id": tid,
-                        "window_size": int(w),
-                        "start": int(bw.get("start", 0)) if bw else 0,
-                        "end": int(bw.get("end", 0)) if bw else 0,
-                        "metric": float(q) if np.isfinite(q) else float("nan"),
-                        "matrix": bw.get("matrix"),
-                    })
-                ext = _select_best_median_worst(ticks, key="metric")
-                ext_ids = {
-                    "best": ticks[ext.get("best")]["id"] if ticks and ext.get("best") is not None else None,
-                    "median": ticks[ext.get("median")]["id"] if ticks and ext.get("median") is not None else None,
-                    "worst": ticks[ext.get("worst")]["id"] if ticks and ext.get("worst") is not None else None,
-                }
-                scan_meta["window_size"] = {"lag": int(chosen_lag), "curve": {"x": xs, "y": ys}, "ticks": ticks, "extremes": ext_ids}
-
-            if scans["lag"] and supports_lag:
-                xs, ys = [], []
-                ticks = []
-                for lag in lag_grid:
-                    mat_l = _cached_compute_at_lag(df, int(lag), start=0, end=-1)
-                    q = _lag_quality(variant, mat_l)
-                    xs.append(int(lag))
-                    ys.append(float(q) if np.isfinite(q) else float("nan"))
-                    tid = f"lag_l{int(lag)}"
-                    ticks.append({"id": tid, "lag": int(lag), "metric": float(q) if np.isfinite(q) else float("nan"), "matrix": mat_l})
-                ext = _select_best_median_worst(ticks, key="metric")
-                ext_ids = {
-                    "best": ticks[ext.get("best")]["id"] if ticks and ext.get("best") is not None else None,
-                    "median": ticks[ext.get("median")]["id"] if ticks and ext.get("median") is not None else None,
-                    "worst": ticks[ext.get("worst")]["id"] if ticks and ext.get("worst") is not None else None,
-                }
-                scan_meta["lag"] = {"curve": {"x": xs, "y": ys}, "grid": lag_grid, "ticks": ticks, "extremes": ext_ids}
-
-            if scans["cube"] and ws_list:
-                combo_limit = max(1, int(kwargs.get("cube_combo_limit", 80)))
-                cube_eval_limit = int(kwargs.get("cube_eval_limit", 0) or 0)
-                cube_matrix_mode = str(kwargs.get("cube_matrix_mode", "selected") or "selected").lower()
-                if cube_matrix_mode not in {"selected", "all"}:
-                    cube_matrix_mode = "selected"
-                cube_matrix_limit = int(kwargs.get("cube_matrix_limit", 0) or 0)
-                if cube_matrix_limit <= 0:
-                    cube_matrix_limit = cube_eval_limit if cube_eval_limit > 0 else 500
-
-                points: list[dict] = []
-                lags_for_cube = lag_grid if supports_lag else [1]
-                combos = [(int(w), int(lg)) for w in ws_list for lg in lags_for_cube]
-                if len(combos) > combo_limit:
-                    idx = np.linspace(0, len(combos) - 1, combo_limit).round().astype(int)
-                    combos = [combos[i] for i in idx]
-
-                per_combo_max_windows = int(w_max_windows)
-                if cube_eval_limit and len(combos) > 0:
-                    per_combo_max_windows = max(1, min(int(w_max_windows), int(cube_eval_limit) // int(len(combos))))
-                saved_mats = 0
-
-                def _compute_combo(w: int, lg: int) -> list[dict]:
-                    stride = int(w_stride) if w_stride is not None else int(max(1, int(w) // 5))
-                    info = analyze_sliding_windows_with_metric(
-                        df,
-                        variant,
-                        window_size=int(w),
-                        stride=int(stride),
-                        lag=int(lg),
-                        start_min=w_start_min,
-                        start_max=w_start_max,
-                        max_windows=int(per_combo_max_windows),
-                        return_matrices=(cube_matrix_mode == "all"),
-                        pairs=pairs_idx,
-                        cache=_matrix_cache,
-                        # Избегаем nested-parallel: здесь параллелим по combos,
-                        # а внутри прохода по окнам работаем последовательно.
-                        n_jobs=1,
-                    )
-                    out_pts: list[dict] = []
-                    for t in (info or {}).get("ticks") or []:
-                        try:
-                            fq = float(t.get("metric", float("nan")))
-                        except Exception:
-                            fq = float("nan")
-                        if not np.isfinite(fq):
-                            continue
-                        st0 = int(t.get("start", 0))
-                        tid = f"cube_w{int(w)}_l{int(lg)}_s{st0}"
-                        mat0 = t.get("matrix")
-                        out_pts.append(
-                            {
-                                "id": tid,
-                                "window_size": int(w),
-                                "lag": int(lg),
-                                "start": st0,
-                                "end": int(t.get("end", st0 + int(w))),
-                                "metric": fq,
-                                "matrix": mat0,
-                            }
-                        )
-                    return out_pts
-
-                if cube_n_jobs == 1 or len(combos) <= 1:
-                    all_pts = [_compute_combo(w, lg) for (w, lg) in combos]
-                else:
-                    try:
-                        from joblib import Parallel, delayed
-                    except Exception:
-                        Parallel = None  # type: ignore
-                        delayed = None  # type: ignore
-                    if Parallel is None:
-                        all_pts = [_compute_combo(w, lg) for (w, lg) in combos]
-                    else:
-                        all_pts = Parallel(n_jobs=int(cube_n_jobs), backend=str(scan_backend))(
-                            delayed(_compute_combo)(w, lg) for (w, lg) in combos
-                        )
-
-                for pts in all_pts:
-                    for p in pts:
-                        mat0 = p.get("matrix")
-                        if cube_matrix_mode == "all":
-                            if mat0 is not None and saved_mats < cube_matrix_limit:
-                                saved_mats += 1
-                            else:
-                                p["matrix"] = None
-                        points.append(p)
-
-                scan_meta["cube"] = {
-                    "points": points, "combos": combos,
-                    "lag_grid": lags_for_cube,
-                    "window_sizes": ws_list,
-                    "eval_limit": int(cube_eval_limit) if cube_eval_limit else None,
-                    "matrix_mode": cube_matrix_mode,
-                    "matrix_limit": int(cube_matrix_limit),
-                }
-
-                ext = _select_best_median_worst(points, key="metric")
-                ext_ids = {
-                    "best": points[ext.get("best")]["id"] if points and ext.get("best") is not None else None,
-                    "median": points[ext.get("median")]["id"] if points and ext.get("median") is not None else None,
-                    "worst": points[ext.get("worst")]["id"] if points and ext.get("worst") is not None else None,
-                }
-                scan_meta["cube"]["extremes"] = ext_ids
-                if ext.get("best") is not None:
-                    points[int(ext["best"])]["tag"] = "best"
-                if ext.get("median") is not None:
-                    points[int(ext["median"])]["tag"] = "median"
-                if ext.get("worst") is not None:
-                    points[int(ext["worst"])]["tag"] = "worst"
-
-                if cube_matrix_mode == "all":
-                    must = [ext.get("best"), ext.get("median"), ext.get("worst")]
-                    for ii in must:
-                        if ii is None:
-                            continue
-                        ii = int(ii)
-                        if ii < 0 or ii >= len(points):
-                            continue
-                        if points[ii].get("matrix") is not None:
-                            continue
-                        try:
-                            w0 = int(points[ii].get("window_size"))
-                            lg0 = int(points[ii].get("lag"))
-                            st0 = int(points[ii].get("start"))
-                            chunk = df.iloc[st0 : st0 + w0]
-                            points[ii]["matrix"] = compute_connectivity_variant(chunk, variant, lag=int(max(1, lg0)))
-                        except Exception:
-                            points[ii]["matrix"] = None
-
-                # Матрицы для выбранных точек 3D-куба (best/median/worst + выборка).
-                gallery_k = max(1, int(kwargs.get("cube_gallery_k", 1)))
-                gallery_limit = max(3, int(kwargs.get("cube_gallery_limit", 60)))
-                gallery_mode = str(kwargs.get("cube_gallery_mode", "extremes") or "extremes").lower()
-
-                pts_sorted = [p for p in points if np.isfinite(float(p.get("metric", float("nan"))))]
-                pts_sorted.sort(key=lambda p: float(p.get("metric", float("nan"))))
-                if pts_sorted:
-                    idx_set = {0, len(pts_sorted) // 2, len(pts_sorted) - 1}
-
-                    if gallery_mode in {"topbottom", "extremes"}:
-                        for i in range(gallery_k):
-                            idx_set.add(min(i, len(pts_sorted) - 1))
-                            idx_set.add(max(0, len(pts_sorted) - 1 - i))
-
-                    if gallery_mode == "quantiles":
-                        for q in (0.1, 0.25, 0.5, 0.75, 0.9):
-                            idx_set.add(int(round(q * (len(pts_sorted) - 1))))
-
-                    idx_list = sorted(idx_set)
-                    if len(idx_list) > gallery_limit:
-                        sel = np.linspace(0, len(idx_list) - 1, gallery_limit).round().astype(int)
-                        idx_list = [idx_list[i] for i in sel]
-
-                    gallery = []
-                    for ii in idx_list:
-                        p = pts_sorted[ii]
-                        w0 = int(p.get("window_size"))
-                        lg0 = int(p.get("lag"))
-                        st0 = int(p.get("start"))
-                        tid0 = p.get("id") or f"cube_w{w0}_l{lg0}_s{st0}"
-                        try:
-                            chunk = df.iloc[st0 : st0 + w0]
-                            mat0 = compute_connectivity_variant(chunk, variant, lag=int(max(1, lg0)))
-                        except Exception:
-                            mat0 = None
-                        gallery.append(
-                            {
-                                "id": tid0,
-                                "window_size": w0,
-                                "lag": lg0,
-                                "start": st0,
-                                "end": int(st0 + w0),
-                                "metric": float(p.get("metric")),
-                                "tag": p.get("tag"),
-                                "matrix": mat0,
-                            }
-                        )
-
-                    scan_meta["cube"]["gallery"] = gallery
-                    scan_meta["cube"]["selectable_ids"] = [g.get("id") for g in gallery if g.get("matrix") is not None]
-                else:
-                    scan_meta["cube"]["selectable_ids"] = []
-
-                if cube_matrix_mode == "all":
-                    scan_meta["cube"]["selectable_ids"] = [p.get("id") for p in points if p.get("matrix") is not None]
-
-                # Доп. «кубики» по парам (когда переменных ровно 3)
-                # или пользователь явно передал список пар через kwargs).
-                # Идея: один и тот же набор точек (w,lag,start) визуализируем разными метриками
-                # для пар (X–Y, X–Z, Y–Z).
-                try:
-                    cube_pairs = kwargs.get("cube_pairs")
-                except Exception:
-                    cube_pairs = None
-
-                pair_specs: list[tuple[int, int, str]] = []
-                cols0 = list(getattr(df, "columns", []))
-                if cube_pairs:
-                    # Ожидаем список вида [(0,1), ("X","Y"), "X-Y", ...]
-                    for item in (cube_pairs or []):
-                        try:
-                            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                a, b = item[0], item[1]
-                            elif isinstance(item, str):
-                                s = item.replace("→", "-").replace(">", "-").replace(":", "-")
-                                a, b = [x.strip() for x in s.split("-")[:2]]
-                            else:
-                                continue
-
-                            if isinstance(a, int) and isinstance(b, int):
-                                i, j = int(a), int(b)
-                                name = f"{cols0[i]}—{cols0[j]}" if i < len(cols0) and j < len(cols0) else f"{i}—{j}"
-                                pair_specs.append((i, j, name))
-                            else:
-                                if str(a) in cols0 and str(b) in cols0:
-                                    i, j = cols0.index(str(a)), cols0.index(str(b))
-                                    pair_specs.append((i, j, f"{a}—{b}"))
-                        except Exception:
-                            continue
-                elif int(df.shape[1]) == 3:
-                    pair_specs = [
-                        (0, 1, f"{cols0[0]}—{cols0[1]}"),
-                        (0, 2, f"{cols0[0]}—{cols0[2]}"),
-                        (1, 2, f"{cols0[1]}—{cols0[2]}"),
-                    ]
-
-                if pair_specs:
-                    cubes_by_pair: dict[str, dict] = {}
-                    for i, j, nm in pair_specs:
-                        pts_p = []
-                        for p in points:
-                            pid = p.get("id")
-                            mat0 = p.get("matrix")
-                            if pid is None or mat0 is None:
-                                continue
-                            scv = _pair_score(variant, np.asarray(mat0), int(i), int(j))
-                            if not np.isfinite(float(scv)):
-                                continue
-                            pts_p.append({
-                                "id": pid,
-                                "window_size": p.get("window_size"),
-                                "lag": p.get("lag"),
-                                "start": p.get("start"),
-                                "end": p.get("end"),
-                                "metric": float(scv),
-                                "tag": p.get("tag"),
-                            })
-
-                        extp = _select_best_median_worst(pts_p, key="metric")
-                        cubes_by_pair[nm] = {
-                            "pair": [int(i), int(j)],
-                            "points": pts_p,
-                            "extremes": {
-                                "best": (pts_p[int(extp["best"])]["id"] if pts_p and extp.get("best") is not None else None),
-                                "median": (pts_p[int(extp["median"])]["id"] if pts_p and extp.get("median") is not None else None),
-                                "worst": (pts_p[int(extp["worst"])]["id"] if pts_p and extp.get("worst") is not None else None),
-                            },
-                        }
-
-                    if cubes_by_pair:
-                        scan_meta["cube_pairs"] = cubes_by_pair
-
-            meta["window_scans"] = scan_meta
-
-        # Оконный режим (скользящие окна)
+        # Window mode
         window_sizes = kwargs.get("window_sizes") or self.config.window_sizes
-        if not window_sizes:
-            mat = _compute_at_lag(df, chosen_lag)
-            _store_contract(mat)
-            return mat, meta
-
+        if not window_sizes: return _at_lag(df, chosen_lag), meta
         policy = (kwargs.get("window_policy") or self.config.window_policy or "best").lower()
         window_sizes = [int(w) for w in window_sizes if int(w) >= 2]
-        stride_override = kwargs.get("window_stride") or self.config.window_stride
-
-        window_cube_level = str(kwargs.get("window_cube_level", "off") or "off").lower()
-        if window_cube_level != "off":
-            # Быстрый 3D-поиск: window_size × lag × window_start.
-            max_lag_cube = int(kwargs.get("max_lag", self.config.max_lag) or self.config.max_lag)
-            lags = list(range(1, max(1, max_lag_cube) + 1))
-            eval_limit = int(kwargs.get("window_cube_eval_limit", 120 if window_cube_level == "full" else 60))
-            grid = []
-            best_cube = None
-            best_cube_q = float("-inf")
-
-            combos = [(w, lag) for w in window_sizes for lag in lags]
-            if len(combos) > eval_limit:
-                idx = np.linspace(0, len(combos) - 1, eval_limit).round().astype(int)
-                combos = [combos[i] for i in idx]
-
-            for w, lag in combos:
-                stride = int(stride_override) if stride_override is not None else int(max(1, int(w) // 5))
-                w_info = analyze_sliding_windows_with_metric(df, variant, window_size=int(w), stride=int(stride), lag=int(lag), pairs=pairs_idx, cache=_matrix_cache)
-                bw = w_info.get("best_window") if w_info else None
-                q = float(bw.get("metric", float("nan"))) if bw else float("nan")
-                grid.append({"window_size": int(w), "lag": int(lag), "best_metric": q, "best_start": (bw.get("start") if bw else None)})
-                if np.isfinite(q) and q > best_cube_q and bw and bw.get("matrix") is not None:
-                    best_cube_q = q
-                    best_cube = {
-                        "window_size": int(w),
-                        "lag": int(lag),
-                        "stride": int(stride),
-                        "best_window": bw,
-                        "curve": (w_info.get("curve") if window_cube_level == "full" else None),
-                    }
-
-            if best_cube is not None:
-                # Для отчёта сохраняем и 3D-точки (window, lag, start, metric), и агрегированный grid.
-                points = []
-                try:
-                    for g in grid:
-                        st = g.get("best_start")
-                        mt = g.get("best_metric")
-                        if st is None or mt is None:
-                            continue
-                        points.append({"window_size": int(g["window_size"]), "lag": int(g["lag"]), "start": int(st), "metric": float(mt)})
-                except Exception:
-                    points = []
-
-                meta["window_cube"] = {
-                    "level": window_cube_level,
-                    "eval_limit": int(eval_limit),
-                    "grid": grid,
-                    "points": points,
-                    "best": best_cube,
-                }
-                chosen_lag = int(best_cube["lag"])
-
-        mats = []
-        best = None
-        best_q = float("-inf")
-
+        stride_ovr = kwargs.get("window_stride") or self.config.window_stride
+        _is_p = is_pvalue_method(variant)
+        mats, best, best_q = [], None, float("-inf")
         for w in window_sizes:
-            stride = int(stride_override) if stride_override is not None else int(max(1, w // 5))
-            w_info = analyze_sliding_windows_with_metric(df, variant, window_size=w, stride=stride, lag=chosen_lag, pairs=pairs_idx, cache=_matrix_cache)
-            if not w_info:
-                continue
-            # Лучшее окно для данного w
-            bw = w_info.get("best_window")
+            stride = int(stride_ovr) if stride_ovr else max(1, w//5)
+            wi = analyze_sliding_windows(df, variant, w, stride,
+                compute_variant_func=compute_connectivity_variant,
+                is_pvalue=_is_p, lag=chosen_lag, pairs=pairs_idx)
+            bw = (wi or {}).get("best_window")
             if bw and bw.get("matrix") is not None:
                 mats.append(np.asarray(bw["matrix"]))
                 q = float(bw.get("metric", float("nan")))
                 if np.isfinite(q) and q > best_q:
-                    best_q = q
-                    best = {
-                        "window_size": int(w),
-                        "stride": int(stride),
-                        "best_window": bw,
-                        "curve": w_info.get("curve"),
-                    }
-
-        if not mats:
-            mat = _compute_at_lag(df, chosen_lag)
-            _store_contract(mat)
-            return mat, meta
-
-        if policy == "mean":
-            # усредняем по матрицам лучших окон каждого размера
-            mat = np.nanmean(np.stack(mats, axis=0), axis=0)
-        else:
-            # Лучший вариант
-            mat = np.asarray(best["best_window"]["matrix"]) if best else np.asarray(mats[0])
-
-        meta["window"] = {
-            "sizes": window_sizes,
-            "policy": policy,
-            "best": best,
-        }
-        _store_contract(mat)
+                    best_q = q; best = {"window_size": w, "stride": stride,
+                                         "best_window": bw, "curve": wi.get("curve")}
+        if not mats: return _at_lag(df, chosen_lag), meta
+        mat = np.nanmean(np.stack(mats,0),0) if policy == "mean" else (
+            np.asarray(best["best_window"]["matrix"]) if best else np.asarray(mats[0]))
+        meta["window"] = {"sizes": window_sizes, "policy": policy, "best": best}
         return mat, meta
 
-    def export_html_report(self, output_path: str, **kwargs) -> str:
-        """Генерация HTML отчета через внешний класс."""
+    def _run_diagnostic_scans(self, df, variant, chosen_lag, pairs_idx, meta, kwargs,
+                               _at_lag, supports_lag, max_lag_v, scans):
+        _is_p = is_pvalue_method(variant); scan_meta = {"flags": scans}
+        ws = [int(w) for w in (kwargs.get("window_sizes_grid") or kwargs.get("window_sizes") or
+              self.config.window_sizes or []) if int(w)>=2]
+        dw = int(kwargs.get("window_size", ws[0] if ws else min(200, max(10, len(df)//5))))
+        dw = max(2, min(dw, len(df)))
+        max_win = int(kwargs.get("window_max_windows", 250))
+        n_jobs = int(kwargs.get("scan_n_jobs") or 1)
+        if scans.get("window_pos"):
+            stride = int(kwargs.get("window_stride") or max(1, dw//5))
+            info = analyze_sliding_windows(df, variant, dw, stride,
+                compute_variant_func=compute_connectivity_variant, is_pvalue=_is_p,
+                lag=chosen_lag, pairs=pairs_idx, return_matrices=True,
+                max_windows=max_win, n_jobs=n_jobs)
+            ticks = [{"id": f"pos_w{dw}_i{i}", **t}
+                     for i, t in enumerate((info or {}).get("ticks") or [])]
+            scan_meta["window_pos"] = {"window_size": dw, "lag": chosen_lag,
+                "curve": (info or {}).get("curve"), "best_window": (info or {}).get("best_window"),
+                "ticks": ticks}
+        if scans.get("window_size") and ws:
+            xs, ys, ticks = [], [], []
+            for w in ws:
+                stride = int(kwargs.get("window_stride") or max(1, w//5))
+                info = analyze_sliding_windows(df, variant, w, stride,
+                    compute_variant_func=compute_connectivity_variant, is_pvalue=_is_p,
+                    lag=chosen_lag, pairs=pairs_idx, max_windows=max_win, n_jobs=n_jobs)
+                bw = (info or {}).get("best_window") or {}; q = bw.get("metric", float("nan"))
+                xs.append(w); ys.append(float(q) if np.isfinite(q) else float("nan"))
+                ticks.append({"id": f"size_w{w}", "window_size": w, "metric": ys[-1],
+                              "matrix": bw.get("matrix")})
+            scan_meta["window_size"] = {"lag": chosen_lag, "curve": {"x": xs, "y": ys},
+                "ticks": ticks, "extremes": select_best_median_worst(ticks, key="metric")}
+        if scans.get("lag") and supports_lag:
+            lmin, lmax = max(1, int(kwargs.get("lag_min", 1))), max(1, int(kwargs.get("lag_max", max_lag_v)))
+            lstep = max(1, int(kwargs.get("lag_step", 1)))
+            xs, ys, ticks = [], [], []
+            for lag in range(lmin, lmax+1, lstep):
+                m = _at_lag(df, lag); q = lag_quality(variant, m, _is_p)
+                xs.append(lag); ys.append(float(q) if np.isfinite(q) else float("nan"))
+                ticks.append({"id": f"lag_l{lag}", "lag": lag, "metric": ys[-1], "matrix": m})
+            scan_meta["lag"] = {"curve": {"x": xs, "y": ys},
+                "grid": list(range(lmin, lmax+1, lstep)), "ticks": ticks,
+                "extremes": select_best_median_worst(ticks, key="metric")}
+        if scans.get("cube") and ws:
+            lag_grid = kwargs.get("lag_grid")
+            if lag_grid is None:
+                lm2, lx2, ls2 = max(1,int(kwargs.get("lag_min",1))), max(1,int(kwargs.get("lag_max",max_lag_v))), max(1,int(kwargs.get("lag_step",1)))
+                lag_grid = list(range(lm2, lx2+1, ls2))
+            combos = [(w, lg) for w in ws for lg in lag_grid]
+            cl = int(kwargs.get("cube_combo_limit", 500))
+            if len(combos) > cl:
+                idx = np.linspace(0, len(combos)-1, cl).round().astype(int)
+                combos = [combos[i] for i in idx]
+            points = []; cn = int(kwargs.get("cube_n_jobs") or 1)
+            def _cube(w, lg):
+                stride = int(kwargs.get("window_stride") or max(1, w//5))
+                info = analyze_sliding_windows(df, variant, w, stride,
+                    compute_variant_func=compute_connectivity_variant, is_pvalue=_is_p,
+                    lag=lg, pairs=pairs_idx, max_windows=max(1, max_win//max(1,len(combos))), n_jobs=1)
+                return [{"id": f"cube_w{w}_l{lg}_s{t.get('start',0)}", "window_size": w, "lag": lg,
+                         "start": t.get("start",0), "end": t.get("end",0),
+                         "metric": float(t.get("metric", float("nan")))}
+                        for t in (info or {}).get("ticks") or [] if np.isfinite(t.get("metric", float("nan")))]
+            if cn == 1 or len(combos) <= 1:
+                all_pts = [_cube(w, lg) for w, lg in combos]
+            else:
+                try:
+                    from joblib import Parallel, delayed
+                    all_pts = Parallel(n_jobs=cn, backend=str(kwargs.get("scan_backend") or "loky"))(
+                        delayed(_cube)(w, lg) for w, lg in combos)
+                except ImportError: all_pts = [_cube(w, lg) for w, lg in combos]
+            for pts in all_pts: points.extend(pts)
+            scan_meta["cube"] = {"combos": combos, "lag_grid": lag_grid, "window_sizes": ws,
+                "points": points, "extremes": select_best_median_worst(points, key="metric")}
+        meta["window_scans"] = scan_meta
+
+    # ── Graph topology ───────────────────────────────────────────────
+
+    def calculate_graph_metrics(self, threshold=0.2):
+        from ..analysis.graph import analyze_graph_topology
+        self.graph_results = {}; names = list(self.data.columns)
+        for v, mat in (self.results or {}).items():
+            if mat is None: continue
+            d = get_method_spec(v).directed
+            if is_pvalue_method(v):
+                cm = np.zeros_like(mat, dtype=float)
+                mk = (mat < threshold) & (~np.eye(mat.shape[0], dtype=bool))
+                cm[mk] = 1.0 - mat[mk]
+                self.graph_results[v] = analyze_graph_topology(cm, names, threshold=0.01, directed=d)
+            else:
+                self.graph_results[v] = analyze_graph_topology(mat, names, threshold=float(threshold), directed=d)
+
+    # ── Export ────────────────────────────────────────────────────────
+
+    def export_html_report(self, output_path, **kwargs):
         return HTMLReportGenerator(self).generate(output_path, **kwargs)
 
-    def export_big_excel(self, save_path: str, **kwargs) -> str:
-        """Генерация Excel отчета через внешний класс."""
+    def export_big_excel(self, save_path, **kwargs):
         return ExcelReportWriter(self).write(save_path, **kwargs)
 
-    def export_series_bundle(self, save_path: str) -> str:
-        """Сохраняет ряды и метаданные рядом с отчётами.
-
-        Для небольших таблиц пишет единый XLSX. Для слишком больших — делает папку с CSV/TSV,
-        чтобы не упираться в лимиты Excel и не раздувать память.
-        """
-        import json
-        import pandas as pd
-
-        excel_max_rows = 1_048_576
-        excel_max_cols = 16_384
-        csv_threshold_cells = int(os.getenv("TS_TOOL_SERIES_BUNDLE_MAX_CELLS", "5000000") or 5000000)
-
-        def _pick(df):
+    def export_series_bundle(self, save_path):
+        def _p(d):
+            try: return d if d is not None and not getattr(d,'empty',True) else None
+            except: return None
+        with pd.ExcelWriter(save_path, engine='openpyxl') as w:
+            for nm, d in [("RAW", _p(self.data_raw)), ("PREPROCESSED", _p(self.data_preprocessed)),
+                          ("AFTER_AUTODIFF", _p(self.data_after_autodiff)), ("NORMALIZED", _p(self.data_normalized))]:
+                (d or pd.DataFrame()).to_excel(w, sheet_name=nm, index=False)
             try:
-                return df if df is not None and not getattr(df, "empty", True) else None
-            except Exception:
-                return None
-
-        def _shape(df) -> tuple[int, int]:
-            try:
-                return int(df.shape[0]), int(df.shape[1])
-            except Exception:
-                return 0, 0
-
-        def _can_store_in_xlsx(df) -> bool:
-            r, c = _shape(df)
-            cells = r * max(c, 1)
-            return r <= excel_max_rows and c <= excel_max_cols and cells <= csv_threshold_cells
-
-        def _write_delimited(df: pd.DataFrame, path: Path) -> str:
-            suffix = path.suffix.lower()
-            sep = "	" if suffix == ".tsv" else ","
-            df.to_csv(path, index=False, sep=sep)
-            return str(path)
-
-        raw_df = _pick(getattr(self, "data_raw", None))
-        if raw_df is None:
-            raw_df = _pick(getattr(self, "data", None))
-        if raw_df is None:
-            raw_df = pd.DataFrame()
-
-        pre_df = _pick(getattr(self, "data_preprocessed", None))
-        if pre_df is None:
-            pre_df = _pick(getattr(self, "data", None))
-        if pre_df is None:
-            pre_df = pd.DataFrame()
-
-        ad_df = _pick(getattr(self, "data_after_autodiff", None))
-        if ad_df is None:
-            ad_df = _pick(getattr(self, "data", None))
-        if ad_df is None:
-            ad_df = pd.DataFrame()
-
-        norm_df = _pick(getattr(self, "data_normalized", None))
-        if norm_df is None:
-            norm_df = pd.DataFrame()
-
-        datasets = {
-            "RAW": raw_df,
-            "PREPROCESSED": pre_df,
-            "AFTER_AUTODIFF": ad_df,
-        }
-        if not norm_df.empty:
-            datasets["NORMALIZED"] = norm_df
-        try:
-            qc_raw = getattr(self, "qc_raw", None)
-            qc_clean = getattr(self, "qc_clean", None)
-            if qc_raw is not None and not getattr(qc_raw, "empty", True):
-                datasets["QC_RAW"] = qc_raw
-            if qc_clean is not None and not getattr(qc_clean, "empty", True):
-                datasets["QC_CLEAN"] = qc_clean
-        except Exception:
-            pass
-        try:
-            coords = getattr(self, "coords_df", None)
-            if coords is not None and not getattr(coords, "empty", True):
-                datasets["COORDS"] = coords
-        except Exception:
-            pass
-        try:
-            data_main = getattr(self, "data", None)
-            if isinstance(data_main, pd.DataFrame) and not data_main.empty:
-                fmt = str(getattr(data_main, "attrs", {}).get("format", "")).lower()
-                if fmt == "spatial_bins":
-                    datasets["BINNED_TIMESERIES"] = data_main
-                    coords_attr = getattr(data_main, "attrs", {}).get("coords")
-                    if isinstance(coords_attr, pd.DataFrame) and not coords_attr.empty:
-                        datasets["BINNED_COORDS"] = coords_attr
-        except Exception:
-            pass
-
-        save_path_obj = Path(save_path)
-        warnings: list[str] = []
-        sheet_shapes = {name: list(_shape(df)) for name, df in datasets.items()}
-        needs_split = any(not _can_store_in_xlsx(df) for df in datasets.values())
-
-        artifact_paths: dict[str, str] = {}
-        if not needs_split:
-            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-                for sheet_name, df in datasets.items():
-                    df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            artifact_paths["series_bundle_xlsx"] = str(save_path_obj)
-            logging.info("[Series] Сохранены ряды в XLSX: %s", save_path)
-        else:
-            bundle_dir = save_path_obj.with_suffix("")
-            bundle_dir.mkdir(parents=True, exist_ok=True)
-            for sheet_name, df in datasets.items():
-                out_file = bundle_dir / f"{sheet_name.lower()}.csv"
-                _write_delimited(df, out_file)
-                artifact_paths[f"{sheet_name.lower()}_csv"] = str(out_file)
-                if not _can_store_in_xlsx(df):
-                    warnings.append(
-                        f"{sheet_name}: слишком большой для одного XLSX sheet, сохранён отдельным CSV; shape={tuple(_shape(df))}"
-                    )
-            save_path = str(bundle_dir)
-            logging.info("[Series] Сохранены ряды в папку с CSV: %s", bundle_dir)
-
-        try:
-            meta_path = save_path_obj.with_suffix(".meta.json")
-            meta = {
-                "series_artifact": str(Path(save_path).name),
-                "series_artifact_type": "directory" if needs_split else "xlsx",
-                "sheet_shapes": sheet_shapes,
-                "warnings": warnings,
-                "artifacts": artifact_paths,
-                "data_shape": list(getattr(self, "data", pd.DataFrame()).shape),
-                "preprocessing": self.get_preprocessing_summary(),
-                "methods": list(getattr(self, "results", {}).keys()),
-                "results_meta": getattr(self, "results_meta", {}),
-                "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
-                "data_attrs": _to_jsonable(getattr(getattr(self, "data", None), "attrs", {})),
-            }
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+                for nm2, d2 in [("QC_RAW", self.qc_raw), ("QC_CLEAN", self.qc_clean), ("COORDS", self.coords_df)]:
+                    if d2 is not None and not getattr(d2,'empty',True): d2.to_excel(w, sheet_name=nm2, index=False)
+            except: pass
         return save_path
 
+    def export_connectivity_bundle(self, out_dir, name_prefix="run", dense_n_limit=2000,
+                                    topk_per_node=50, min_abs_weight=0.0, include_scan_matrices=True):
+        from pathlib import Path
+        from ..reporting.connectivity_export import ExportPolicy, export_connectivity_matrix, save_manifest, save_nodes_csv
+        data_dir = str(Path(out_dir)/"data"); os.makedirs(data_dir, exist_ok=True)
+        try: self.export_dimred_bundle(out_dir, name_prefix=name_prefix)
+        except: pass
+        names = list(getattr(self,"data",pd.DataFrame()).columns)
+        policy = ExportPolicy(dense_n_limit=dense_n_limit, topk_per_node=topk_per_node, min_abs_weight=min_abs_weight)
+        manifest = {"name_prefix": name_prefix, "variants": {}}
+        if names: save_nodes_csv(data_dir, names)
+        for v, mat in (self.results or {}).items():
+            try:
+                arr = np.asarray(mat)
+                if arr.ndim != 2 or arr.shape[0] != arr.shape[1]: continue
+                ln = names if names and arr.shape[0]==len(names) else [f"v{i:04d}" for i in range(arr.shape[0])]
+                manifest["variants"][v] = export_connectivity_matrix(data_dir, name_prefix, v, arr, ln, policy)
+            except Exception as e: manifest["variants"][v] = {"error": str(e)}
+        return str(save_manifest(data_dir, name_prefix, manifest))
 
-    def export_binned_timeseries(
-        self,
-        save_path: str,
-        *,
-        coords_path: str | None = None,
-        metadata_path: str | None = None,
-    ) -> dict[str, str]:
-        """Сохраняет spatial-binned ряды и связанные метаданные в CSV/JSON."""
-        import json
+    # ── Dimred ────────────────────────────────────────────────────────
 
-        data_main = getattr(self, "data", None)
-        if not isinstance(data_main, pd.DataFrame) or data_main.empty:
-            raise ValueError("Нет данных для сохранения binned time-series.")
-        fmt = str(getattr(data_main, "attrs", {}).get("format", "")).lower()
-        if fmt != "spatial_bins":
-            raise ValueError("Текущие данные не находятся в формате spatial_bins.")
-
-        save_obj = Path(save_path)
-        save_obj.parent.mkdir(parents=True, exist_ok=True)
-        data_main.to_csv(save_obj, index=False)
-        out = {"binned_timeseries_csv": str(save_obj)}
-
-        coords_df = None
-        try:
-            coords_df = getattr(data_main, "attrs", {}).get("coords")
-        except Exception:
-            coords_df = None
-        if not isinstance(coords_df, pd.DataFrame) or coords_df.empty:
-            coords_df = getattr(self, "coords_df", None)
-        if isinstance(coords_df, pd.DataFrame) and not coords_df.empty:
-            coords_obj = Path(coords_path) if coords_path else save_obj.with_name(f"{save_obj.stem}_coords.csv")
-            coords_obj.parent.mkdir(parents=True, exist_ok=True)
-            coords_df.to_csv(coords_obj, index=False)
-            out["binned_coords_csv"] = str(coords_obj)
-
-        meta_obj = Path(metadata_path) if metadata_path else save_obj.with_name(f"{save_obj.stem}_meta.json")
-        meta = {
-            "data_shape": list(data_main.shape),
-            "columns": [str(c) for c in data_main.columns],
-            "data_attrs": _to_jsonable(getattr(data_main, "attrs", {})),
-            "coords_shape": list(coords_df.shape) if isinstance(coords_df, pd.DataFrame) else None,
-            "results_meta_run": _to_jsonable((getattr(self, "results_meta", {}) or {}).get("__run__", {})),
-        }
-        meta_obj.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        out["binned_meta_json"] = str(meta_obj)
-        return out
-
-    def export_run_manifest(self, save_path: str, *, extra: dict | None = None) -> str:
-        """Сохраняет manifest запуска с ключевыми параметрами и размерами данных."""
-        import json
-
-        payload = {
-            "config": _to_jsonable(_config_snapshot(getattr(self, "config", None))),
-            "results_meta": _to_jsonable(getattr(self, "results_meta", {}) or {}),
-            "preprocessing_summary": _to_jsonable(self.get_preprocessing_summary()),
-            "data_shape": list(getattr(self, "data", pd.DataFrame()).shape),
-            "data_raw_shape": list(getattr(self, "data_raw", pd.DataFrame()).shape) if isinstance(getattr(self, "data_raw", None), pd.DataFrame) else None,
-            "data_preprocessed_shape": list(getattr(self, "data_preprocessed", pd.DataFrame()).shape) if isinstance(getattr(self, "data_preprocessed", None), pd.DataFrame) else None,
-            "data_after_autodiff_shape": list(getattr(self, "data_after_autodiff", pd.DataFrame()).shape) if isinstance(getattr(self, "data_after_autodiff", None), pd.DataFrame) else None,
-            "data_normalized_shape": list(getattr(self, "data_normalized", pd.DataFrame()).shape) if isinstance(getattr(self, "data_normalized", None), pd.DataFrame) else None,
-            "data_attrs": _to_jsonable(getattr(getattr(self, "data", None), "attrs", {})),
-            "coords_shape": list(getattr(self, "coords_df", pd.DataFrame()).shape) if isinstance(getattr(self, "coords_df", None), pd.DataFrame) else None,
-            "window_analysis": _to_jsonable(getattr(self, "window_analysis", {}) or {}),
-            "variant_lags": _to_jsonable(getattr(self, "variant_lags", {}) or {}),
-        }
-        if extra:
-            payload["extra"] = _to_jsonable(extra)
-        save_obj = Path(save_path)
-        save_obj.parent.mkdir(parents=True, exist_ok=True)
-        save_obj.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(save_obj)
-
-
-    def _maybe_apply_dimred(self, **kwargs) -> None:
-        """Предобработка: опциональное уменьшение размерности для больших N."""
+    def _maybe_apply_dimred(self, **kwargs):
         enabled = bool(kwargs.get("dimred_enabled", False))
         method = str(kwargs.get("dimred_method") or "none").strip().lower()
         target_n = int(kwargs.get("dimred_target", 0) or 0)
-        target_var = kwargs.get("dimred_target_var", None)
-        try:
-            target_var = float(target_var) if target_var is not None and str(target_var).strip() != "" else None
-        except Exception:
-            target_var = None
-        save_variants = bool(kwargs.get("dimred_save_variants", False))
-        variants_text = str(kwargs.get("dimred_variants") or "").strip()
-        seed = int(kwargs.get("dimred_seed", 0) or 0)
-        spatial_bin = int(kwargs.get("dimred_spatial_bin", 2) or 2)
-        kmeans_batch = int(kwargs.get("dimred_kmeans_batch", 2048) or 2048)
-        dimred_priority = str(kwargs.get("dimred_priority") or "auto").strip().lower()
-        dimred_pca_solver = str(kwargs.get("dimred_pca_solver") or "full").strip().lower()
-        mapping_topk = kwargs.get("dimred_mapping_topk", None)
-        mapping_min_abs = kwargs.get("dimred_mapping_min_abs", None)
-
-        base = (
-            self.data_preprocessed
-            if isinstance(getattr(self, "data_preprocessed", None), pd.DataFrame) and not self.data_preprocessed.empty
-            else getattr(self, "data", None)
-        )
+        target_var = kwargs.get("dimred_target_var")
+        try: target_var = float(target_var) if target_var is not None and str(target_var).strip() != "" else None
+        except: target_var = None
+        base = (self.data_preprocessed if isinstance(getattr(self,"data_preprocessed",None), pd.DataFrame) and not self.data_preprocessed.empty else getattr(self,"data",None))
         if base is None or getattr(base, "empty", True):
-            self.dimred_report = {"enabled": False, "reason": "no_data"}
-            self.data_dimred = pd.DataFrame()
-            self.dimred_mapping = pd.DataFrame()
-            return
-
-        self.data_dimred_base = base
-        n0 = int(base.shape[1])
-        if (not enabled) or (method in ("none", "off", "disabled")):
+            self.dimred_report = {"enabled": False, "reason": "no_data"}; self.data_dimred = pd.DataFrame(); self.dimred_mapping = pd.DataFrame(); return
+        self.data_dimred_base = base; n0 = int(base.shape[1])
+        if not enabled or method in ("none","off","disabled"):
             self.dimred_report = {"enabled": False, "method": "none", "k": n0}
             self.data_dimred = base.copy()
             self.dimred_mapping = pd.DataFrame({"source": list(base.columns), "target": list(base.columns), "weight": 1.0})
-            self.data = base.copy()
-            return
-
-        if (target_n <= 0) and (target_var is None or not (0.0 < target_var <= 1.0)):
+            self.data = base.copy(); return
+        if target_n <= 0 and (target_var is None or not (0.0 < target_var <= 1.0)):
             target_n = int(min(500, n0))
-
-        # Экономим память/время на больших N: не строим полный mapping (k*N строк).
-        if mapping_topk is None and n0 >= 5000:
-            mapping_topk = 50
-        if mapping_min_abs is None:
-            mapping_min_abs = None
-
-        res = apply_dimred(
-            base,
-            method=method,
+        mtk = kwargs.get("dimred_mapping_topk")
+        if mtk is None and n0 >= 5000: mtk = 50
+        res = apply_dimred(base, method=method,
             target_n=(int(min(target_n, n0)) if target_n and target_n > 0 else None),
-            target_var=target_var,
-            seed=seed,
-            coords_df=getattr(self, "coords_df", None),
-            kmeans_batch=kmeans_batch,
-            spatial_bin=spatial_bin,
-            pca_priority=dimred_priority,
-            pca_solver=dimred_pca_solver,
-            mapping_topk=(int(mapping_topk) if mapping_topk is not None else None),
-            mapping_min_abs=(float(mapping_min_abs) if mapping_min_abs is not None else None),
-        )
-        self.data_dimred = res.reduced
-        self.dimred_mapping = res.mapping
+            target_var=target_var, seed=int(kwargs.get("dimred_seed", 0) or 0),
+            coords_df=getattr(self,"coords_df",None),
+            kmeans_batch=int(kwargs.get("dimred_kmeans_batch", 2048) or 2048),
+            spatial_bin=int(kwargs.get("dimred_spatial_bin", 2) or 2),
+            pca_priority=str(kwargs.get("dimred_priority") or "auto").strip().lower(),
+            pca_solver=str(kwargs.get("dimred_pca_solver") or "full").strip().lower(),
+            mapping_topk=(int(mtk) if mtk is not None else None),
+            mapping_min_abs=(float(kwargs.get("dimred_mapping_min_abs")) if kwargs.get("dimred_mapping_min_abs") is not None else None))
+        self.data_dimred = res.reduced; self.dimred_mapping = res.mapping
         self.dimred_report = {"enabled": True, **(res.meta or {}), "n_before": n0, "n_after": int(res.reduced.shape[1])}
-        self.data_preprocessed = self.data_dimred.copy()
-        self.data = self.data_dimred.copy()
-
-        if save_variants and variants_text:
+        self.data_preprocessed = self.data_dimred.copy(); self.data = self.data_dimred.copy()
+        if bool(kwargs.get("dimred_save_variants", False)) and str(kwargs.get("dimred_variants") or "").strip():
             try:
-                parts = [p.strip() for p in variants_text.replace(";", ",").split(",") if p.strip()]
-                targets = sorted(set(int(float(p)) for p in parts if float(p) > 0))
-                self.dimred_report["saved_variants"] = targets
-            except Exception as e:
-                self.dimred_report["saved_variants_error"] = str(e)
+                parts = [p.strip() for p in str(kwargs["dimred_variants"]).replace(";",",").split(",") if p.strip()]
+                self.dimred_report["saved_variants"] = sorted(set(int(float(p)) for p in parts if float(p)>0))
+            except Exception as e: self.dimred_report["saved_variants_error"] = str(e)
 
-    def export_dimred_bundle(self, out_dir: str, name_prefix: str = "run") -> Dict[str, str]:
-        """Экспортирует уменьшенные ряды и source->target mapping в ``out_dir/data``."""
-        import json
-        from pathlib import Path
-
-        data_dir = Path(out_dir) / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        paths: Dict[str, str] = {}
-        pref = f"{name_prefix}_" if name_prefix else ""
-
+    def export_dimred_bundle(self, out_dir, name_prefix="run"):
+        import json; from pathlib import Path
+        data_dir = Path(out_dir)/"data"; data_dir.mkdir(parents=True, exist_ok=True)
+        paths: Dict[str, str] = {}; pref = f"{name_prefix}_" if name_prefix else ""
         try:
-            df = getattr(self, "data_dimred", None)
-            if df is not None and not getattr(df, "empty", True):
-                p = data_dir / f"{pref}timeseries_dimred.csv"
-                df.to_csv(p, index=True)
-                paths["timeseries_dimred_csv"] = str(p)
-        except Exception:
-            pass
-
+            df = getattr(self,"data_dimred",None)
+            if df is not None and not getattr(df,"empty",True):
+                p = data_dir/f"{pref}timeseries_dimred.csv"; df.to_csv(p, index=True); paths["timeseries_dimred_csv"] = str(p)
+        except: pass
         try:
-            mp = getattr(self, "dimred_mapping", None)
-            if mp is not None and not getattr(mp, "empty", True):
-                p = data_dir / f"{pref}dimred_mapping.csv"
-                mp.to_csv(p, index=False)
-                paths["dimred_mapping_csv"] = str(p)
-        except Exception:
-            pass
-
+            mp = getattr(self,"dimred_mapping",None)
+            if mp is not None and not getattr(mp,"empty",True):
+                p = data_dir/f"{pref}dimred_mapping.csv"; mp.to_csv(p, index=False); paths["dimred_mapping_csv"] = str(p)
+        except: pass
         try:
-            rep = getattr(self, "dimred_report", {}) or {}
-            p = data_dir / f"{pref}dimred_meta.json"
-            p.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
-            paths["dimred_meta_json"] = str(p)
-        except Exception:
-            pass
-
+            rep = getattr(self,"dimred_report",{}) or {}; p = data_dir/f"{pref}dimred_meta.json"
+            p.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8"); paths["dimred_meta_json"] = str(p)
+        except: pass
         try:
-            rep = getattr(self, "dimred_report", {}) or {}
-            targets = rep.get("saved_variants") or []
-            m = str(rep.get("method", "none")).strip().lower()
-            if targets and m not in ("none", "off", "disabled"):
-                base = getattr(self, "data_dimred_base", None)
-                if base is not None and not getattr(base, "empty", True):
-                    vroot = data_dir / f"{pref}dimred_variants"
-                    vroot.mkdir(parents=True, exist_ok=True)
+            rep2 = getattr(self,"dimred_report",{}) or {}; targets = rep2.get("saved_variants") or []
+            m = str(rep2.get("method","none")).strip().lower()
+            if targets and m not in ("none","off","disabled"):
+                base = getattr(self,"data_dimred_base",None)
+                if base is not None and not getattr(base,"empty",True):
+                    vroot = data_dir/f"{pref}dimred_variants"; vroot.mkdir(parents=True, exist_ok=True)
                     for t in targets:
                         try:
-                            t2 = int(min(int(t), int(base.shape[1])))
-                            rr = apply_dimred(
-                                base,
-                                method=m,
-                                target_n=t2,
-                                seed=int(rep.get("seed", 0) or 0),
-                                coords_df=getattr(self, "coords_df", None),
-                                kmeans_batch=int(rep.get("batch_size", 2048) or 2048),
-                                spatial_bin=int(rep.get("bin_size", 2) or 2),
-                                mapping_topk=(int(rep.get("mapping_topk")) if rep.get("mapping_topk") is not None else None),
-                                mapping_min_abs=(float(rep.get("mapping_min_abs")) if rep.get("mapping_min_abs") is not None else None),
-                            )
-                            sub = vroot / f"{m}_n{t2}"
-                            sub.mkdir(parents=True, exist_ok=True)
-                            rr.reduced.to_csv(sub / "timeseries_dimred.csv", index=True)
-                            rr.mapping.to_csv(sub / "dimred_mapping.csv", index=False)
-                            (sub / "dimred_meta.json").write_text(json.dumps(rr.meta, ensure_ascii=False, indent=2), encoding="utf-8")
-                        except Exception:
-                            continue
+                            t2 = int(min(int(t), base.shape[1]))
+                            rr = apply_dimred(base, method=m, target_n=t2, seed=int(rep2.get("seed",0) or 0), coords_df=getattr(self,"coords_df",None))
+                            sub = vroot/f"{m}_n{t2}"; sub.mkdir(parents=True, exist_ok=True)
+                            rr.reduced.to_csv(sub/"timeseries_dimred.csv", index=True)
+                            rr.mapping.to_csv(sub/"dimred_mapping.csv", index=False)
+                            (sub/"dimred_meta.json").write_text(json.dumps(rr.meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                        except: continue
                     paths["dimred_variants_dir"] = str(vroot)
-        except Exception:
-            pass
-
+        except: pass
         return paths
 
-    def _maybe_post_preprocess(self, **kwargs) -> None:
-        """Опциональная предобработка после dimred (для stage=post|both)."""
+    def _maybe_post_preprocess(self, **kwargs):
         stage = str(kwargs.get("preprocess_stage", "pre")).strip().lower()
-        if stage not in ("post", "both"):
-            return
-
+        if stage not in ("post","both"): return
         post = kwargs.get("post_preprocess", {}) or {}
-        if not bool(post.get("enabled", False)):
-            return
-
+        if not bool(post.get("enabled", False)): return
         try:
-            self.data = preprocess_timeseries(
-                self.data,
-                enabled=True,
+            self.data = preprocess_timeseries(self.data, enabled=True,
                 log_transform=bool(post.get("log_transform", False)),
                 remove_outliers=bool(post.get("remove_outliers", False)),
-                outlier_rule=str(post.get("outlier_rule", "robust_z")),
-                outlier_action=str(post.get("outlier_action", "mask")),
-                outlier_z=float(post.get("outlier_z", 5.0)),
-                outlier_k=float(post.get("outlier_k", 1.5)),
-                outlier_abs=post.get("outlier_abs", None),
-                outlier_p_low=float(post.get("outlier_p_low", 0.5)),
-                outlier_p_high=float(post.get("outlier_p_high", 99.5)),
-                outlier_hampel_window=int(post.get("outlier_hampel_window", 7)),
-                outlier_jump_thr=post.get("outlier_jump_thr", None),
-                outlier_local_median_window=int(post.get("outlier_local_median_window", 7)),
                 normalize=bool(post.get("normalize", True)),
-                normalize_mode=str(post.get("normalize_mode", "zscore")),
-                rank_mode=str(post.get("rank_mode", "dense")),
-                rank_ties=str(post.get("rank_ties", "average")),
                 fill_missing=bool(post.get("fill_missing", True)),
-                remove_ar1=bool(post.get("remove_ar1", False)),
-                remove_ar_order=int(post.get("remove_ar_order", 1) or 1),
-                remove_seasonality=bool(post.get("remove_seasonality", False)),
-                season_period=post.get("season_period", None),
-                check_stationarity=False,
-                return_report=False,
-            )
-            try:
-                getattr(self, "log", RunLog()).add("Post-preprocess: applied")
-            except Exception:
-                logging.info("Post-preprocess: applied")
-        except Exception as e:
-            try:
-                getattr(self, "log", RunLog()).add(f"Post-preprocess failed: {e}")
-            except Exception:
-                logging.warning("Post-preprocess failed: %s", e)
+                check_stationarity=False, return_report=False,
+                **{k: post[k] for k in post if k not in ("enabled","log_transform","remove_outliers","normalize","fill_missing")})
+        except Exception as e: logging.warning("Post-preprocess failed: %s", e)
 
+    # ── Diagnostics ──────────────────────────────────────────────────
 
-    def export_connectivity_bundle(
-        self,
-        out_dir: str,
-        name_prefix: str = "run",
-        dense_n_limit: int = 2000,
-        topk_per_node: int = 50,
-        min_abs_weight: float = 0.0,
-        include_scan_matrices: bool = True,
-    ) -> str:
-        """Экспортирует матрицы связности и графы как данные для внешних пайплайнов.
+    def test_stationarity(self, series): return analysis_stats.test_stationarity(series)
 
-        Записывает в ``out_dir/data``:
-        - ``nodes.csv`` с узлами и (опционально) координатами,
-        - для каждой матрицы: ``edges.csv.gz``, ``sparse.npz`` и ``dense.npy`` (только для малых N),
-        - ``manifest.json`` со сводной метаинформацией.
-
-        Для больших размерностей плотная NxN-матрица может быть тяжёлой,
-        поэтому sparse-представление сохраняется всегда.
-        """
-        from pathlib import Path
-
-        import numpy as np
-
-        from src.reporting.connectivity_export import ExportPolicy, export_connectivity_matrix, save_manifest, save_nodes_csv
-
-        data_dir = str(Path(out_dir) / "data")
-        os.makedirs(data_dir, exist_ok=True)
-
-        # Экспорт артефактов уменьшения размерности (если использовалось).
-        try:
-            self.export_dimred_bundle(out_dir, name_prefix=name_prefix)
-        except Exception:
-            pass
-
-        # Имена узлов из доступных источников.
-        try:
-            names = list(getattr(self, "node_names", None) or getattr(self, "columns", None) or [])
-        except Exception:
-            names = []
-        if not names:
-            try:
-                names = list(getattr(self, "data", None).columns)
-            except Exception:
-                names = []
-
-        # Координаты (если загружались вместе с данными).
-        coords_map = None
-        try:
-            coords_df = getattr(self, "coords_df", None)
-            if coords_df is not None and not getattr(coords_df, "empty", True):
-                ccols = [c.lower() for c in coords_df.columns]
-                name_col = "name" if "name" in ccols else ("node" if "node" in ccols else None)
-                if name_col:
-                    coords_map = {}
-                    for _, row in coords_df.iterrows():
-                        nm = str(row[name_col])
-                        x = row.get("x", row.get("X", None))
-                        y = row.get("y", row.get("Y", None))
-                        z = row.get("z", row.get("Z", None))
-                        coords_map[nm] = (x, y, z)
-        except Exception:
-            coords_map = None
-
-        policy = ExportPolicy(
-            dense_n_limit=int(dense_n_limit),
-            topk_per_node=int(topk_per_node),
-            min_abs_weight=float(min_abs_weight),
-        )
-
-        manifest: dict = {
-            "name_prefix": str(name_prefix),
-            "policy": {
-                "dense_n_limit": int(dense_n_limit),
-                "topk_per_node": int(topk_per_node),
-                "min_abs_weight": float(min_abs_weight),
-            },
-            "variants": {},
-            "scan_matrices": {},
-        }
-
-        if names:
-            save_nodes_csv(data_dir, names, coords=coords_map)
-            manifest["nodes_file"] = "nodes.csv"
-
-        # Основные матрицы по выбранным методам.
-        results = getattr(self, "results", {}) or {}
-        for variant, mat in results.items():
-            try:
-                arr = np.asarray(mat)
-                if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
-                    continue
-                if names and arr.shape[0] != len(names):
-                    # Размер не совпал: используем локальные имена по индексу.
-                    local_names = [f"v{i:04d}" for i in range(arr.shape[0])]
-                else:
-                    local_names = names or [f"v{i:04d}" for i in range(arr.shape[0])]
-                extra = None
-                try:
-                    extra = (getattr(self, "results_meta", {}) or {}).get(variant)
-                except Exception:
-                    extra = None
-                m = export_connectivity_matrix(data_dir, str(name_prefix), str(variant), arr, local_names, policy, extra_meta=extra)
-                manifest["variants"][variant] = m
-            except Exception as e:
-                manifest["variants"][variant] = {"error": str(e)}
-
-        # Матрицы из сканов (если доступны в results_meta).
-        if include_scan_matrices:
-            try:
-                scans = (getattr(self, "results_meta", {}) or {}).get("scans", {})
-            except Exception:
-                scans = {}
-            if isinstance(scans, dict):
-                for scan_name, payload in scans.items():
-                    if not isinstance(payload, dict):
-                        continue
-                    for key in ("best", "median", "worst"):
-                        item = payload.get(key)
-                        if not isinstance(item, dict):
-                            continue
-                        mat = item.get("matrix")
-                        if mat is None:
-                            continue
-                        try:
-                            arr = np.asarray(mat)
-                            if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
-                                continue
-                            local_names = names or [f"v{i:04d}" for i in range(arr.shape[0])]
-                            vname = f"scan_{scan_name}_{key}"
-                            m = export_connectivity_matrix(data_dir, str(name_prefix), vname, arr, local_names, policy, extra_meta=item)
-                            manifest["scan_matrices"].setdefault(scan_name, {})[key] = m
-                        except Exception as e:
-                            manifest["scan_matrices"].setdefault(scan_name, {})[key] = {"error": str(e)}
-
-        manifest_path = save_manifest(data_dir, str(name_prefix), manifest)
-        return str(manifest_path)
-
-    def test_stationarity(self, series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
-        """Проверяет стационарность ряда через ADF-тест."""
-        return analysis_stats.test_stationarity(series)
-
-    def get_preprocessing_summary(self) -> dict:
-        """Возвращает отчёт о предобработке и auto-diff в формате для UI/HTML."""
+    def get_preprocessing_summary(self):
         rep = {}
         try:
             if self.preprocessing_report is not None:
                 pr = self.preprocessing_report
-                rep["preprocess"] = {
-                    "enabled": bool(getattr(pr, "enabled", True)),
-                    "steps_global": list(getattr(pr, "steps_global", [])),
-                    "steps_by_column": dict(getattr(pr, "steps_by_column", {})),
-                    "dropped_columns": list(getattr(pr, "dropped_columns", [])),
-                    "notes": dict(getattr(pr, "notes", {})),
-                }
-            else:
-                rep["preprocess"] = {"enabled": None, "steps_global": [], "steps_by_column": {}, "dropped_columns": [], "notes": {}}
-        except Exception:
-            rep["preprocess"] = {"enabled": None, "steps_global": [], "steps_by_column": {}, "dropped_columns": [], "notes": {}}
-
-        rep["autodiff"] = dict(self.autodiff_report or {"enabled": False, "differenced": []})
-        # В отчёт включаем и dimred, чтобы UI/HTML мог корректно объяснить
-        # итоговое число признаков и стратегию выбора компонент.
-        try:
-            rep["dimred"] = dict(getattr(self, "dimred_report", {}) or {})
-        except Exception:
-            rep["dimred"] = {}
+                rep["preprocess"] = {"enabled": bool(getattr(pr,"enabled",True)),
+                    "steps_global": list(getattr(pr,"steps_global",[])),
+                    "steps_by_column": dict(getattr(pr,"steps_by_column",{})),
+                    "dropped_columns": list(getattr(pr,"dropped_columns",[])),
+                    "notes": dict(getattr(pr,"notes",{}))}
+            else: rep["preprocess"] = {"enabled": None}
+        except: rep["preprocess"] = {"enabled": None}
+        rep["autodiff"] = dict(self.autodiff_report or {"enabled": False})
+        try: rep["dimred"] = dict(getattr(self,"dimred_report",{}) or {})
+        except: rep["dimred"] = {}
         return rep
 
-    def get_harmonics(self, top_k: int = 5, fs: float | None = None) -> dict:
-        """Возвращает FFT-пики (гармоники) по каждому ряду."""
+    def get_harmonics(self, top_k=5, fs=None):
         out = {}
-        if self.data.empty:
-            return out
-        fs0 = float(fs) if fs is not None else float(getattr(self, "fs", 1.0))
+        if self.data.empty: return out
+        fs0 = float(fs) if fs is not None else float(getattr(self,"fs",1.0))
         for col in self.data.columns:
-            s = self.data[col]
-            out[col] = analysis_stats.fft_peaks(s, fs=fs0, top_k=int(max(1, top_k)))
+            out[col] = analysis_stats.fft_peaks(self.data[col], fs=fs0, top_k=int(max(1, top_k)))
         return out
 
-    def get_diagnostics(self) -> dict:
-        """Возвращает базовые диагностические метрики по всем столбцам."""
+    def get_diagnostics(self):
         diagnostics = {}
-        if self.data.empty:
-            return diagnostics
+        if self.data.empty: return diagnostics
         for col in self.data.columns:
-            series = self.data[col]
-            adf_stat, adf_p = analysis_stats.test_stationarity(series)
-            season = analysis_stats.detect_seasonality(series)
-            fft_pk = analysis_stats.fft_peaks(series, top_k=3)
-            ac = analysis_stats.autocorr_summary(series)
-            diagnostics[col] = {
-                "adf_stat": adf_stat,
-                "adf_p": adf_p,
-                "hurst_rs": analysis_stats.compute_hurst_rs(series),
-                "hurst_dfa": analysis_stats.compute_hurst_dfa(series),
-                "hurst_aggvar": analysis_stats.compute_hurst_aggvar(series),
-                "hurst_wavelet": analysis_stats.compute_hurst_wavelet(series),
-                "sample_entropy": analysis_stats.compute_sample_entropy(series),
-                "shannon_entropy": analysis_stats.shannon_entropy(series),
-                "permutation_entropy": analysis_stats.permutation_entropy(series, order=3, delay=1, normalize=True),
-                "seasonality": season,
-                "autocorr": ac,
-                "fft_peaks": fft_pk,
-            }
+            s = self.data[col]; stat, pv = analysis_stats.test_stationarity(s)
+            diagnostics[col] = {"adf_stat": stat, "adf_p": pv,
+                "hurst_rs": analysis_stats.compute_hurst_rs(s),
+                "sample_entropy": analysis_stats.compute_sample_entropy(s),
+                "shannon_entropy": analysis_stats.shannon_entropy(s),
+                "seasonality": analysis_stats.detect_seasonality(s),
+                "autocorr": analysis_stats.autocorr_summary(s),
+                "fft_peaks": analysis_stats.fft_peaks(s, top_k=3)}
         return diagnostics
 
-    def build_pairwise_summaries(self, *, p_alpha: float = 0.05) -> None:
-        """Строит компактные pairwise-таблицы по каждой матрице результатов."""
-        import pandas as pd
-
+    def build_pairwise_summaries(self, *, p_alpha=0.05):
         self.pairwise_summaries = {}
         cols = list(self.data.columns) if self.data is not None and not self.data.empty else []
         for variant, mat in (self.results or {}).items():
-            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
-                continue
-            is_pval = is_pvalue_method(variant)
-            thr = float(p_alpha) if is_pval else float(getattr(self.config, "graph_threshold", 0.2))
+            if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0: continue
+            _ip = is_pvalue_method(variant); thr = float(p_alpha) if _ip else float(getattr(self.config,"graph_threshold",0.2))
             rows = []
             for i, a in enumerate(cols):
                 for j, b in enumerate(cols):
-                    if i == j:
-                        continue
+                    if i == j: continue
                     v = mat[i, j]
-                    if v is None or not np.isfinite(float(v)):
-                        continue
-                    if is_pval:
-                        flag = "significant" if float(v) < thr else ""
-                    else:
-                        flag = "strong" if abs(float(v)) > thr else ""
+                    if v is None or not np.isfinite(float(v)): continue
+                    flag = ("significant" if float(v)<thr else "") if _ip else ("strong" if abs(float(v))>thr else "")
                     rows.append({"src": a, "tgt": b, "value": float(v), "flag": flag})
-            if rows:
-                self.pairwise_summaries[variant] = pd.DataFrame(rows)
+            if rows: self.pairwise_summaries[variant] = pd.DataFrame(rows)
 
+    # ── Plot helpers (thin wrappers for report generators) ────────────
+
+    def plot_time_series(self, data, title="Time Series"):
+        return plots.plot_time_series(data, title=title)
+
+    def plot_single_time_series(self, series, title=""):
+        return plots.plot_single_time_series(series, title=title)
+
+    def plot_fft(self, data, title="FFT"):
+        return plots.plot_fft(data, title=title)
+
+    def plot_sliding_window_comparison(self, sw_res, legend_text=""):
+        return plots.plot_sliding_window_comparison(sw_res, legend_text=legend_text)
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Compute connectivity measures for multivariate time series."
-    )
-    parser.add_argument(
-        "input_file",
-        help="Path to input CSV or Excel file with time series data",
-    )
-    parser.add_argument(
-        "--lags",
-        type=int,
-        default=DEFAULT_MAX_LAG,
-        help="Lag or model order (for Granger, TE, etc.)",
-    )
-    parser.add_argument(
-        "--pvalue-alpha",
-        type=float,
-        default=DEFAULT_PVALUE_ALPHA,
-        help="Alpha for p-value methods (Granger full/directed)",
-    )
-    parser.add_argument(
-        "--log",
-        action="store_true",
-        help="Apply logarithm transform to data (for positive-valued data)",
-    )
-    parser.add_argument(
-        "--no-outliers",
-        action="store_true",
-        help="Disable outlier removal",
-    )
-    parser.add_argument(
-        "--no-normalize",
-        action="store_true",
-        help="Disable normalization of data",
-    )
-    parser.add_argument(
-        "--no-stationarity-check",
-        action="store_true",
-        help="Disable stationarity check (ADF test)",
-    )
-    parser.add_argument(
-        "--graph-threshold",
-        type=float,
-        default=0.5,
-        help="Threshold for graph edges (weight >= threshold)",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output Excel file path (defaults to TimeSeriesAnalysis/AllMethods_Full.xlsx)",
-    )
-    parser.add_argument(
-        "--quiet-warnings",
-        action="store_true",
-        help="Suppress most warnings for cleaner CLI output.",
-    )
-    parser.add_argument(
-        "--experimental",
-        action="store_true",
-        help="Enable experimental sliding-window analyses.",
-    )
-    parser.add_argument(
-        "--no-excel",
-        action="store_true",
-        help="Skip Excel report generation.",
-    )
-    parser.add_argument(
-        "--report-html",
-        default=None,
-        dest="report_html",
-        help="Path for HTML report output (optional).",
-    )
+    parser = argparse.ArgumentParser(description="Connectivity analysis for multivariate time series.")
+    parser.add_argument("input_file", help="Path to input CSV or Excel file")
+    parser.add_argument("--lags", type=int, default=DEFAULT_MAX_LAG)
+    parser.add_argument("--pvalue-alpha", type=float, default=DEFAULT_PVALUE_ALPHA)
+    parser.add_argument("--log", action="store_true")
+    parser.add_argument("--no-outliers", action="store_true")
+    parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument("--no-stationarity-check", action="store_true")
+    parser.add_argument("--graph-threshold", type=float, default=0.5)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--quiet-warnings", action="store_true")
+    parser.add_argument("--experimental", action="store_true")
+    parser.add_argument("--no-excel", action="store_true")
+    parser.add_argument("--report-html", default=None, dest="report_html")
     args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     configure_warnings(quiet=args.quiet_warnings)
-
     filepath = os.path.abspath(args.input_file)
     output_path = args.output or os.path.join(SAVE_FOLDER, "AllMethods_Full.xlsx")
     output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
+    if output_dir: os.makedirs(output_dir, exist_ok=True)
     tool = BigMasterTool(enable_experimental=args.experimental)
-    tool.lag_ranges = {v: range(1, args.lags + 1) for v in method_mapping}
-    tool.load_data_excel(
-        filepath,
-        log_transform=args.log,
-        remove_outliers=not args.no_outliers,
-        normalize=not args.no_normalize,
-        fill_missing=True,
-        check_stationarity=not args.no_stationarity_check,
-    )
+    tool.load_data_excel(filepath, log_transform=args.log, remove_outliers=not args.no_outliers,
+        normalize=not args.no_normalize, fill_missing=True, check_stationarity=not args.no_stationarity_check)
     tool.run_all_methods()
-    do_excel = not args.no_excel
-    do_report = bool(args.report_html)
-    if not do_excel and not do_report:
-        do_excel = True
-
-    if do_excel:
-        tool.export_big_excel(
-            output_path,
-            threshold=args.graph_threshold,
-            p_value_alpha=args.pvalue_alpha,
-        )
-
-    if do_report:
-        report_path = os.path.abspath(args.report_html)
-        report_dir = os.path.dirname(report_path)
-        if report_dir:
-            os.makedirs(report_dir, exist_ok=True)
-        tool.export_html_report(
-            report_path,
-            graph_threshold=args.graph_threshold,
-            p_value_alpha=args.pvalue_alpha,
-        )
-
-    print("Анализ завершён, результаты сохранены в:", output_path)
+    if not args.no_excel:
+        tool.export_big_excel(output_path, threshold=args.graph_threshold, p_value_alpha=args.pvalue_alpha)
+    if args.report_html:
+        rp = os.path.abspath(args.report_html); os.makedirs(os.path.dirname(rp), exist_ok=True)
+        tool.export_html_report(rp, graph_threshold=args.graph_threshold, p_value_alpha=args.pvalue_alpha)
+    print("Done:", output_path)
