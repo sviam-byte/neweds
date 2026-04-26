@@ -12,7 +12,10 @@ from neweds.core.batch_pipeline import run_batch, run_one_analysis
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="neweds",
-        description="Считает метрики связности для многомерных временных рядов.",
+        description=(
+            "Connectivity analysis for multivariate time series. Single-file mode supports "
+            "CSV/Excel/Parquet/MAT/HDF5; directory batch supports CSV/Excel/Parquet."
+        ),
     )
     p.add_argument("input_file", nargs="?", default="examples/demo_timeseries.csv")
     p.add_argument(

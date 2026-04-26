@@ -70,21 +70,9 @@ class HTMLReportGenerator:
         return self._b64_png(plots.plot_window_cube_3d(points, title))
 
     def _resolve_report_dataframe(self):
-        """Выбирает наиболее подходящий слой рядов для HTML-отчёта.
-
-        Логика нужна для совместимости: разные этапы пайплайна могут менять
-        количество рядов, и визуальный слой отчёта должен по возможности
-        совпадать по размерности с матрицами связности в results.
-        """
+        """Resolve the single honest analysis dataframe for the HTML report."""
         candidates = []
-        for layer_name in [
-            "data_normalized",
-            "data_dimred",
-            "data_after_autodiff",
-            "data_preprocessed",
-            "data",
-            "data_raw",
-        ]:
+        for layer_name in ["analysis_data", "data"]:
             df = getattr(self.tool, layer_name, None)
             if df is None or getattr(df, "empty", True):
                 continue
@@ -119,7 +107,7 @@ class HTMLReportGenerator:
                 return chosen[1], chosen[0], candidates
 
         # Приоритет 2: самый широкий «обработанный» слой; data_raw — fallback.
-        preferred = [c for c in candidates if c[0] != "data_raw"] or candidates
+        preferred = list(candidates)
         preferred.sort(key=lambda x: (x[2], x[3]), reverse=True)
         chosen = preferred[0]
         return chosen[1], chosen[0], candidates
@@ -568,12 +556,11 @@ class HTMLReportGenerator:
 
         # Главный экран: raw/proc в едином масштабе + отчёт предобработки + гармоники.
         try:
-            raw_df = getattr(self.tool, "data_raw", None)
-            proc_df = getattr(self.tool, "data_preprocessed", None)
+            raw_df = getattr(self.tool, "analysis_data", None)
+            proc_df = raw_df
             if raw_df is None or getattr(raw_df, "empty", True):
                 raw_df = self.tool.data
-            if proc_df is None or getattr(proc_df, "empty", True):
-                proc_df = self.tool.data
+                proc_df = raw_df
 
             y_domain = None
             try:

@@ -1,10 +1,13 @@
 """Tests for deterministic connectivity behavior in group pipeline."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
+import neweds.cli_group as cli_group
 import neweds.core.group_pipeline as gp
 from neweds.core.group_pipeline import (
     _correlation_matrix_fast,
@@ -16,6 +19,8 @@ from neweds.core.group_pipeline import (
     filter_features_by_bin_coverage,
     group_comparison,
     load_subject,
+    load_group,
+    run_group_pipeline,
 )
 
 
@@ -160,3 +165,107 @@ def test_group_comparison_reports_effect_size_and_respects_pair_mask() -> None:
         "significant",
     ]
     assert set(zip(df["bin_i"], df["bin_j"])) == {("b0", "b1"), ("b1", "b2")}
+
+
+def test_load_group_fail_fast_by_default_and_allows_explicit_skip(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "ok.csv").write_text("x,y,z,t0\n0,0,0,1\n", encoding="utf-8")
+    (tmp_path / "bad.csv").write_text("x,y,z,t0\n0,0,0,1\n", encoding="utf-8")
+
+    def _fake_load_subject(path: Path, **kwargs):
+        if path.name == "bad.csv":
+            raise ValueError("boom")
+        return pd.DataFrame({"bin_0_0_0": [1.0, 2.0]})
+
+    monkeypatch.setattr(gp, "load_subject", _fake_load_subject)
+    monkeypatch.setattr(gp, "_validate_subject_schema", lambda path, columns: {"file": path.name})
+    monkeypatch.setattr(gp, "_peek_columns", lambda path: ["x", "y", "z", "t0"])
+    monkeypatch.setattr(gp, "_cross_validate_group_schemas", lambda schemas, group_label: None)
+
+    with pytest.raises(RuntimeError, match="failed to load"):
+        load_group(tmp_path, "schiz")
+
+    loaded = load_group(tmp_path, "schiz", allow_skip=True)
+    assert list(loaded) == ["schiz::ok"]
+    assert loaded.skipped_subjects == [{"file": "bad.csv", "error": "boom"}]
+
+
+def test_group_pipeline_normalizes_canonical_reference_aliases(monkeypatch, tmp_path: Path) -> None:
+    refs: list[str] = []
+
+    def _fake_load_group(directory, group_label, **kwargs):
+        return {f"{group_label}::s1": pd.DataFrame({"b0": [1.0, 2.0], "b1": [2.0, 3.0]})}
+
+    def _fake_fit(ref_dfs, strategy):
+        refs.append(next(iter(ref_dfs)).split("::", 1)[0])
+        return SimpleNamespace(
+            n_voxels=2,
+            voxel_ids=["b0", "b1"],
+            source_info={},
+            save=lambda path: None,
+        )
+
+    monkeypatch.setattr(gp, "load_group", _fake_load_group)
+    monkeypatch.setattr(gp, "fit_canonical_space", _fake_fit)
+    monkeypatch.setattr(gp, "align_all", lambda dfs, space: dfs)
+    monkeypatch.setattr(
+        gp,
+        "build_missing_bin_qc_table",
+        lambda dfs: pd.DataFrame({"subject_id": list(dfs), "n_missing_bins": [0], "missing_bin_fraction": [0.0]}),
+    )
+    monkeypatch.setattr(gp, "build_feature_matrix", lambda dfs, method: (np.array([[0.1]]), list(dfs)))
+    monkeypatch.setattr(
+        gp,
+        "group_comparison",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "bin_i": ["b0"],
+                "bin_j": ["b1"],
+                "u_stat": [0.0],
+                "p_raw": [1.0],
+                "p_fdr": [1.0],
+                "effect_size_r": [0.0],
+                "significant": [False],
+            }
+        ),
+    )
+
+    summary_case = run_group_pipeline(
+        tmp_path,
+        tmp_path,
+        tmp_path / "out_case",
+        canonical_reference="case",
+        min_bin_coverage=0.0,
+        save_canonical_space=False,
+        save_feature_matrix=False,
+    )
+    summary_control = run_group_pipeline(
+        tmp_path,
+        tmp_path,
+        tmp_path / "out_control",
+        canonical_reference="control",
+        min_bin_coverage=0.0,
+        save_canonical_space=False,
+        save_feature_matrix=False,
+    )
+
+    assert summary_case["canonical_reference"] == "schiz"
+    assert summary_control["canonical_reference"] == "healthy"
+    assert refs[:2] == ["schiz", "healthy"]
+
+
+def test_cli_group_accepts_legacy_and_internal_canonical_reference_names() -> None:
+    parser = cli_group.build_parser()
+    for ref in ["case", "control", "schiz", "healthy", "all"]:
+        args = parser.parse_args(
+            [
+                "--case-dir",
+                "case_dir",
+                "--control-dir",
+                "control_dir",
+                "--output-dir",
+                "out",
+                "--canonical-reference",
+                ref,
+            ]
+        )
+        assert args.canonical_reference == ref

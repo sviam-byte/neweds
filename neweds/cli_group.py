@@ -10,7 +10,10 @@ import sys
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="neweds-group",
-        description="Групповое сравнение fMRI connectivity (например, пациенты vs контроль).",
+        description=(
+            "Group fMRI connectivity comparison. Inputs are subject-wise CSV/Excel/Parquet "
+            "after spatial binning; HDF5 group input is not supported yet."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Пример:
@@ -60,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--canonical-reference",
         default="all",
-        choices=["case", "control", "all"],
+        choices=["case", "control", "schiz", "healthy", "all"],
         help="По какой группе строится canonical space (по умолчанию: all).",
     )
     p.add_argument(
@@ -88,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-save-features",
         action="store_true",
         help="Не сохранять матрицы признаков по субъектам (экономит диск).",
+    )
+    p.add_argument(
+        "--allow-skip-subjects",
+        action="store_true",
+        help="Allow failed subject files to be skipped; default is fail-fast.",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Подробный DEBUG-лог.")
     return p
@@ -117,6 +125,7 @@ def main() -> None:
             min_bin_coverage=args.min_bin_coverage,
             csv_chunk_rows=args.chunk_size,
             save_feature_matrix=not args.no_save_features,
+            allow_skip=bool(args.allow_skip_subjects),
         )
     except Exception as exc:
         logging.error("Группой пайплайн упал: %s", exc, exc_info=args.verbose)

@@ -8,9 +8,9 @@
 
 ## Что внутри
 
-- **Plugin-based реестр метрик** — 24 связностных метрики (Pearson, Spearman, Kendall, partial-correlation, distance correlation, mutual information, transfer entropy, Granger, coherence, ordinal MI, AH) регистрируются декоратором и снабжены структурированной метадатой (категория, направленность, описание).
+- **Central metric registry with decorator support** — 24 связностных метрики (Pearson, Spearman, Kendall, partial-correlation, distance correlation, mutual information, transfer entropy, Granger, coherence, ordinal MI, AH) живут в едином registry со структурированной метадатой; `@register_metric(...)` остаётся extension API для plugin/custom-метрик.
 - **Структурированные контракты результатов** — `AnalysisResult` / `MetricResult` / `ComputationContract` (frozen `@dataclass(slots=True)`); каждый результат сопровождается воспроизводимым контекстом: параметры, конфиг-хэш, контролируемые переменные, лаг.
-- **Время-ряды и fMRI на одной поверхности** — `neweds` для time-series, `neweds-group` для группового сравнения по канонической voxel-сетке.
+- **Чёткие границы форматов** — single-file `neweds` поддерживает CSV/Excel/Parquet/MAT/HDF5 через `load_or_generate`; directory batch поддерживает CSV/Excel/Parquet; `neweds-group` сейчас поддерживает subject-wise CSV/Excel/Parquet после spatial binning, не HDF5 group input.
 - **Lag-optimization** — для направленных метрик пайплайн умеет искать лучший лаг в [1, max_lag].
 - **HTML и Excel отчёты** — генерируются из `AnalysisResult`, без legacy-зависимостей.
 - **Ground-truth тесты** — синтетические сценарии (VAR(1), независимые ряды, лаговая копия) с известным ответом, плюс snapshot-регрессии и subprocess-тест CLI.
@@ -81,7 +81,7 @@ neweds/
 │   ├── voxel_space.py        canonical voxel space для fMRI
 │   └── window_scanner.py     сканирование по окнам (joblib)
 ├── metrics/
-│   ├── registry.py           plugin-style реестр (decorator + dataclass)
+│   ├── registry.py           central metric registry (decorator support + dataclass)
 │   └── connectivity.py       реализации метрик
 ├── reporting/
 │   ├── html_generator.py     HTML-отчёт
@@ -107,7 +107,7 @@ CLI ─► run_analysis ─► load_or_generate ─► metric registry
 
 ## Ключевые места для ревью кода
 
-- [neweds/metrics/registry.py](neweds/metrics/registry.py) — plugin-реестр на декораторе, метаданные через `@dataclass(frozen=True, slots=True)`, read-only `Mapping`-view для обратной совместимости.
+- [neweds/metrics/registry.py](neweds/metrics/registry.py) — central metric registry with decorator support, метаданные через `@dataclass(frozen=True, slots=True)`, read-only `Mapping`-view для обратной совместимости.
 - [neweds/core/pipeline.py](neweds/core/pipeline.py) — публичная точка входа; реализует lag-selection через скоринг матриц связности, формирует `ComputationContract` для воспроизводимости.
 - [neweds/core/results.py](neweds/core/results.py) — структурированные контракты результатов.
 - [neweds/config.py](neweds/config.py) и [neweds/methods.py](neweds/methods.py) — разделение конфигурации и каталога методов.

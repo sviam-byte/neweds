@@ -35,6 +35,7 @@ class Metric:
     pvalue_based: bool = False
     supports_control: bool = False
     experimental: bool = False
+    stable: bool = False
 
 
 _METRICS: dict[str, Metric] = {}
@@ -49,6 +50,7 @@ def register_metric(
     pvalue_based: bool = False,
     supports_control: bool = False,
     experimental: bool = False,
+    stable: bool = False,
 ) -> Callable[[MetricFunc], MetricFunc]:
     """Декоратор: регистрирует обёрнутую функцию в реестре метрик."""
 
@@ -64,6 +66,7 @@ def register_metric(
             pvalue_based=pvalue_based,
             supports_control=supports_control,
             experimental=experimental,
+            stable=stable,
         )
         return func
 
@@ -361,9 +364,23 @@ def _bootstrap_builtin_metrics() -> None:
         ),
     ]
 
+    stable_builtin_names = {
+        "correlation_full",
+        "correlation_spearman",
+        "correlation_kendall",
+        "correlation_partial",
+        "coherence_full",
+        "coherence_partial",
+        "granger_full",
+        "dcor_full",
+        "ordinal_full",
+    }
+
     for metric_name, func, meta in builtins:
         if metric_name in _METRICS:
             continue
+        if metric_name in stable_builtin_names:
+            meta = {**meta, "stable": True}
         _METRICS[metric_name] = Metric(name=metric_name, func=func, **meta)
 
 

@@ -30,6 +30,7 @@ interfaces/TimeSeriesAnalysis/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 
 # Large local data
 data/

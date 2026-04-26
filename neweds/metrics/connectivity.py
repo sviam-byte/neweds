@@ -16,7 +16,7 @@ from scipy.special import digamma
 from statsmodels.tsa.stattools import grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
 
-from ..config import (
+from ..defaults import (
     DEFAULT_BINS,
     DEFAULT_EMBED_DIM,
     DEFAULT_EMBED_TAU,

@@ -24,6 +24,14 @@ _META_COLS = frozenset({"subject", "group", "iq", "sex"})
 COVERAGE_CONFOUND_THRESHOLD = 0.4
 
 
+class GroupLoadResult(dict[str, pd.DataFrame]):
+    """Mapping of subject id to data plus explicit skipped-subject metadata."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.skipped_subjects: list[dict[str, str]] = []
+
+
 # ---------------------------------------------------------------------------
 # Загрузка
 # ---------------------------------------------------------------------------
@@ -77,6 +85,7 @@ def load_group(
     spatial_grid_size: int = 10,
     spatial_grid_method: str = "mean",
     csv_chunk_rows: int = 32768,
+    allow_skip: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Загружает все субъекты из директории.
 
@@ -84,7 +93,7 @@ def load_group(
         dict: ``group_label::stem`` → DataFrame (time × bins)
     """
     files = _iter_subject_files(directory)
-    result: dict[str, pd.DataFrame] = {}
+    result = GroupLoadResult()
     schemas: list[dict] = []
     for path in files:
         sid = f"{group_label}::{path.stem}"
@@ -106,6 +115,9 @@ def load_group(
                 df.shape[1],
             )
         except Exception as exc:
+            if not allow_skip:
+                raise RuntimeError(f"[{group_label}] failed to load {path.name}: {exc}") from exc
+            result.skipped_subjects.append({"file": path.name, "error": str(exc)})
             logger.error("[%s] ПРОПУСК %s: %s", group_label, path.name, exc)
     if not result:
         raise RuntimeError(f"Ни один субъект из {directory} не загружен.")
@@ -575,6 +587,7 @@ def run_group_pipeline(
     save_feature_matrix: bool = True,
     canonical_reference: str = "all",
     min_bin_coverage: float = 0.8,
+    allow_skip: bool = False,
 ) -> dict:
     """Полный pipeline группового сравнения.
 
@@ -601,6 +614,7 @@ def run_group_pipeline(
         spatial_grid_size=spatial_grid_size,
         spatial_grid_method=spatial_grid_method,
         csv_chunk_rows=csv_chunk_rows,
+        allow_skip=allow_skip,
     )
     logger.info("=== Загрузка: здоровые (%s) ===", healthy_dir)
     dfs_healthy = load_group(
@@ -609,6 +623,7 @@ def run_group_pipeline(
         spatial_grid_size=spatial_grid_size,
         spatial_grid_method=spatial_grid_method,
         csv_chunk_rows=csv_chunk_rows,
+        allow_skip=allow_skip,
     )
 
     all_dfs = {**dfs_schiz, **dfs_healthy}
@@ -621,7 +636,8 @@ def run_group_pipeline(
 
     # 2. Canonical space
     logger.info("=== Canonical voxel space (strategy=%s) ===", strategy)
-    ref = str(canonical_reference or "all").strip().lower()
+    raw_ref = str(canonical_reference or "all").strip().lower()
+    ref = {"case": "schiz", "control": "healthy"}.get(raw_ref, raw_ref)
     if ref == "healthy":
         ref_dfs = dfs_healthy
     elif ref == "schiz":
@@ -630,7 +646,9 @@ def run_group_pipeline(
         ref_dfs = all_dfs
         logger.warning("canonical_reference='all' может давать leakage при train/test сценариях.")
     else:
-        raise ValueError("canonical_reference должен быть одним из: 'healthy', 'schiz', 'all'.")
+        raise ValueError(
+            "canonical_reference must be one of: 'case', 'control', 'healthy', 'schiz', 'all'."
+        )
 
     space = fit_canonical_space(ref_dfs, strategy=strategy)
     space.source_info["reference_group"] = ref
@@ -742,6 +760,9 @@ def run_group_pipeline(
         "method": method,
         "strategy": strategy,
         "canonical_reference": ref,
+        "allow_skip": bool(allow_skip),
+        "skipped_subjects": list(getattr(dfs_schiz, "skipped_subjects", []))
+        + list(getattr(dfs_healthy, "skipped_subjects", [])),
         "min_bin_coverage": min_bin_coverage,
         "spatial_grid_size": spatial_grid_size,
         "missing_bins_diag_corr": (

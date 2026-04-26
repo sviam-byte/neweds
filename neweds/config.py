@@ -2,26 +2,21 @@
 
 from __future__ import annotations
 
-import importlib.util
 from dataclasses import dataclass, field
 
-# Дефолтные параметры анализа.
-DEFAULT_MAX_LAG = 5
-DEFAULT_K_MI = 5
-DEFAULT_BINS = 8
-DEFAULT_OUTLIER_Z = 5
-DEFAULT_REGULARIZATION = 1e-8
-DEFAULT_EMBED_DIM = 3
-DEFAULT_EMBED_TAU = 1
-DEFAULT_PVALUE_ALPHA = 0.05
-DEFAULT_EDGE_THRESHOLD = 0.2
-
-# Регуляризация для partial-correlation методов.
-REG_ALPHA = 1e-5
-
-# Признак доступности опционального pyinform — даёт более точный TE.
-# Если нет, ядро откатывается на numpy-fallback.
-PYINFORM_AVAILABLE = importlib.util.find_spec("pyinform") is not None
+from neweds.defaults import (
+    DEFAULT_BINS,
+    DEFAULT_EDGE_THRESHOLD,
+    DEFAULT_EMBED_DIM,
+    DEFAULT_EMBED_TAU,
+    DEFAULT_K_MI,
+    DEFAULT_MAX_LAG,
+    DEFAULT_OUTLIER_Z,
+    DEFAULT_PVALUE_ALPHA,
+    DEFAULT_REGULARIZATION,
+    PYINFORM_AVAILABLE,
+    REG_ALPHA,
+)
 
 
 @dataclass(slots=True)
