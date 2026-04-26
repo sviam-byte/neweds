@@ -13,14 +13,14 @@ def test_iter_supported_input_files_recursive(tmp_path: Path):
     (tmp_path / "b.xlsx").write_text("fake", encoding="utf-8")
     nested = tmp_path / "nested"
     nested.mkdir()
-    (nested / "c.mat").write_text("fake", encoding="utf-8")
+    (nested / "c.parquet").write_text("fake", encoding="utf-8")
     (nested / "ignore.txt").write_text("nope", encoding="utf-8")
 
     flat = cli._iter_supported_input_files(str(tmp_path), recursive=False)
     rec = cli._iter_supported_input_files(str(tmp_path), recursive=True)
 
     assert [Path(x).name for x in flat] == ["a.csv", "b.xlsx"]
-    assert [Path(x).name for x in rec] == ["a.csv", "b.xlsx", "c.mat"]
+    assert [Path(x).name for x in rec] == ["a.csv", "b.xlsx", "c.parquet"]
 
 
 def test_write_manifest_and_zip(tmp_path: Path):

@@ -44,6 +44,9 @@ METRICS_REGISTRY: dict[str, MetricFunc] = {
     # Спец-метрика: порядковая/пермутационная зависимость
     "ordinal_full": connectivity.ordinal_matrix,
     "ordinal_directed": connectivity.ordinal_matrix_directed,
+    "ah_full": connectivity.AH_matrix,
+    "ah_partial": connectivity.compute_partial_AH_matrix,
+    "ah_directed": connectivity.AH_matrix_directed,
 }
 
 

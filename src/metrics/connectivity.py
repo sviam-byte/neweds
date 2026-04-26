@@ -17,7 +17,14 @@ from scipy.special import digamma
 from statsmodels.tsa.stattools import grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
 
-from ..config import DEFAULT_BINS, DEFAULT_K_MI, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
+from ..config import (
+    DEFAULT_BINS,
+    DEFAULT_EMBED_DIM,
+    DEFAULT_EMBED_TAU,
+    DEFAULT_K_MI,
+    DEFAULT_MAX_LAG,
+    PYINFORM_AVAILABLE,
+)
 
 # Порог пар, с которого пробуем параллелизацию.
 # Для тяжёлых методов (dcor, MI, TE, AH) порог ниже — overhead joblib окупается быстрее.
@@ -1163,3 +1170,136 @@ def ordinal_matrix_directed(
         v = _ordinal_mi(x[mask], y_shifted[mask], order=order, delay=delay)
         out[i, j] = float(v) if np.isfinite(v) else 0.0
     return out
+
+
+def _H_ratio_direction(
+    source: np.ndarray,
+    target: np.ndarray,
+    m: int = DEFAULT_EMBED_DIM,
+    tau: int = DEFAULT_EMBED_TAU,
+) -> Optional[float]:
+    """Return the AH nearest-neighbor ratio for one directed pair."""
+
+    source_values = np.asarray(source, dtype=np.float64).reshape(-1)
+    target_values = np.asarray(target, dtype=np.float64).reshape(-1)
+    if source_values.size != target_values.size or source_values.size < 2:
+        return None
+
+    embed_dim = int(max(1, m))
+    embed_tau = int(max(1, tau))
+    embedded_len = int(source_values.size - (embed_dim - 1) * embed_tau)
+    if embedded_len < 2:
+        return None
+
+    source_embedding = np.empty((embedded_len, embed_dim), dtype=np.float64)
+    target_embedding = np.empty((embedded_len, embed_dim), dtype=np.float64)
+    for offset in range(embed_dim):
+        start = offset * embed_tau
+        stop = start + embedded_len
+        source_embedding[:, offset] = source_values[start:stop]
+        target_embedding[:, offset] = target_values[start:stop]
+
+    valid_rows = np.isfinite(source_embedding).all(axis=1) & np.isfinite(target_embedding).all(axis=1)
+    if not np.any(valid_rows):
+        return None
+
+    source_valid = source_embedding[valid_rows]
+    target_valid = target_embedding[valid_rows]
+    if source_valid.shape[0] < 2:
+        return None
+
+    source_tree = cKDTree(source_valid)
+    _, source_neighbor_idx = source_tree.query(source_valid, k=2)
+    if source_neighbor_idx.ndim != 2 or source_neighbor_idx.shape[1] < 2:
+        return None
+
+    source_neighbor = source_neighbor_idx[:, 1]
+    target_distance_by_source_neighbor = np.linalg.norm(
+        target_valid - target_valid[source_neighbor],
+        axis=1,
+    )
+
+    target_tree = cKDTree(target_valid)
+    target_distances, _ = target_tree.query(target_valid, k=2)
+    if target_distances.ndim != 2 or target_distances.shape[1] < 2:
+        return None
+
+    target_nearest_distance = np.where(target_distances[:, 1] == 0.0, 1e-10, target_distances[:, 1])
+    ratios = target_distance_by_source_neighbor / target_nearest_distance
+    ratios = ratios[np.isfinite(ratios)]
+    return float(np.mean(ratios)) if ratios.size > 0 else None
+
+
+def AH_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    embed_dim: int = DEFAULT_EMBED_DIM,
+    tau: int = DEFAULT_EMBED_TAU,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **_: dict,
+) -> np.ndarray:
+    """Compute directed Arnhold-H ratio connectivity."""
+
+    df = data.dropna(axis=0, how="any")
+    n_cols = int(df.shape[1])
+    out = _init_matrix(n_cols, 0.0, diag=0.0)
+    if n_cols < 2 or df.empty:
+        return out
+
+    effective = _get_effective_pairs(n_cols, pairs, directed=True)
+    values = df.to_numpy(dtype=np.float64, copy=False)
+
+    def _compute_ah_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
+        src, tgt = pair
+        ratio = _H_ratio_direction(values[:, src], values[:, tgt], m=embed_dim, tau=tau)
+        if ratio is None or ratio <= 0.0:
+            return src, tgt, 0.0
+        return src, tgt, float(min(1.0, 1.0 / ratio))
+
+    for src, tgt, value in _try_parallel(_compute_ah_pair, effective, heavy=True):
+        out[src, tgt] = value
+    return out
+
+
+def compute_partial_AH_matrix(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    embed_dim: int = DEFAULT_EMBED_DIM,
+    tau: int = DEFAULT_EMBED_TAU,
+    pairs: Optional[list[tuple[int, int]]] = None,
+    **extra: dict,
+) -> np.ndarray:
+    """Compute AH after residualizing control effects or VAR residuals."""
+
+    df = data.dropna(axis=0, how="any")
+    n_cols = int(df.shape[1])
+    if n_cols < 2:
+        return _init_matrix(n_cols, 0.0, diag=0.0)
+
+    control_matrix = extra.get("control_matrix", None)
+    if control_matrix is not None or (control is not None and len(control) > 0):
+        residualized, _desc = _residualize_df(df, control=control, control_matrix=control_matrix)
+        return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs)
+
+    try:
+        model = VAR(df.values).fit(int(max(1, lag)), ic=None)
+        residualized = pd.DataFrame(model.resid, columns=df.columns)
+    except Exception as exc:
+        logging.warning("[AH] VAR residualization failed; using raw data: %s", exc)
+        residualized = df
+    return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs)
+
+
+def AH_matrix_directed(
+    data: pd.DataFrame,
+    lag: int = 1,
+    control: Optional[list[str]] = None,
+    **kwargs: dict,
+) -> np.ndarray:
+    """Compatibility wrapper for the directed AH variant."""
+
+    if control:
+        return compute_partial_AH_matrix(data, lag=lag, control=control, **kwargs)
+    return AH_matrix(data, lag=lag, control=control, **kwargs)

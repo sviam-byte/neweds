@@ -24,7 +24,9 @@ def _resolve_alias(name: str) -> str:
     return VARIANT_ALIASES.get(name, name)
 
 
+LEGACY_OPT_IN_VARIANTS = {"ah_full", "ah_partial", "ah_directed"}
 ALL_REGISTRY_VARIANTS = list(METRICS_REGISTRY.keys())
+PUBLIC_REGISTRY_VARIANTS = [v for v in ALL_REGISTRY_VARIANTS if v not in LEGACY_OPT_IN_VARIANTS]
 
 
 PRESETS = {
@@ -62,7 +64,6 @@ PRESETS = {
             "granger_partial",
             "te_full",
             "te_partial",
-            "ah_directed",
             "dcor_directed",
             "ordinal_directed",
         ]
@@ -89,14 +90,11 @@ PRESETS = {
             "granger_partial",
             "te_full",
             "te_partial",
-            "ah_full",
-            "ah_partial",
-            "ah_directed",
         ]
         if variant in ALL_REGISTRY_VARIANTS
     ],
     # абсолютно всё из живого реестра
-    "all": list(ALL_REGISTRY_VARIANTS),
+    "all": list(PUBLIC_REGISTRY_VARIANTS),
 }
 
 

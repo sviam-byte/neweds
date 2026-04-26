@@ -179,7 +179,6 @@ def _choose_k_from_priority(
             k = int(max(1, min(10, int(n_features))))
         return k, pr_used, ev_sum, ev_top
 
-    # explained_variance
     if eigvals_desc is None or eigvals_desc.size == 0:
         # нет спектра — фолбэк
         if tn is not None:

@@ -36,7 +36,8 @@ def test_reporting_has_public_wrappers() -> None:
 def test_main_cli_has_modern_pipeline_path() -> None:
     text = read("interfaces/cli.py")
     assert "from src.core.engine import BigMasterTool" not in text
-    assert "run_analysis" in text
+    assert "run_batch" in text
+    assert "zipfile" not in text
 
 
 def test_engine_is_marked_legacy() -> None:

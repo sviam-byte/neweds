@@ -12,25 +12,22 @@ New portfolio-facing code should use:
 
 Do not add new public pipeline logic here.
 """
-import argparse, logging, os
+import argparse, json, logging, os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.spatial import cKDTree
-from sklearn.linear_model import LinearRegression
-from statsmodels.tsa.vector_ar.var_model import VAR
 
 from ..config import (
-    DEFAULT_EMBED_DIM, DEFAULT_EMBED_TAU, DEFAULT_MAX_LAG, DEFAULT_PVALUE_ALPHA,
+    DEFAULT_MAX_LAG, DEFAULT_PVALUE_ALPHA,
     SAVE_FOLDER, AnalysisConfig,
     is_control_sensitive_method, is_directed_method, is_pvalue_method,
 )
 from ..analysis import stats as analysis_stats
 from ..analysis.dimred import apply_dimred
 from ..metrics import connectivity as metrics_connectivity
-from ..metrics.registry import METRICS_REGISTRY, get_metric_func, register_metric
+from ..metrics.registry import METRICS_REGISTRY, get_metric_func
 from ..reporting import ExcelReportWriter, HTMLReportGenerator
 from ..visualization import plots
 from .data_loader import load_or_generate, preprocess_timeseries
@@ -50,82 +47,41 @@ class RunLog:
     def __init__(self): self.items: List[str] = []
     def add(self, msg):
         try: self.items.append(str(msg))
-        except: pass
+        except Exception as exc: logging.error("Failed to append run log item: %s", exc)
     def as_text(self): return "\n".join(self.items)
 
 # ── AH metrics ───────────────────────────────────────────────────────────
-def _H_ratio_direction(X, Y, m=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU):
-    n = len(X)
-    if len(Y) != n or n < 2: return None
-    L = n - (m-1)*tau
-    if L < 2: return None
-    Xs = np.zeros((L, m)); Ys = np.zeros((L, m))
-    for j in range(m):
-        Xs[:, j] = X[j*tau:j*tau+L]; Ys[:, j] = Y[j*tau:j*tau+L]
-    v = ~np.isnan(Xs).any(1) & ~np.isnan(Ys).any(1)
-    if not np.any(v): return None
-    Xv, Yv = Xs[v], Ys[v]
-    if len(Xv) < 2: return None
-    tX = cKDTree(Xv); _, iX = tX.query(Xv, k=2)
-    if iX.shape[1] < 2: return None
-    nn = iX[:, 1]; dY1 = np.sqrt(np.sum((Yv - Yv[nn])**2, axis=1))
-    tY = cKDTree(Yv); dY, _ = tY.query(Yv, k=2)
-    dY2 = np.where(dY[:, 1] == 0, 1e-10, dY[:, 1])
-    r = dY1/dY2; r = r[np.isfinite(r)]
-    return float(np.mean(r)) if len(r) > 0 else None
-
-def AH_matrix(df, embed_dim=DEFAULT_EMBED_DIM, tau=DEFAULT_EMBED_TAU, pairs=None, **_kw):
-    from ..metrics.connectivity import _get_effective_pairs, _iter_pairs
-    df = df.dropna(axis=0, how='any'); N = df.shape[1]; out = np.zeros((N, N)); arr = df.values
-    if pairs is not None: eff = _iter_pairs(N, pairs, directed=True)
-    else:
-        nf = N*(N-1)
-        if nf > 10_000_000:
-            mp = min(500_000, N*5); rng = np.random.default_rng(42); es = set()
-            bi, bj = rng.integers(0, N, size=mp*3), rng.integers(0, N, size=mp*3)
-            for ii, jj in zip(bi, bj):
-                if ii != jj: es.add((int(ii), int(jj)))
-                if len(es) >= mp: break
-            eff = list(es)
-        else: eff = [(s,t) for s in range(N) for t in range(N) if s != t]
-    def _ah(pair):
-        s, t = pair; H = _H_ratio_direction(arr[:,s], arr[:,t], m=embed_dim, tau=tau)
-        return (s, t, 0.0) if H is None or H <= 0 else (s, t, min(1.0, 1.0/H))
-    if len(eff) > 800:
-        try:
-            from joblib import Parallel, delayed
-            res = Parallel(n_jobs=-1, backend="loky")(delayed(_ah)(p) for p in eff)
-        except ImportError: res = [_ah(p) for p in eff]
-    else: res = [_ah(p) for p in eff]
-    for s, t, v in res: out[s, t] = v
-    return out
-
-def compute_partial_AH_matrix(data, max_lag=DEFAULT_MAX_LAG, embed_dim=DEFAULT_EMBED_DIM,
-                               tau=DEFAULT_EMBED_TAU, control=None, pairs=None):
-    df = data.dropna(axis=0, how='any'); N = df.shape[1]
-    if N < 2: return np.zeros((N, N))
-    if control and len(control) > 0:
-        rdf = pd.DataFrame(index=df.index)
-        for col in df.columns:
-            Xc = df[control]; y = df[col]
-            if len(Xc) > 0 and not Xc.isnull().any().any():
-                try: mdl = LinearRegression().fit(Xc.values, y.values); rdf[col] = y.values - mdl.predict(Xc.values)
-                except: rdf[col] = y
-            else: rdf[col] = y
-    else:
-        try: r = VAR(df.values).fit(max_lag, ic=None); rdf = pd.DataFrame(r.resid, columns=df.columns)
-        except: rdf = df
-    return AH_matrix(rdf, embed_dim=embed_dim, tau=tau, pairs=pairs)
-
-for _n, _f in {
-    "ah_full": lambda d, lag=1, control=None, **kw: AH_matrix(d, pairs=kw.get("pairs")),
-    "ah_partial": lambda d, lag=1, control=None, **kw: compute_partial_AH_matrix(d, max_lag=lag, control=control, pairs=kw.get("pairs")),
-    "ah_directed": lambda d, lag=1, control=None, **kw: (AH_matrix(d, pairs=kw.get("pairs")) if not control
-        else compute_partial_AH_matrix(d, max_lag=lag, control=control, pairs=kw.get("pairs"))),
-}.items():
-    register_metric(_n, _f)
+_H_ratio_direction = metrics_connectivity._H_ratio_direction
+AH_matrix = metrics_connectivity.AH_matrix
+compute_partial_AH_matrix = metrics_connectivity.compute_partial_AH_matrix
 
 method_mapping = dict(METRICS_REGISTRY)
+
+
+def apply_auto_diff(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with non-stationary numeric columns differenced."""
+
+    result = df.copy()
+    differenced: list[str] = []
+    for col in result.columns:
+        if not pd.api.types.is_numeric_dtype(result[col]):
+            continue
+        _, pval = analysis_stats.test_stationarity(result[col])
+        if pval is None or pval <= 0.05:
+            continue
+        series = pd.to_numeric(result[col], errors="coerce").astype(float)
+        diffed = series.diff()
+        if len(diffed) > 0:
+            diffed.iloc[0] = 0.0
+        mean = float(diffed.mean(skipna=True)) if np.isfinite(diffed.mean(skipna=True)) else 0.0
+        diffed -= mean
+        std = float(diffed.std(skipna=True)) if np.isfinite(diffed.std(skipna=True)) else 0.0
+        if std > 1e-12:
+            diffed /= std
+        result[col] = diffed.fillna(0.0)
+        differenced.append(str(col))
+    result.attrs["differenced_columns"] = differenced
+    return result
 
 # Legacy metric API re-exports kept for compatibility with older tests and callers.
 correlation_matrix = metrics_connectivity.correlation_matrix
@@ -185,7 +141,9 @@ def compute_connectivity_variant(data, variant, lag=1, control=None, *, pairs=No
                     for i in range(min(k, U.shape[1])):
                         ctrls.append(U[:,i]*S[i]); control_desc.append(f"pca[{i+1}]")
                 if ctrls: control_matrix = np.vstack(ctrls).T
-            except: control_matrix = None; control_desc = []
+            except Exception as exc:
+                logging.warning("Control covariate construction failed: %s", exc)
+                control_matrix = None; control_desc = []
         if variant in method_mapping:
             return get_metric_func(variant)(data, lag=lag, control=control,
                 control_matrix=control_matrix, control_desc=control_desc, pairs=pairs)
@@ -220,7 +178,7 @@ class BigMasterTool:
             data = data.loc[:, (data != data.iloc[0]).any()]
             self.data = data.copy()
             try: self.data.attrs = {}
-            except: pass
+            except Exception as exc: logging.warning("Could not clear DataFrame attrs: %s", exc)
             for c in list(self.data.columns):
                 self.data[c] = pd.to_numeric(self.data[c], errors="coerce")
             if len(self.data.columns) > 0 and isinstance(self.data.columns[0], int):
@@ -242,12 +200,11 @@ class BigMasterTool:
         self._stage_callback = cb
 
     def _stage(self, stage, progress=None, **meta):
-        try: logging.info("[Stage] %s", stage)
-        except: pass
+        logging.info("[Stage] %s", stage)
         cb = getattr(self, "_stage_callback", None)
         if cb:
             try: cb(stage, progress, dict(meta or {}))
-            except: pass
+            except Exception as exc: logging.error("Stage callback failed for %s: %s", stage, exc)
 
     # ── Data loading ─────────────────────────────────────────────────
 
@@ -258,7 +215,9 @@ class BigMasterTool:
             self._stage("Загрузка RAW", 0.05)
             self.data_raw = load_or_generate(filepath, preprocess=False, normalize=False,
                 remove_outliers=False, fill_missing=False, check_stationarity=False)
-        except: self.data_raw = pd.DataFrame()
+        except Exception as exc:
+            logging.warning("RAW load failed for %s: %s", filepath, exc)
+            self.data_raw = pd.DataFrame()
         self._stage("Загрузка + предобработка", 0.15)
         df_out = load_or_generate(filepath, return_report=True, **kwargs)
         if isinstance(df_out, tuple): self.data, self.preprocessing_report = df_out
@@ -269,16 +228,18 @@ class BigMasterTool:
             notes = (self.preprocessing_report.notes if self.preprocessing_report else {}) or {}
             coords = notes.get("coords")
             if isinstance(coords, list) and coords: self.coords_df = pd.DataFrame(coords)
-        except: pass
+        except Exception as exc:
+            logging.warning("Could not extract coordinates from preprocessing report: %s", exc)
         try:
             if qc_enabled and (self.coords_df is not None or self.data.shape[1] >= 20):
                 self._stage("QC", 0.45)
                 if not self.data_raw.empty:
                     self.qc_raw = analysis_stats.voxel_qc(self.data_raw, coords=self.coords_df)
                 self.qc_clean = analysis_stats.voxel_qc(self.data, coords=self.coords_df)
-        except: pass
+        except Exception as exc:
+            logging.warning("QC calculation failed: %s", exc)
         try: self.results_meta.setdefault("__run__", {}).setdefault("qc_enabled", qc_enabled)
-        except: pass
+        except Exception as exc: logging.warning("Could not write QC metadata: %s", exc)
         self.data = self.data.fillna(self.data.mean(numeric_only=True))
         if self.config.auto_difference: self._apply_auto_diff()
         self.data_after_autodiff = self.data.copy()
@@ -288,21 +249,11 @@ class BigMasterTool:
     def _apply_auto_diff(self):
         self.autodiff_report = {"enabled": True, "differenced": []}
         self._stage("Авто-дифференцирование", 0.55)
-        cnt = 0
-        for col in self.data.columns:
-            if not pd.api.types.is_numeric_dtype(self.data[col]): continue
-            _, pval = analysis_stats.test_stationarity(self.data[col])
-            if pval is None or pval <= 0.05: continue
-            s = pd.to_numeric(self.data[col], errors="coerce").astype(float)
-            d = s.diff()
-            if len(d) > 0: d.iloc[0] = 0.0
-            mu = float(d.mean(skipna=True)) if np.isfinite(d.mean(skipna=True)) else 0.0
-            d -= mu
-            sd = float(d.std(skipna=True)) if np.isfinite(d.std(skipna=True)) else 0.0
-            if sd > 1e-12: d /= sd
-            self.data[col] = d.fillna(0.0); cnt += 1
-            self.autodiff_report["differenced"].append(col)
-        if cnt > 0: logging.warning("Differenced %d non-stationary series.", cnt)
+        self.data = apply_auto_diff(self.data)
+        differenced = list(self.data.attrs.get("differenced_columns", []))
+        self.autodiff_report["differenced"] = differenced
+        if differenced:
+            logging.warning("Differenced %d non-stationary series.", len(differenced))
 
     def normalize_data(self):
         if self.data.empty: return
@@ -544,10 +495,50 @@ class BigMasterTool:
     def export_big_excel(self, save_path, **kwargs):
         return ExcelReportWriter(self).write(save_path, **kwargs)
 
+    def export_binned_timeseries(self, save_path):
+        from pathlib import Path
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = getattr(self, "data", pd.DataFrame())
+        (data if data is not None else pd.DataFrame()).to_csv(path, index=False)
+
+        paths = {"binned_csv": str(path)}
+        coords = getattr(self, "coords_df", None)
+        if coords is None and isinstance(getattr(data, "attrs", None), dict):
+            coords = data.attrs.get("coords")
+        if coords is not None and not getattr(coords, "empty", True):
+            coords_path = path.with_name(f"{path.stem}_coords.csv")
+            coords.to_csv(coords_path, index=False)
+            paths["binned_coords_csv"] = str(coords_path)
+
+        meta_path = path.with_name(f"{path.stem}_meta.json")
+        meta = {
+            "format": getattr(data, "attrs", {}).get("format", "unknown") if data is not None else "unknown",
+            "shape": list(getattr(data, "shape", (0, 0))),
+            "results_meta": getattr(self, "results_meta", {}) or {},
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        paths["binned_meta_json"] = str(meta_path)
+        return paths
+
+    def export_run_manifest(self, save_path, *, extra=None):
+        from pathlib import Path
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "results_meta": getattr(self, "results_meta", {}) or {},
+            "preprocessing": self.get_preprocessing_summary(),
+            "extra": dict(extra or {}),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
+
     def export_series_bundle(self, save_path):
         def _p(d):
             try: return d if d is not None and not getattr(d,'empty',True) else None
-            except: return None
+            except Exception as exc:
+                logging.warning("Could not inspect exported series object: %s", exc)
+                return None
         with pd.ExcelWriter(save_path, engine='openpyxl') as w:
             for nm, d in [("RAW", _p(self.data_raw)), ("PREPROCESSED", _p(self.data_preprocessed)),
                           ("AFTER_AUTODIFF", _p(self.data_after_autodiff)), ("NORMALIZED", _p(self.data_normalized))]:
@@ -555,7 +546,8 @@ class BigMasterTool:
             try:
                 for nm2, d2 in [("QC_RAW", self.qc_raw), ("QC_CLEAN", self.qc_clean), ("COORDS", self.coords_df)]:
                     if d2 is not None and not getattr(d2,'empty',True): d2.to_excel(w, sheet_name=nm2, index=False)
-            except: pass
+            except Exception as exc:
+                logging.warning("Could not write QC/coords sheets: %s", exc)
         return save_path
 
     def export_connectivity_bundle(self, out_dir, name_prefix="run", dense_n_limit=2000,
@@ -564,7 +556,7 @@ class BigMasterTool:
         from ..reporting.connectivity_export import ExportPolicy, export_connectivity_matrix, save_manifest, save_nodes_csv
         data_dir = str(Path(out_dir)/"data"); os.makedirs(data_dir, exist_ok=True)
         try: self.export_dimred_bundle(out_dir, name_prefix=name_prefix)
-        except: pass
+        except Exception as exc: logging.warning("Dimred bundle export failed: %s", exc)
         names = list(getattr(self,"data",pd.DataFrame()).columns)
         policy = ExportPolicy(dense_n_limit=dense_n_limit, topk_per_node=topk_per_node, min_abs_weight=min_abs_weight)
         manifest = {"name_prefix": name_prefix, "variants": {}}
@@ -586,7 +578,9 @@ class BigMasterTool:
         target_n = int(kwargs.get("dimred_target", 0) or 0)
         target_var = kwargs.get("dimred_target_var")
         try: target_var = float(target_var) if target_var is not None and str(target_var).strip() != "" else None
-        except: target_var = None
+        except Exception as exc:
+            logging.warning("Invalid dimred target variance %r: %s", target_var, exc)
+            target_var = None
         base = (self.data_preprocessed if isinstance(getattr(self,"data_preprocessed",None), pd.DataFrame) and not self.data_preprocessed.empty else getattr(self,"data",None))
         if base is None or getattr(base, "empty", True):
             self.dimred_report = {"enabled": False, "reason": "no_data"}; self.data_dimred = pd.DataFrame(); self.dimred_mapping = pd.DataFrame(); return
@@ -627,16 +621,19 @@ class BigMasterTool:
             df = getattr(self,"data_dimred",None)
             if df is not None and not getattr(df,"empty",True):
                 p = data_dir/f"{pref}timeseries_dimred.csv"; df.to_csv(p, index=True); paths["timeseries_dimred_csv"] = str(p)
-        except: pass
+        except Exception as exc:
+            logging.warning("Could not export dimred time series: %s", exc)
         try:
             mp = getattr(self,"dimred_mapping",None)
             if mp is not None and not getattr(mp,"empty",True):
                 p = data_dir/f"{pref}dimred_mapping.csv"; mp.to_csv(p, index=False); paths["dimred_mapping_csv"] = str(p)
-        except: pass
+        except Exception as exc:
+            logging.warning("Could not export dimred mapping: %s", exc)
         try:
             rep = getattr(self,"dimred_report",{}) or {}; p = data_dir/f"{pref}dimred_meta.json"
             p.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8"); paths["dimred_meta_json"] = str(p)
-        except: pass
+        except Exception as exc:
+            logging.warning("Could not export dimred metadata: %s", exc)
         try:
             rep2 = getattr(self,"dimred_report",{}) or {}; targets = rep2.get("saved_variants") or []
             m = str(rep2.get("method","none")).strip().lower()
@@ -652,9 +649,12 @@ class BigMasterTool:
                             rr.reduced.to_csv(sub/"timeseries_dimred.csv", index=True)
                             rr.mapping.to_csv(sub/"dimred_mapping.csv", index=False)
                             (sub/"dimred_meta.json").write_text(json.dumps(rr.meta, ensure_ascii=False, indent=2), encoding="utf-8")
-                        except: continue
+                        except Exception as exc:
+                            logging.warning("Could not export dimred variant %s: %s", t, exc)
+                            continue
                     paths["dimred_variants_dir"] = str(vroot)
-        except: pass
+        except Exception as exc:
+            logging.warning("Could not export dimred variants: %s", exc)
         return paths
 
     def _maybe_post_preprocess(self, **kwargs):
@@ -687,10 +687,14 @@ class BigMasterTool:
                     "dropped_columns": list(getattr(pr,"dropped_columns",[])),
                     "notes": dict(getattr(pr,"notes",{}))}
             else: rep["preprocess"] = {"enabled": None}
-        except: rep["preprocess"] = {"enabled": None}
+        except Exception as exc:
+            logging.warning("Could not build preprocessing summary: %s", exc)
+            rep["preprocess"] = {"enabled": None}
         rep["autodiff"] = dict(self.autodiff_report or {"enabled": False})
         try: rep["dimred"] = dict(getattr(self,"dimred_report",{}) or {})
-        except: rep["dimred"] = {}
+        except Exception as exc:
+            logging.warning("Could not build dimred summary: %s", exc)
+            rep["dimred"] = {}
         return rep
 
     def get_harmonics(self, top_k=5, fs=None):
