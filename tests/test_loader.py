@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from src.core import data_loader
-from src.core.data_loader import read_input_table
+from neweds.core import data_loader
+from neweds.core.data_loader import read_input_table
 
 
 def test_read_input_table_with_header(tmp_path: Path) -> None:
@@ -165,10 +165,7 @@ def test_streaming_csv_voxel_wide_spatial_binning(tmp_path: Path) -> None:
     """Large-CSV path should support streaming deterministic spatial binning."""
     csv_path = tmp_path / "vox.csv"
     csv_path.write_text(
-        "x,y,z,t0,t1\n"
-        "55,0,0,1,3\n"
-        "56,0,0,2,4\n"
-        "57,0,0,6,8\n",
+        "x,y,z,t0,t1\n55,0,0,1,3\n56,0,0,2,4\n57,0,0,6,8\n",
         encoding="utf-8",
     )
 
@@ -196,16 +193,11 @@ def test_streaming_csv_bin_names_are_stable_with_missing_voxels(tmp_path: Path) 
     a = tmp_path / "a.csv"
     b = tmp_path / "b.csv"
     a.write_text(
-        "x,y,z,t0,t1\n"
-        "55,0,0,1,2\n"
-        "56,0,0,3,4\n"
-        "57,0,0,5,6\n",
+        "x,y,z,t0,t1\n55,0,0,1,2\n56,0,0,3,4\n57,0,0,5,6\n",
         encoding="utf-8",
     )
     b.write_text(
-        "x,y,z,t0,t1\n"
-        "56,0,0,7,8\n"
-        "57,0,0,9,10\n",
+        "x,y,z,t0,t1\n56,0,0,7,8\n57,0,0,9,10\n",
         encoding="utf-8",
     )
 
@@ -240,8 +232,7 @@ def test_streaming_csv_fixed_range_keeps_empty_bins_as_nan(tmp_path: Path) -> No
     """Fixed range should preserve empty bins so alignment stays deterministic."""
     csv_path = tmp_path / "fixed_range.csv"
     csv_path.write_text(
-        "x,y,z,t0,t1\n"
-        "0,0,0,1,2\n",
+        "x,y,z,t0,t1\n0,0,0,1,2\n",
         encoding="utf-8",
     )
 

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import AnalysisConfig
-from src.core.metric_runner import compute_all_metrics, compute_metric
-from src.core.pipeline import run_analysis
-from src.core.results import AnalysisResult
-from src.reporting.excel_writer import write_excel_report
-from src.reporting.html_generator import write_html_report
+from neweds.config import AnalysisConfig
+from neweds.core.metric_runner import compute_all_metrics, compute_metric
+from neweds.core.pipeline import run_analysis
+from neweds.core.results import AnalysisResult
+from neweds.reporting.excel_writer import write_excel_report
+from neweds.reporting.html_generator import write_html_report
 
 
 def test_compute_metric_uses_registry_contract() -> None:

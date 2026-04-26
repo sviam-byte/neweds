@@ -3,13 +3,13 @@
 import numpy as np
 import pandas as pd
 
-from src.metrics.connectivity import (
+from neweds.metrics.connectivity import (
     correlation_matrix,
     granger_matrix,
     kendall_matrix,
     spearman_matrix,
 )
-from src.metrics.registry import get_metric_func
+from neweds.metrics.registry import get_metric_func
 
 
 def test_correlation_identity() -> None:

@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.config import AnalysisConfig
-from src.core.pipeline import run_analysis
-from src.core.variant_presets import expand_variants
-from src.metrics.connectivity import lagged_directed_correlation
+from neweds.config import AnalysisConfig
+from neweds.core.pipeline import run_analysis
+from neweds.core.variant_presets import expand_variants
+from neweds.metrics.connectivity import lagged_directed_correlation
 
 
 def test_lagged_directed_correlation_recovers_shifted_signal() -> None:

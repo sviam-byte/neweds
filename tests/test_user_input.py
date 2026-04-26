@@ -1,7 +1,7 @@
 """Тесты парсинга пользовательского конфига и пресетов вариантов."""
 
-from src.core.variant_presets import expand_variants
-from src.io.user_input import build_run_spec, parse_user_input
+from neweds.core.variant_presets import expand_variants
+from neweds.io.user_input import build_run_spec, parse_user_input
 
 
 def test_parse_user_input_key_value() -> None:

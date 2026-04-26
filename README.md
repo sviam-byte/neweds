@@ -1,114 +1,142 @@
-# NewEDS: Time-Series and fMRI Connectivity Toolkit
+# NewEDS
 
-NewEDS is a Python toolkit for multivariate time-series connectivity analysis.
+**NewEDS** — Python-инструмент для анализа связности (connectivity) многомерных временных рядов и групповых fMRI-данных.
 
-It demonstrates how an exploratory research prototype can be refactored into a layered, testable analysis tool with:
+Пакет показывает, как исследовательский прототип превращается в слоистый, тестируемый аналитический пайплайн со строгим публичным API.
 
-- a central metric registry;
-- reproducible CLI runs;
-- structured result contracts;
-- HTML/Excel reporting;
-- legacy isolation from the portfolio-facing pipeline.
+---
 
-## What this project does
+## Что внутри
 
-For ordinary multivariate time-series data, NewEDS loads a CSV/Excel file, preprocesses the series, computes selected connectivity metrics, and writes human-readable reports.
+- **Plugin-based реестр метрик** — 24 связностных метрики (Pearson, Spearman, Kendall, partial-correlation, distance correlation, mutual information, transfer entropy, Granger, coherence, ordinal MI, AH) регистрируются декоратором и снабжены структурированной метадатой (категория, направленность, описание).
+- **Структурированные контракты результатов** — `AnalysisResult` / `MetricResult` / `ComputationContract` (frozen `@dataclass(slots=True)`); каждый результат сопровождается воспроизводимым контекстом: параметры, конфиг-хэш, контролируемые переменные, лаг.
+- **Время-ряды и fMRI на одной поверхности** — `neweds` для time-series, `neweds-group` для группового сравнения по канонической voxel-сетке.
+- **Lag-optimization** — для направленных метрик пайплайн умеет искать лучший лаг в [1, max_lag].
+- **HTML и Excel отчёты** — генерируются из `AnalysisResult`, без legacy-зависимостей.
+- **Ground-truth тесты** — синтетические сценарии (VAR(1), независимые ряды, лаговая копия) с известным ответом, плюс snapshot-регрессии и subprocess-тест CLI.
 
-The repository still contains a legacy GUI-compatible engine.
-The portfolio-facing path is the modern CLI/core pipeline.
+---
 
-## Quick Start
+## Установка
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
 
-Run a simple time-series analysis:
+Опционально:
 
 ```bash
-neweds demo.csv \
-  --variants correlation_full,dcor_full,ordinal_full \
-  --output-dir outputs/demo
+pip install -e ".[dev,advanced]"   # + dcor, hurst, nolds для экспериментальных метрик
 ```
 
-## Architecture
+---
 
-```text
-interfaces/
-  cli.py                  public command-line entry point
-  legacy_cli.py           compatibility entry point for old workflow
-  gui.py, web.py          legacy interactive interfaces
+## Quick start
 
-src/core/
-  pipeline.py             public orchestration layer
-  metric_runner.py        metric execution boundary
-  results.py              structured result contracts
-  data_loader.py          input loading and preprocessing
-
-src/metrics/
-  registry.py             canonical metric registry
-  connectivity.py         metric implementations
-
-src/reporting/
-  html_generator.py       HTML report generation
-  excel_writer.py         Excel report generation
+```bash
+neweds examples/demo_timeseries.csv \
+    --variants correlation_full,dcor_full,ordinal_full \
+    --output-dir outputs/demo
 ```
 
-The portfolio-facing path is `interfaces/cli.py -> src.core.pipeline.run_analysis -> src.metrics.registry -> AnalysisResult -> reporting`.
+После запуска в `outputs/demo/` появятся `report.html` и `report.xlsx`.
 
-## Public API
+Программный API:
 
-The reviewed public API is the modern CLI/core path above.
+```python
+from neweds import AnalysisConfig, run_analysis
 
-Legacy compatibility is retained in:
+result = run_analysis(
+    "examples/demo_timeseries.csv",
+    AnalysisConfig(
+        variants=["correlation_full", "correlation_directed"],
+        max_lag=3,
+        lag_selection="optimize",
+    ),
+)
 
-- `interfaces/legacy_cli.py`
-- `interfaces/gui.py`
-- `interfaces/web.py`
-- `src/core/engine.py`
+for name, metric in result.metrics.items():
+    print(name, metric.matrix.shape, "lag=", metric.lag)
+```
 
-Those modules are intentionally not the main portfolio surface.
+---
 
-## Implemented Metric Families
+## Архитектура
 
-- Pearson correlation and partial correlation
-- Distance correlation
-- Mutual information and partial mutual information
-- Coherence
-- Granger-style lagged tests
-- Transfer-entropy-style metrics
-- Ordinal/permutation-pattern connectivity
-- Directed lagged variants for selected metrics
+```
+neweds/
+├── cli.py                    публичный CLI (time-series)
+├── cli_group.py              CLI группового fMRI-сравнения
+├── config.py                 AnalysisConfig, ComputationContract
+├── methods.py                каталог методов (категории, описания, флаги)
+├── core/
+│   ├── pipeline.py           run_analysis (публичная точка входа)
+│   ├── batch_pipeline.py     batch-режим + manifest + zip
+│   ├── group_pipeline.py     fMRI: groupwise сравнение по canonical voxel space
+│   ├── metric_runner.py      граница вычислений → registry
+│   ├── results.py            AnalysisResult / MetricResult / WindowResult
+│   ├── data_loader.py        ввод (CSV / Excel / Parquet / HDF5)
+│   ├── preprocessing.py      нормализация, заполнение пропусков
+│   ├── voxel_space.py        canonical voxel space для fMRI
+│   └── window_scanner.py     сканирование по окнам (joblib)
+├── metrics/
+│   ├── registry.py           plugin-style реестр (decorator + dataclass)
+│   └── connectivity.py       реализации метрик
+├── reporting/
+│   ├── html_generator.py     HTML-отчёт
+│   ├── excel_writer.py       Excel-отчёт
+│   └── _adapter.py           private shim: AnalysisResult → поверхность отчётов
+├── io/                       загрузчики (HDF5, user_input)
+├── analysis/                 dimred / graph / stats утилиты
+├── validation/               синтетические сценарии для ground-truth
+└── visualization/            heatmap / connectome / FFT plots
+```
 
-## Portfolio Focus
+Поток данных:
 
-This project is meant to show how research code can be turned into a clearer analytical toolkit:
+```
+CLI ─► run_analysis ─► load_or_generate ─► metric registry
+                                               │
+                            ComputationContract │
+                                               ▼
+                                       AnalysisResult ─► HTML / Excel
+```
 
-- interfaces separated from computation;
-- a public pipeline separated from legacy orchestration;
-- explicit `AnalysisResult` / `MetricResult` result contracts;
-- reproducible metadata attached to each run;
-- reporting built on top of structured outputs.
+---
 
-## Implemented Now
+## Ключевые места для ревью кода
 
-- Modern CLI entry point for repeatable local runs
-- Metric registry and explicit variant selection
-- Structured `AnalysisResult`-based reporting pipeline
-- HTML and Excel report generation
-- Legacy engine retained but isolated from the main public flow
+- [neweds/metrics/registry.py](neweds/metrics/registry.py) — plugin-реестр на декораторе, метаданные через `@dataclass(frozen=True, slots=True)`, read-only `Mapping`-view для обратной совместимости.
+- [neweds/core/pipeline.py](neweds/core/pipeline.py) — публичная точка входа; реализует lag-selection через скоринг матриц связности, формирует `ComputationContract` для воспроизводимости.
+- [neweds/core/results.py](neweds/core/results.py) — структурированные контракты результатов.
+- [neweds/config.py](neweds/config.py) и [neweds/methods.py](neweds/methods.py) — разделение конфигурации и каталога методов.
+- [tests/test_metric_ground_truth.py](tests/test_metric_ground_truth.py) — ground-truth сценарии (VAR(1), независимые ряды, лаговая копия) проверяют, что метрики действительно отвечают тому, что обещают.
+- [tests/test_pipeline_snapshot.py](tests/test_pipeline_snapshot.py) — числовая регрессия публичного pipeline.
+- [tests/test_cli_integration.py](tests/test_cli_integration.py) — subprocess-проверка, что `neweds <csv>` создаёт валидный HTML/Excel.
 
-## Planned Next
+---
 
-- Synthetic validation scenarios with known ground truth
-- fMRI-style spatial binning and canonical bin alignment
-- Group-level connectivity comparison workflows
+## Разработка
 
-## Current Limitations
+```bash
+ruff check .
+ruff format --check .
+pytest --cov=neweds --cov-report=term-missing
+```
 
-- The modern public pipeline currently executes metrics with a fixed user-specified lag.
-- The legacy GUI/web path is retained for compatibility and is not the main public API.
-- Some advanced metrics are exploratory and parameter-sensitive.
-- `ah_*` metrics remain legacy-only and are not advertised in the modern public presets.
-- Validation and generic fMRI group-comparison modules are not yet part of the portfolio-facing public workflow.
+CI (`.github/workflows/tests.yml`) гоняет матрицу `ubuntu-latest × windows-latest × Python 3.11/3.12`.
+
+---
+
+## Roadmap
+
+- Расширение ground-truth сценариев (Lorenz, Rössler, NARMA).
+- Группировка `*_partial` метрик в общий control-aware фреймворк.
+- Экспорт результатов в Parquet и Arrow.
+
+---
+
+## Лицензия
+
+MIT.

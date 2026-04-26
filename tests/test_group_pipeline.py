@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import src.core.group_pipeline as gp
-from src.core.group_pipeline import (
+import neweds.core.group_pipeline as gp
+from neweds.core.group_pipeline import (
     _correlation_matrix_fast,
     _fdr_bh,
     _mannwhitneyu_vectorized,
@@ -78,16 +78,20 @@ def test_missing_bin_qc_table_and_diag_correlation() -> None:
 
 def test_missing_bins_do_not_break_mannwhitney_and_fdr() -> None:
     """All-missing bins must not produce NaN features/p-values in MW/FDR stage."""
-    subj_a = pd.DataFrame({
-        "bin_1": [1.0, 2.0, 3.0, 4.0],
-        "bin_missing": [np.nan, np.nan, np.nan, np.nan],
-        "bin_2": [4.0, 3.0, 2.0, 1.0],
-    })
-    subj_b = pd.DataFrame({
-        "bin_1": [1.5, 2.5, 3.5, 4.5],
-        "bin_missing": [np.nan, np.nan, np.nan, np.nan],
-        "bin_2": [3.5, 2.5, 1.5, 0.5],
-    })
+    subj_a = pd.DataFrame(
+        {
+            "bin_1": [1.0, 2.0, 3.0, 4.0],
+            "bin_missing": [np.nan, np.nan, np.nan, np.nan],
+            "bin_2": [4.0, 3.0, 2.0, 1.0],
+        }
+    )
+    subj_b = pd.DataFrame(
+        {
+            "bin_1": [1.5, 2.5, 3.5, 4.5],
+            "bin_missing": [np.nan, np.nan, np.nan, np.nan],
+            "bin_2": [3.5, 2.5, 1.5, 0.5],
+        }
+    )
 
     feat_a = extract_upper_triangle(_correlation_matrix_fast(subj_a))[None, :]
     feat_b = extract_upper_triangle(_correlation_matrix_fast(subj_b))[None, :]
@@ -147,6 +151,12 @@ def test_group_comparison_reports_effect_size_and_respects_pair_mask() -> None:
     )
 
     assert list(df.columns) == [
-        "bin_i", "bin_j", "u_stat", "p_raw", "p_fdr", "effect_size_r", "significant"
+        "bin_i",
+        "bin_j",
+        "u_stat",
+        "p_raw",
+        "p_fdr",
+        "effect_size_r",
+        "significant",
     ]
     assert set(zip(df["bin_i"], df["bin_j"])) == {("b0", "b1"), ("b1", "b2")}
