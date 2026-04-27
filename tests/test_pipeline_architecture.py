@@ -1,4 +1,4 @@
-"""Architecture-level tests for the public pipeline boundary."""
+"""Архитектурные тесты публичного pipeline."""
 
 from __future__ import annotations
 

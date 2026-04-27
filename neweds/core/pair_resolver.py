@@ -14,7 +14,7 @@ import pandas as pd
 
 
 def parse_pairs_text(text: str, columns: pd.Index, n_cols: int) -> list[tuple[int, int]]:
-    """Parse user pairs like: a-b; a->b; 0-1; 0->1."""
+    """Разбирает пары вида a-b, a->b, 0-1, 0->1."""
     text = (text or "").strip()
     if not text:
         return []
@@ -52,7 +52,7 @@ def build_neighbor_pairs(
     kind: str = "26",
     radius: int = 1,
 ) -> list[tuple[int, int]]:
-    """Spatial neighborhood pairs from coords_df (voxel_id/x/y/z)."""
+    """Пары соседей по воксельным координатам."""
     if coords_df is None or coords_df.empty:
         return []
     col_to_idx = {str(c): i for i, c in enumerate(columns)}
@@ -106,7 +106,7 @@ def resolve_pairs(
     auto_thr: int = 500,
     **kwargs,
 ) -> tuple[list[tuple[int, int]] | None, str, dict]:
-    """Resolve which pairs to compute. Returns (pairs_idx, resolved_mode, meta)."""
+    """Определяет пары для расчёта, возвращает (pairs_idx, resolved_mode, meta)."""
     meta: dict = {}
 
     if pair_mode == "auto":

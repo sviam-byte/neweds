@@ -48,7 +48,7 @@ def make_independent(n: int = 1000, seed: int = 42) -> Scenario:
     df = pd.DataFrame({"X": rng.normal(size=n), "Y": rng.normal(size=n)})
     expectations = []
 
-    # Undirected метрики: |value| < threshold
+    # Ненаправленные метрики: |value| < threshold
     for m in (
         "correlation_full",
         "correlation_partial",
@@ -69,7 +69,7 @@ def make_independent(n: int = 1000, seed: int = 42) -> Scenario:
             )
         )
 
-    # Directed метрики: |value| < threshold
+    # Направленные метрики: |value| < threshold
     for m in (
         "correlation_directed",
         "h2_directed",
@@ -130,7 +130,7 @@ def make_linear_lagged(
 
     expectations = []
 
-    # Undirected: X-Y связь сильная, X-Z и Y-Z слабые
+    # Ненаправленные: X-Y связь сильная, X-Z и Y-Z слабые
     for m in ("correlation_full", "h2_full", "mutinf_full", "dcor_full", "coherence_full"):
         expectations.append(
             Expectation(
@@ -152,7 +152,7 @@ def make_linear_lagged(
             )
         )
 
-    # Directed: X→Y >> Y→X
+    # Направленные: X→Y >> Y→X
     for m in ("correlation_directed", "h2_directed", "dcor_directed", "ordinal_directed"):
         expectations.append(
             Expectation(
@@ -313,7 +313,7 @@ def make_confounded(n: int = 1000, seed: int = 42) -> Scenario:
 
     expectations = []
 
-    # Full correlation X-Y > 0 (spurious)
+    # Полная корреляция X-Y > 0 (ложная связь через конфаундер)
     expectations.append(
         Expectation(
             metric_group="correlation_full",
@@ -324,7 +324,7 @@ def make_confounded(n: int = 1000, seed: int = 42) -> Scenario:
         )
     )
 
-    # Partial correlation X-Y|Z ≈ 0
+    # Частичная корреляция X-Y|Z ≈ 0
     expectations.append(
         Expectation(
             metric_group="correlation_partial",
@@ -384,7 +384,7 @@ def make_ill_conditioned(n: int = 200, seed: int = 42) -> Scenario:
     df = pd.DataFrame({"X1": x1, "X2": x2, "X3": x3})
 
     expectations = [
-        # Partial correlation не должна взрываться (|value| < 5)
+        # Частичная корреляция не должна взрываться (|value| < 5)
         Expectation(
             metric_group="correlation_partial",
             pair=(0, 2),

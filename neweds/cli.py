@@ -42,7 +42,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-excel", action="store_true")
     p.add_argument("--recursive", action="store_true")
     p.add_argument("--batch-zip", action="store_true")
-    # Preprocessing toggles — explicit, so users see what was applied.
     p.add_argument("--no-preprocess", action="store_true", help="Полностью отключить препроцессинг.")
     p.add_argument("--no-fill-missing", action="store_true", help="Не заполнять пропуски.")
     p.add_argument("--no-normalize", action="store_true", help="Не нормализовать ряды.")

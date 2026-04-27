@@ -1,4 +1,4 @@
-"""Excel report generator for the public ``AnalysisResult`` contract."""
+"""Генератор Excel-отчёта для AnalysisResult."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def write_excel_report(
     filename: str = "report.xlsx",
     **kwargs,
 ) -> str:
-    """Write the Excel report for an :class:`AnalysisResult` to ``out_dir``."""
+    """Записывает Excel-отчёт для AnalysisResult в out_dir."""
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

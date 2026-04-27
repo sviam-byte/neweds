@@ -6,7 +6,7 @@ import numpy as np
 
 
 def as_float64_1d(x) -> np.ndarray:
-    """Safely convert input to 1D float64 without NaN/inf."""
+    """1D float64 без NaN/inf."""
     arr = np.asarray(x, dtype=np.float64).reshape(-1)
     if arr.size == 0:
         return arr
@@ -14,7 +14,7 @@ def as_float64_1d(x) -> np.ndarray:
 
 
 def fdr_bh(pvals: np.ndarray) -> np.ndarray:
-    """Benjamini-Hochberg FDR correction. Returns q-values (same shape)."""
+    """FDR-коррекция Бенджамини-Хохберга. Возвращает q-значения той же формы."""
     p = np.asarray(pvals, dtype=float)
     q = np.full(p.shape, np.nan, dtype=float)
     mask = np.isfinite(p)
@@ -34,7 +34,7 @@ def fdr_bh(pvals: np.ndarray) -> np.ndarray:
 
 
 def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarray:
-    """Apply FDR correction to a p-value matrix (off-diagonal entries)."""
+    """FDR-коррекция матрицы p-значений (внедиагональные элементы)."""
     M = np.array(mat, dtype=float, copy=True)
     n = M.shape[0]
     if n == 0:
@@ -56,7 +56,7 @@ def apply_pvalue_correction_matrix(mat: np.ndarray, directed: bool) -> np.ndarra
 
 
 def residualize_series(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """Return residuals of regression y ~ X (with intercept)."""
+    """Остатки регрессии y ~ X (со сдвигом)."""
     y = np.asarray(y, dtype=float)
     if X is None or np.size(X) == 0:
         return y - np.nanmean(y)
@@ -88,7 +88,7 @@ def residualize_series(y: np.ndarray, X: np.ndarray) -> np.ndarray:
 
 
 def lag_quality(variant: str, mat: np.ndarray, is_pvalue: bool) -> float:
-    """Scalar quality metric for a lag: higher => better."""
+    """Скалярная метрика качества лага: больше — лучше."""
     if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
         return np.nan
     n = mat.shape[0]
@@ -108,7 +108,7 @@ def lag_quality(variant: str, mat: np.ndarray, is_pvalue: bool) -> float:
 def pair_score(
     variant: str, mat: np.ndarray, i: int, j: int, is_directed: bool, is_pvalue: bool
 ) -> float:
-    """Scalar metric for a single pair (i,j) from a connectivity matrix."""
+    """Скалярная оценка пары (i,j) из матрицы связности."""
     if mat is None or not isinstance(mat, np.ndarray) or mat.size == 0:
         return float("nan")
     n = int(mat.shape[0])
@@ -129,7 +129,7 @@ def pair_score(
 
 
 def select_best_median_worst(items: list[dict], *, key: str = "metric") -> dict:
-    """Return indices of best/median/worst by value of key (NaN-aware)."""
+    """Индексы лучшего, медианного и худшего элемента по ключу key."""
     if not items:
         return {"best": None, "median": None, "worst": None}
 

@@ -1,4 +1,4 @@
-"""Pytest configuration for repository-local imports."""
+"""Конфигурация pytest для локальных импортов."""
 
 import sys
 from pathlib import Path

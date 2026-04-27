@@ -1,4 +1,4 @@
-"""Statistical diagnostics helpers used by the analysis engine."""
+"""Статистические диагностики: стационарность, спектр, энтропия."""
 
 from __future__ import annotations
 
@@ -192,7 +192,7 @@ def shannon_entropy(series: pd.Series, bins: int = 32) -> float:
 def permutation_entropy(
     series: pd.Series, order: int = 3, delay: int = 1, normalize: bool = True
 ) -> float:
-    """Permutation entropy (Bandt-Pompe).
+    """Перестановочная энтропия (Bandt-Pompe).
 
     Оценивает «сложность» через частоты порядковых паттернов.
     normalize=True -> значение в [0,1].

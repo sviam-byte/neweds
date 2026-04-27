@@ -1,4 +1,4 @@
-"""Tests for batch helpers in :mod:`neweds.core.batch_pipeline`."""
+"""Тесты пакетного запуска (batch_pipeline)."""
 
 from __future__ import annotations
 

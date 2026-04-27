@@ -1,4 +1,4 @@
-"""End-to-end integration test for the ``neweds`` CLI."""
+"""Сквозной интеграционный тест CLI."""
 
 from __future__ import annotations
 

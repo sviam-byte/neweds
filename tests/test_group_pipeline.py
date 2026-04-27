@@ -1,4 +1,4 @@
-"""Tests for deterministic connectivity behavior in group pipeline."""
+"""Тесты детерминированности group pipeline."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +25,7 @@ from neweds.core.group_pipeline import (
 
 
 def test_correlation_matrix_fast_all_nan_column_becomes_zero_correlations() -> None:
-    """All-NaN columns should not propagate NaN into connectivity matrix."""
+    """Столбцы из одних NaN не должны распространять NaN в матрицу связности."""
     df = pd.DataFrame(
         {
             "bin_with_signal": [1.0, 2.0, 3.0],
@@ -42,7 +42,7 @@ def test_correlation_matrix_fast_all_nan_column_becomes_zero_correlations() -> N
 
 
 def test_load_subject_disables_subjectwise_preprocessing(monkeypatch, tmp_path: Path) -> None:
-    """Loader must not apply per-subject preprocessing before canonical alignment."""
+    """Загрузчик не должен применять препроцессинг до canonical alignment."""
     captured: dict[str, object] = {}
 
     def _fake_load_or_generate(filepath: str, **kwargs):
@@ -63,7 +63,7 @@ def test_load_subject_disables_subjectwise_preprocessing(monkeypatch, tmp_path: 
 
 
 def test_missing_bin_qc_table_and_diag_correlation() -> None:
-    """QC table should expose missing-bin counts and binary correlation helper should be finite."""
+    """QC-таблица должна содержать счётчики пропущенных бинов, корреляция — конечная."""
     dfs = {
         "schiz::a": pd.DataFrame({"b1": [1.0, 2.0], "b2": [np.nan, np.nan]}),
         "healthy::b": pd.DataFrame({"b1": [1.0, 2.0], "b2": [1.0, 2.0]}),
@@ -82,7 +82,7 @@ def test_missing_bin_qc_table_and_diag_correlation() -> None:
 
 
 def test_missing_bins_do_not_break_mannwhitney_and_fdr() -> None:
-    """All-missing bins must not produce NaN features/p-values in MW/FDR stage."""
+    """Полностью пустые бины не должны давать NaN в стадии MW/FDR."""
     subj_a = pd.DataFrame(
         {
             "bin_1": [1.0, 2.0, 3.0, 4.0],
@@ -112,9 +112,9 @@ def test_missing_bins_do_not_break_mannwhitney_and_fdr() -> None:
 
 
 def test_filter_features_by_bin_coverage_masks_pairs_with_sparse_bins() -> None:
-    """Coverage filter should keep only feature pairs with both bins well covered."""
+    """Фильтр покрытия оставляет только пары бинов с достаточным покрытием."""
     bin_ids = ["b0", "b1", "b2"]
-    # Features correspond to pairs: (0,1), (0,2), (1,2)
+    # Признаки соответствуют парам: (0,1), (0,2), (1,2)
     feat_a = np.array([[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]], dtype=float)
     feat_b = np.array([[0.5, 0.6, 0.7]], dtype=float)
 
@@ -143,7 +143,7 @@ def test_group_comparison_reports_effect_size_and_respects_pair_mask() -> None:
     """group_comparison must expose effect size and align bin labels with filtered pairs."""
     features_a = np.array([[0.1, 0.9], [0.2, 1.0]], dtype=float)
     features_b = np.array([[0.3, 1.1], [0.4, 1.2]], dtype=float)
-    # For 3 bins, pairs are: (b0,b1), (b0,b2), (b1,b2)
+    # Для 3 бинов пары: (b0,b1), (b0,b2), (b1,b2)
     bin_ids = ["b0", "b1", "b2"]
     pair_mask = np.array([True, False, True], dtype=bool)
 

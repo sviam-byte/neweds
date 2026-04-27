@@ -1,4 +1,4 @@
-"""Architecture boundary tests for the public package surface."""
+"""Тесты граничных условий публичного API."""
 
 from __future__ import annotations
 

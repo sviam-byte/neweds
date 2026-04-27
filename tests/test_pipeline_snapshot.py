@@ -1,8 +1,7 @@
-"""Numerical snapshot regression test for ``run_analysis``.
+"""Снэпшот-регрессия для run_analysis.
 
-Locks down the matrix produced by the public pipeline on a small deterministic
-input. If a refactor changes any numerical result, this test fails loudly so the
-change can be reviewed deliberately.
+Фиксирует матрицу публичного pipeline на детерминированных данных.
+Любое изменение числовых результатов — явный сигнал для ревью.
 """
 
 from __future__ import annotations
@@ -38,8 +37,7 @@ def test_correlation_full_snapshot(tmp_path) -> None:
     np.testing.assert_allclose(np.diag(matrix), 1.0, atol=1e-9)
     np.testing.assert_allclose(matrix, matrix.T, atol=1e-9)
 
-    # Lock in the off-diagonal values to two significant digits — tight enough
-    # to catch real regressions, loose enough to absorb BLAS-level fluctuation.
+    # Фиксируем внедиагональные значения с точностью 2 знаков — улавливает регрессии, терпит BLAS-флуктуации.
     expected_xy = matrix[0, 1]
     expected_xz = matrix[0, 2]
     expected_yz = matrix[1, 2]

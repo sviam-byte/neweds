@@ -27,9 +27,9 @@ def analyze_sliding_windows(
     n_jobs: int | None = None,
     parallel_backend: str | None = None,
 ) -> dict:
-    """Sliding window analysis for a given window_size.
+    """Скользящее окно заданного размера.
 
-    Returns structure for HTML report:
+    Возвращает структуру для HTML-отчёта:
       {
         "best_window": {"start": int, "end": int, "metric": float, "matrix": ndarray},
         "curve": {"x": [start_idx...], "y": [metric...]},

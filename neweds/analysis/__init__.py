@@ -1,4 +1,4 @@
-"""Analysis package."""
+"""Пакет анализа."""
 
 from . import dimred, stats
 

@@ -38,7 +38,7 @@ def build_run_summary_ru(tool, *, run_dir: str | None = None) -> str:
     has_coords = getattr(tool, "coords_df", None) is not None
     lines.append(f"- координаты (x,y,z): {_fmt_bool(has_coords)}")
 
-    # Spatial binning
+    # Пространственная бинизация
     sb = notes.get("spatial_bin_report")
     if isinstance(sb, dict):
         lines.append("Spatial binning")

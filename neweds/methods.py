@@ -1,11 +1,7 @@
-"""Compatibility facade for connectivity method metadata.
+"""Фасад совместимости: исторические имена STABLE_METHODS, METHOD_INFO и др.
 
-The central source of truth is ``neweds.metrics.registry``. This module keeps
-the historical names (``STABLE_METHODS``, ``METHOD_INFO`` and friends) for code
-that imports them from ``neweds.methods`` or ``neweds.config``.
-
-Все таблицы вычисляются лениво через ``__getattr__``, чтобы ``import neweds``
-не триггерил ``ensure_builtins()`` (который тянет statsmodels/scipy.signal).
+Источник истины — neweds.metrics.registry; здесь — ленивые re-exports через __getattr__,
+чтобы ``import neweds`` не тянул statsmodels/scipy.signal.
 """
 
 from __future__ import annotations
@@ -54,7 +50,7 @@ def __getattr__(name: str) -> Any:
 
 
 def is_pvalue_method(variant: str) -> bool:
-    """Return True if ``variant`` produces p-values rather than effect sizes."""
+    """True, если метрика возвращает p-значения, а не effect size."""
     from neweds.metrics.registry import get_metric
 
     try:
@@ -64,7 +60,7 @@ def is_pvalue_method(variant: str) -> bool:
 
 
 def is_directed_method(variant: str) -> bool:
-    """Return True if ``variant`` is direction-sensitive."""
+    """True, если метрика учитывает направление."""
     from neweds.metrics.registry import get_metric
 
     try:
@@ -74,7 +70,7 @@ def is_directed_method(variant: str) -> bool:
 
 
 def is_control_sensitive_method(variant: str) -> bool:
-    """Return True if ``variant`` accepts explicit control variables."""
+    """True, если метрика принимает контрольные переменные."""
     from neweds.metrics.registry import get_metric
 
     try:

@@ -264,7 +264,7 @@ def additional_preprocessing(
             cols_to_drop.append(col)
             continue
 
-        # Legacy-логика: для классических табличных данных можно отсекать
+        # Историческая логика: для классических табличных данных можно отсекать
         # почти-константные признаки по доле уникальных значений.
         if not skip_unique_filter:
             uniq_ratio = float(pd.Series(finite_vals).nunique(dropna=True)) / max(1, n_finite)

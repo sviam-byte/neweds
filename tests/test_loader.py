@@ -1,4 +1,4 @@
-"""Tests for CSV loading behavior with and without headers."""
+"""Тесты загрузки CSV с заголовком и без."""
 
 from pathlib import Path
 
@@ -7,7 +7,7 @@ from neweds.core.data_loader import read_input_table
 
 
 def test_read_input_table_with_header(tmp_path: Path) -> None:
-    """Header row should be detected in auto mode for typical CSV files."""
+    """В режиме auto заголовок должен автоматически определяться."""
     csv_path = tmp_path / "with_header.csv"
     csv_path.write_text("time,a,b\n1,10,20\n2,11,21\n", encoding="utf-8")
     df = read_input_table(str(csv_path), header="auto")
@@ -16,7 +16,7 @@ def test_read_input_table_with_header(tmp_path: Path) -> None:
 
 
 def test_read_input_table_without_header(tmp_path: Path) -> None:
-    """No-header mode should auto-generate column names c1..cn."""
+    """Без заголовка должны генерироваться имена c1..cn."""
     csv_path = tmp_path / "no_header.csv"
     csv_path.write_text("1,10,20\n2,11,21\n", encoding="utf-8")
     df = read_input_table(str(csv_path), header="no")
@@ -25,7 +25,7 @@ def test_read_input_table_without_header(tmp_path: Path) -> None:
 
 
 def test_read_input_table_csv_usecols_limits_columns(tmp_path: Path) -> None:
-    """CSV reader should honor explicit usecols to avoid loading all columns."""
+    """usecols должен ограничивать загружаемые столбцы."""
     csv_path = tmp_path / "wide.csv"
     csv_path.write_text("1,2,3,4\n5,6,7,8\n", encoding="utf-8")
 
@@ -36,7 +36,7 @@ def test_read_input_table_csv_usecols_limits_columns(tmp_path: Path) -> None:
 
 
 def test_load_or_generate_csv_auto_cap_by_feature_limit(tmp_path: Path) -> None:
-    """Wide CSV should be capped before full read when feature_limit is configured."""
+    """Широкий CSV должен ограничиваться feature_limit до полной загрузки."""
     csv_path = tmp_path / "very_wide.csv"
     csv_path.write_text("1,2,3,4,5,6\n7,8,9,10,11,12\n", encoding="utf-8")
 
@@ -76,7 +76,7 @@ def test_load_mat_numeric_matrix(tmp_path):
 
 
 def test_read_input_table_mat_nested(tmp_path):
-    """Nested MAT structs should be traversed and best numeric matrix selected."""
+    """Вложенные MAT-структуры должны обходиться до нахождения числовой матрицы."""
     import numpy as np
     from scipy.io import savemat
 
@@ -112,7 +112,7 @@ def test_load_h5_defaults_to_spatial_bins(tmp_path):
 
 
 def test_load_h5_can_save_and_reuse_aggregated_h5(tmp_path):
-    """Loader should persist aggregated H5 and reuse it on subsequent runs."""
+    """Загрузчик должен сохранять агрегированный H5 и переиспользовать его при повторном запуске."""
     import h5py
     import numpy as np
 
@@ -162,7 +162,7 @@ def test_load_h5_can_save_and_reuse_aggregated_h5(tmp_path):
 
 
 def test_streaming_csv_voxel_wide_spatial_binning(tmp_path: Path) -> None:
-    """Large-CSV path should support streaming deterministic spatial binning."""
+    """Потоковый CSV должен поддерживать детерминированную пространственную бинизацию."""
     csv_path = tmp_path / "vox.csv"
     csv_path.write_text(
         "x,y,z,t0,t1\n55,0,0,1,3\n56,0,0,2,4\n57,0,0,6,8\n",
@@ -189,7 +189,7 @@ def test_streaming_csv_voxel_wide_spatial_binning(tmp_path: Path) -> None:
 
 
 def test_streaming_csv_bin_names_are_stable_with_missing_voxels(tmp_path: Path) -> None:
-    """Same voxel coordinates should map to the same bin names across files."""
+    """Одинаковые координаты вокселей должны давать одни имена бинов в разных файлах."""
     a = tmp_path / "a.csv"
     b = tmp_path / "b.csv"
     a.write_text(
@@ -229,7 +229,7 @@ def test_streaming_csv_bin_names_are_stable_with_missing_voxels(tmp_path: Path) 
 
 
 def test_streaming_csv_fixed_range_keeps_empty_bins_as_nan(tmp_path: Path) -> None:
-    """Fixed range should preserve empty bins so alignment stays deterministic."""
+    """Фиксированный диапазон должен сохранять пустые бины для детерминированного выравнивания."""
     csv_path = tmp_path / "fixed_range.csv"
     csv_path.write_text(
         "x,y,z,t0,t1\n0,0,0,1,2\n",

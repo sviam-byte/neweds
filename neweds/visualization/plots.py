@@ -1,4 +1,4 @@
-"""Visualization helpers for connectivity matrices."""
+"""Визуализация матриц связности."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def plot_heatmap(
     vmin=None,
     vmax=None,
 ) -> BytesIO:
-    """Generate a heatmap image and return it as an in-memory PNG buffer."""
+    """Тепловая карта матрицы — PNG в памяти."""
     n = (
         matrix.shape[0]
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2
@@ -94,7 +94,7 @@ def plot_connectome(
     invert_threshold: bool = False,
     legend_text: str = "",
 ) -> BytesIO:
-    """Generate a connectome graph for a connectivity matrix and return PNG buffer."""
+    """Граф связности (connectome) — PNG в памяти."""
     if matrix is None or not isinstance(matrix, np.ndarray) or matrix.ndim != 2 or matrix.size == 0:
         fig, ax = plt.subplots(figsize=(4, 4))
         ax.text(

@@ -123,7 +123,7 @@ COVERAGE_CONFOUND_THRESHOLD = 0.4
 
 
 class GroupLoadResult(dict[str, pd.DataFrame]):
-    """Mapping of subject id to data plus explicit skipped-subject metadata."""
+    """Данные субъектов + метаданные о пропущенных."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -579,9 +579,9 @@ def _mannwhitneyu_vectorized(
 
 
 def _fdr_bh(p_values: np.ndarray, alpha: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
-    """Benjamini-Hochberg FDR correction.
+    """FDR-коррекция Бенджамини-Хохберга.
 
-    Returns:
+    Возвращает:
         p_fdr: скорректированные p-значения
         significant: bool-маска (p_fdr <= alpha)
     """
@@ -872,7 +872,7 @@ def run_group_pipeline(
     return {
         "n_case": len(dfs_schiz),
         "n_control": len(dfs_healthy),
-        # Backward-compat keys (старые пользователи).
+        # Ключи для обратной совместимости (старые пользователи).
         "n_schiz": len(dfs_schiz),
         "n_healthy": len(dfs_healthy),
         "n_canonical_bins": space.n_voxels,

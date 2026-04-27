@@ -1,4 +1,4 @@
-"""Ordinal-pattern metrics: Bandt-Pompe permutation MI."""
+"""Порядковые метрики: перестановочная взаимная информация (Bandt-Pompe)."""
 
 from __future__ import annotations
 

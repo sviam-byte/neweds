@@ -1,4 +1,4 @@
-"""Reporting package for HTML and Excel output generators."""
+"""Пакет генерации отчётов (HTML, Excel)."""
 
 from .excel_writer import ExcelReportWriter, write_excel_report
 from .html_generator import HTMLReportGenerator, write_html_report

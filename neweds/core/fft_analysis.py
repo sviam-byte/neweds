@@ -17,7 +17,7 @@ from .statistics import as_float64_1d
 
 
 def fft_analysis(series: pd.Series, *, fs: float = 1.0):
-    """FFT analysis returning (freqs, amplitude, phase, peak_indices)."""
+    """FFT: возвращает (freqs, amplitude, phase, peak_indices)."""
     arr = as_float64_1d(series.dropna().values)
     if arr.size == 0:
         return np.array([]), np.array([]), np.array([]), np.array([])
@@ -36,7 +36,7 @@ def fft_analysis(series: pd.Series, *, fs: float = 1.0):
 
 
 def frequency_analysis(series: pd.Series, peak_height_ratio: float = 0.2, *, fs: float = 1.0):
-    """Return (peak_freqs, peak_amplitudes, periods) or (None, None, None)."""
+    """Пиковые частоты, амплитуды, периоды; (None, None, None) если пиков нет."""
     freqs, amplitude, phase, peaks = fft_analysis(series, fs=fs)
     if freqs.size == 0 or peaks.size == 0:
         return None, None, None
@@ -54,7 +54,7 @@ def plot_coherence_vs_frequency(
     fs: float = 1.0,
     nperseg: int | None = None,
 ) -> BytesIO:
-    """Plot coherence as a function of frequency for two series."""
+    """Когерентность двух рядов по частоте — PNG в памяти."""
     s1 = as_float64_1d(series1.dropna().values)
     s2 = as_float64_1d(series2.dropna().values)
     n = int(min(s1.size, s2.size))

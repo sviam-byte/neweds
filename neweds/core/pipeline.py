@@ -1,4 +1,4 @@
-"""Public analysis pipeline."""
+"""Публичный pipeline анализа связности."""
 
 from __future__ import annotations
 
@@ -240,7 +240,7 @@ def run_analysis(
     *,
     controls: list[str] | None = None,
 ) -> AnalysisResult:
-    """Run the public analysis pipeline."""
+    """Запускает публичный pipeline анализа."""
 
     data, preprocess_report = _load_data(str(input_path), config)
     if config.auto_difference:

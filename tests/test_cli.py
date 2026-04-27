@@ -1,4 +1,4 @@
-"""Tests for the public CLI helpers."""
+"""Тесты публичного CLI."""
 
 from __future__ import annotations
 

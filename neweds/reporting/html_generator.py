@@ -1,4 +1,4 @@
-"""HTML report generator for the public ``AnalysisResult`` contract."""
+"""Генератор HTML-отчёта для AnalysisResult."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def write_html_report(
     filename: str = "report.html",
     **kwargs,
 ) -> str:
-    """Write the HTML report for an :class:`AnalysisResult` to ``out_dir``."""
+    """Записывает HTML-отчёт для AnalysisResult в out_dir."""
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -37,7 +37,7 @@ def write_html_report(
 
 @dataclass(slots=True)
 class HTMLReportGenerator:
-    """Render an HTML report from a :class:`ReportAdapter`-shaped object."""
+    """Рендерит HTML-отчёт из объекта типа ReportAdapter."""
 
     tool: object
 
@@ -70,7 +70,7 @@ class HTMLReportGenerator:
         return self._b64_png(plots.plot_window_cube_3d(points, title))
 
     def _resolve_report_dataframe(self):
-        """Resolve the single honest analysis dataframe for the HTML report."""
+        """Возвращает единственный честный датафрейм для HTML-отчёта."""
         candidates = []
         for layer_name in ["analysis_data", "data"]:
             df = getattr(self.tool, layer_name, None)
@@ -632,7 +632,6 @@ class HTMLReportGenerator:
 
             prep_lines = []
             p0 = prep.get("preprocess") or {}
-            # Spatial binning report
             try:
                 _p0_notes = p0.get("notes") or {}
                 _sb_html = _p0_notes.get("spatial_bin_report")

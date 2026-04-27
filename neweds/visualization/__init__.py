@@ -1,4 +1,4 @@
-"""Visualization package."""
+"""Пакет визуализации."""
 
 from . import plots
 

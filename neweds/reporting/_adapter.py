@@ -1,10 +1,7 @@
-"""Internal adapter that exposes ``AnalysisResult`` to the existing reporting code.
+"""Адаптер AnalysisResult для генераторов отчётов.
 
-The HTML and Excel writers were originally driven by the legacy ``BigMasterTool``.
-After legacy removal they consume the modern :class:`AnalysisResult` contract
-through this thin duck-typed adapter. The adapter exposes one honest data layer,
-``analysis_data``, instead of pretending that unavailable raw/normalized stages
-are distinct.
+HTML/Excel-генераторы исходно работали с legacy BigMasterTool; этот тонкий
+duck-typed слой подаёт им современный AnalysisResult без изменения генераторов.
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ class _LogShim:
 
 
 class ReportAdapter:
-    """Duck-typed view of :class:`AnalysisResult` for the report writers."""
+    """Duck-typed обёртка AnalysisResult для генераторов отчётов."""
 
     def __init__(self, result: AnalysisResult) -> None:
         self.result = result

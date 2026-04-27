@@ -1,9 +1,7 @@
-"""Ground-truth correctness tests for the public metric registry.
+"""Тесты корректности метрик на синтетических данных с известным ground truth.
 
-Each test constructs a synthetic signal where the *true* connectivity is known,
-runs the metric, and asserts the matrix has the expected qualitative shape.
-The tolerances are loose enough to absorb small numerical noise but tight
-enough to catch sign flips, dropped lags or accidental matrix transposition.
+Допуски достаточно широки для численного шума, но ловят смену знака,
+потерянный лаг и случайное транспонирование матрицы.
 """
 
 from __future__ import annotations
@@ -52,10 +50,7 @@ def test_correlation_independent_is_near_zero() -> None:
 
 def test_correlation_strong_when_signals_share_a_lag() -> None:
     matrix = compute_metric(_lagged_copy(), "correlation_full", lag=1)
-    # Pearson correlation between a series and its 1-step lag is high (≈ alpha=1).
-    # With lag=1 the metric still reads the contemporaneous value, which has
-    # high correlation since y(t) = x(t-1) ~ Pearson(x, y) ≈ 0.0 — but the
-    # *directed* lagged variant should expose it. Use that instead.
+    # Pearson для полного лага не выявит связь y(t)=x(t-1) — нужна directed-версия.
     matrix = compute_metric(_lagged_copy(), "correlation_directed", lag=1)
     assert matrix[0, 1] > 0.8, f"x -> y correlation expected high, got {matrix[0, 1]}"
 
@@ -63,7 +58,7 @@ def test_correlation_strong_when_signals_share_a_lag() -> None:
 def test_directed_correlation_recovers_var1_direction() -> None:
     df = _coupled_var1(alpha=0.7)
     matrix = compute_metric(df, "correlation_directed", lag=1)
-    # x drives y at lag 1, so the (x -> y) entry should dominate (y -> x).
+    # x ведёт y с лагом 1 → (x→y) должно быть больше (y→x).
     assert matrix[0, 1] > matrix[1, 0], (
         f"expected x->y > y->x, got {matrix[0, 1]:.3f} vs {matrix[1, 0]:.3f}"
     )
