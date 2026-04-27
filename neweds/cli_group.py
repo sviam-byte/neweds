@@ -110,7 +110,12 @@ def main() -> None:
         stream=sys.stderr,
     )
 
-    from neweds.core.group_pipeline import run_group_pipeline
+    from neweds.core.group_pipeline import (
+        GROUP_PIPELINE_EXPERIMENTAL_NOTICE,
+        run_group_pipeline,
+    )
+
+    print(GROUP_PIPELINE_EXPERIMENTAL_NOTICE, file=sys.stderr)
 
     try:
         summary = run_group_pipeline(

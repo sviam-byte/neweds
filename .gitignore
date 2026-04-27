@@ -36,3 +36,6 @@ interfaces/TimeSeriesAnalysis/
 data/
 raw_data/
 derivatives/
+
+# Claude Code persistent memory (local context, not source)
+memory/

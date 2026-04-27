@@ -13,17 +13,28 @@ except ImportError:  # pragma: no cover - optional dependency path
     compute_Hc = None
 from scipy.fft import fft
 from scipy.signal import find_peaks
-from statsmodels.tsa.stattools import adfuller
 
-try:
-    from statsmodels.stats.diagnostic import acorr_ljungbox
-except Exception:  # pragma: no cover - optional dependency path
-    acorr_ljungbox = None
+# statsmodels — тяжёлый импорт. Тянем лениво внутри функций, чтобы
+# ``import neweds`` не подтягивал ARIMA/VAR/diagnostic-модули заранее.
 
 try:
     import nolds
 except ImportError:  # pragma: no cover - optional dependency path
     nolds = None
+
+
+def _adfuller():
+    from statsmodels.tsa.stattools import adfuller as _f
+
+    return _f
+
+
+def _acorr_ljungbox():
+    try:
+        from statsmodels.stats.diagnostic import acorr_ljungbox as _f
+    except Exception:  # pragma: no cover - optional dependency path
+        return None
+    return _f
 
 
 def _coerce_1d_numeric(series_like) -> np.ndarray:
@@ -67,7 +78,7 @@ def test_stationarity(series: pd.Series) -> tuple[float | None, float | None]:
         return None, None
 
     try:
-        res = adfuller(arr, autolag="AIC")
+        res = _adfuller()(arr, autolag="AIC")
         return float(res[0]), float(res[1])
     except Exception as exc:
         logging.debug("ADF skipped/failed: %s", exc)
@@ -508,9 +519,10 @@ def autocorr_summary(series: pd.Series, *, max_lag: int | None = None) -> dict:
 
     lb_p = None
     lb_lags = int(max(1, min(n // 5, 20)))
-    if acorr_ljungbox is not None and n >= max(12, 3 * lb_lags):
+    _lb = _acorr_ljungbox()
+    if _lb is not None and n >= max(12, 3 * lb_lags):
         try:
-            res = acorr_ljungbox(x, lags=[lb_lags], return_df=True)
+            res = _lb(x, lags=[lb_lags], return_df=True)
             pv = float(res["lb_pvalue"].iloc[0])
             lb_p = pv if np.isfinite(pv) else None
         except Exception:

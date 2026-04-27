@@ -72,6 +72,11 @@ def run_one_analysis(
     p_alpha: float = 0.05,
     write_html: bool = True,
     write_excel: bool = True,
+    preprocess: bool = True,
+    fill_missing: bool = True,
+    normalize: bool = True,
+    remove_outliers: bool = True,
+    ar_order: int = 0,
 ) -> dict[str, str]:
     """Прогоняет анализ для одного файла и возвращает строку манифеста."""
 
@@ -82,6 +87,11 @@ def run_one_analysis(
         graph_threshold=float(graph_threshold),
         variants=list(variants),
         controls=list(controls) if controls else None,
+        preprocess=bool(preprocess),
+        fill_missing=bool(fill_missing),
+        normalize=bool(normalize),
+        remove_outliers=bool(remove_outliers),
+        ar_order=int(ar_order),
     )
     result = run_analysis(input_file, cfg, controls=list(controls) if controls else None)
 
@@ -126,6 +136,11 @@ def run_batch(
     write_html: bool = True,
     write_excel: bool = True,
     create_zip: bool = False,
+    preprocess: bool = True,
+    fill_missing: bool = True,
+    normalize: bool = True,
+    remove_outliers: bool = True,
+    ar_order: int = 0,
 ) -> tuple[list[dict[str, str]], str, str | None]:
     """Прогоняет анализ для каждого поддерживаемого файла в каталоге и пишет манифест."""
 
@@ -149,6 +164,11 @@ def run_batch(
                     p_alpha=p_alpha,
                     write_html=write_html,
                     write_excel=write_excel,
+                    preprocess=preprocess,
+                    fill_missing=fill_missing,
+                    normalize=normalize,
+                    remove_outliers=remove_outliers,
+                    ar_order=ar_order,
                 )
             )
         except Exception as exc:

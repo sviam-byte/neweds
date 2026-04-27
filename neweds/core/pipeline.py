@@ -165,6 +165,7 @@ def _select_lag(
 def _load_data(input_path: str, config: AnalysisConfig):
     ext = Path(str(input_path)).suffix.lower()
     h5_grid_size = int(config.spatial_grid_size) if ext in _HDF5_EXTS else None
+    ar_order = int(getattr(config, "ar_order", 0))
     return load_or_generate(
         str(input_path),
         time_col="none",
@@ -174,9 +175,12 @@ def _load_data(input_path: str, config: AnalysisConfig):
         spatial_grid_method=str(config.spatial_grid_method),
         lazy_spatial_bin=bool(config.lazy_spatial_bin),
         time_chunk=int(config.time_chunk),
-        preprocess=True,
-        normalize=True,
-        fill_missing=True,
+        preprocess=bool(getattr(config, "preprocess", True)),
+        normalize=bool(getattr(config, "normalize", True)),
+        fill_missing=bool(getattr(config, "fill_missing", True)),
+        remove_outliers=bool(getattr(config, "remove_outliers", True)),
+        remove_ar1=ar_order > 0,
+        remove_ar_order=max(1, ar_order),
         check_stationarity=False,
         return_report=True,
     )
@@ -298,6 +302,7 @@ def run_analysis(
             "preprocess_steps": preprocess_steps,
             "category": metric.category,
             "experimental": metric.experimental,
+            "partial_mode": str(getattr(metric, "partial_mode", "none")),
             "signal_columns": list(signal_columns),
             "control_columns": list(control_columns),
             "matrix_columns": list(signal_columns),
@@ -312,6 +317,7 @@ def run_analysis(
             preprocess_steps=preprocess_steps,
             controls=list(control_columns),
             control_strategy="provided" if control_columns else "none",
+            partial_mode=str(getattr(metric, "partial_mode", "none")),
             directed=metric.directed,
             directed_lag=used_lag,
             lag_selection=config.lag_selection,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from neweds.defaults import (
     DEFAULT_BINS,
@@ -35,6 +36,9 @@ class ComputationContract:
     preprocess_steps: list[str] = field(default_factory=list)
     controls: list[str] = field(default_factory=list)
     control_strategy: str = "none"
+    # Семантика частной метрики (см. registry.PartialMode):
+    # "none" | "precision_matrix" | "explicit_controls_residualization".
+    partial_mode: str = "none"
 
     directed: bool = False
     directed_lag: int = 1
@@ -60,6 +64,7 @@ class ComputationContract:
             "controls": {
                 "strategy": self.control_strategy,
                 "variables": list(self.controls),
+                "partial_mode": self.partial_mode,
             },
             "directed": {
                 "is_directed": self.directed,
@@ -84,6 +89,8 @@ class ComputationContract:
             f"Контроль: {self.control_strategy}"
             + (f" ({', '.join(self.controls)})" if self.controls else ""),
         ]
+        if self.partial_mode and self.partial_mode != "none":
+            lines.append(f"Partial-режим: {self.partial_mode}")
         if self.directed:
             lines.append(f"Направление: lag={self.directed_lag}, выбор={self.lag_selection}")
         if self.validity_warnings:
@@ -126,20 +133,41 @@ class AnalysisConfig:
     # Контрольные колонки для *_partial метрик.
     controls: list[str] | None = None
 
+    # ------------------------------------------------------------------
+    # Preprocessing — явные флаги, протягиваются в data_loader.load_or_generate.
+    # ------------------------------------------------------------------
+    preprocess: bool = True
+    fill_missing: bool = True
+    normalize: bool = True
+    remove_outliers: bool = True
+    # 0 = AR-detrend выключен; >0 = удалить AR(p)-структуру до анализа.
+    ar_order: int = 0
 
-# Реэкспорт: исторически из neweds.config импортировали и таблицы методов,
-# чтобы не ломать старый код, отдаём их и отсюда.
-from neweds.methods import (  # noqa: E402  (намеренный реэкспорт в конце модуля)
-    DIRECTED_METHODS,
-    EXPERIMENTAL_METHODS,
-    EXPERIMENTAL_METHODS_BASE,
-    METHOD_INFO,
-    PVAL_METHODS,
-    STABLE_METHODS,
-    is_control_sensitive_method,
-    is_directed_method,
-    is_pvalue_method,
-)
+
+# Реэкспорт: исторически из neweds.config импортировали и таблицы методов.
+# Делаем это лениво, чтобы ``import neweds.config`` не триггерил ensure_builtins.
+_LAZY_FROM_METHODS = {
+    "DIRECTED_METHODS",
+    "EXPERIMENTAL_METHODS",
+    "EXPERIMENTAL_METHODS_BASE",
+    "METHOD_INFO",
+    "PVAL_METHODS",
+    "STABLE_METHODS",
+    "is_control_sensitive_method",
+    "is_directed_method",
+    "is_pvalue_method",
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_FROM_METHODS:
+        from neweds import methods
+
+        value = getattr(methods, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'neweds.config' has no attribute {name!r}")
+
 
 __all__ = [
     "AnalysisConfig",

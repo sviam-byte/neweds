@@ -42,6 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-excel", action="store_true")
     p.add_argument("--recursive", action="store_true")
     p.add_argument("--batch-zip", action="store_true")
+    # Preprocessing toggles — explicit, so users see what was applied.
+    p.add_argument("--no-preprocess", action="store_true", help="Полностью отключить препроцессинг.")
+    p.add_argument("--no-fill-missing", action="store_true", help="Не заполнять пропуски.")
+    p.add_argument("--no-normalize", action="store_true", help="Не нормализовать ряды.")
+    p.add_argument("--no-remove-outliers", action="store_true", help="Не удалять выбросы.")
+    p.add_argument(
+        "--ar-order",
+        type=int,
+        default=0,
+        help="AR-detrend порядка p (0 = выключено).",
+    )
     return p
 
 
@@ -61,6 +72,11 @@ def _run_one(input_path: str, out_dir: str, args: argparse.Namespace) -> dict[st
         p_alpha=float(args.p_alpha),
         write_html=not args.no_html,
         write_excel=not args.no_excel,
+        preprocess=not args.no_preprocess,
+        fill_missing=not args.no_fill_missing,
+        normalize=not args.no_normalize,
+        remove_outliers=not args.no_remove_outliers,
+        ar_order=int(args.ar_order),
     )
 
 
@@ -85,6 +101,11 @@ def main() -> None:
             write_html=not args.no_html,
             write_excel=not args.no_excel,
             create_zip=bool(args.batch_zip),
+            preprocess=not args.no_preprocess,
+            fill_missing=not args.no_fill_missing,
+            normalize=not args.no_normalize,
+            remove_outliers=not args.no_remove_outliers,
+            ar_order=int(args.ar_order),
         )
         if zip_path:
             print(f"ZIP: {zip_path}")

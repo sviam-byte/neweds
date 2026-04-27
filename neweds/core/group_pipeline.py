@@ -1,11 +1,18 @@
-"""Групповой pipeline: загрузка субъектов, canonical alignment, connectivity, сравнение групп."""
+"""Групповой pipeline: загрузка субъектов, canonical alignment, connectivity, сравнение групп.
+
+⚠️ EXPERIMENTAL: это baseline edge-wise сравнение (Mann-Whitney U + Benjamini-Hochberg FDR).
+covariate-aware GLM, permutation tests, site-aware design — на дорожной карте, но пока нет.
+Не используйте результаты как финальную статистику для публикации.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -13,6 +20,97 @@ from scipy.stats import norm as _norm
 
 from .data_loader import load_or_generate
 from .voxel_space import CanonicalVoxelSpace
+
+GROUP_PIPELINE_EXPERIMENTAL_NOTICE = (
+    "[experimental] neweds-group is a baseline edge-wise group-comparison pipeline. "
+    "Covariate-aware GLM, permutation tests, and site-aware design are NOT yet implemented. "
+    "Treat outputs as exploratory."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class GroupComparisonResult:
+    """Структурированный результат группового сравнения.
+
+    Совместим с историческим dict-выводом ``run_group_pipeline`` через ``from_summary``
+    и ``as_dict``. ``run_group_pipeline`` пока возвращает dict ради обратной совместимости.
+    """
+
+    method: str
+    strategy: str
+    canonical_reference: str
+    n_case: int
+    n_control: int
+    n_canonical_bins: int
+    n_features: int
+    n_significant: int
+    pct_significant: float
+    alpha: float
+    output_dir: str
+    design_metadata: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    skipped_subjects: list[dict[str, str]] = field(default_factory=list)
+    missing_bins_diag_corr: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_summary(cls, summary: dict[str, Any]) -> GroupComparisonResult:
+        known = {
+            "method",
+            "strategy",
+            "canonical_reference",
+            "n_case",
+            "n_control",
+            "n_canonical_bins",
+            "n_features",
+            "n_significant",
+            "pct_significant",
+            "alpha",
+            "output_dir",
+            "design_metadata",
+            "warnings",
+            "skipped_subjects",
+            "missing_bins_diag_corr",
+        }
+        extra = {k: v for k, v in summary.items() if k not in known}
+        return cls(
+            method=str(summary.get("method", "")),
+            strategy=str(summary.get("strategy", "")),
+            canonical_reference=str(summary.get("canonical_reference", "")),
+            n_case=int(summary.get("n_case", summary.get("n_schiz", 0))),
+            n_control=int(summary.get("n_control", summary.get("n_healthy", 0))),
+            n_canonical_bins=int(summary.get("n_canonical_bins", 0)),
+            n_features=int(summary.get("n_features", 0)),
+            n_significant=int(summary.get("n_significant", 0)),
+            pct_significant=float(summary.get("pct_significant", 0.0)),
+            alpha=float(summary.get("alpha", 0.0)),
+            output_dir=str(summary.get("output_dir", "")),
+            design_metadata=dict(summary.get("design_metadata", {})),
+            warnings=list(summary.get("warnings", [])),
+            skipped_subjects=list(summary.get("skipped_subjects", [])),
+            missing_bins_diag_corr=summary.get("missing_bins_diag_corr"),
+            extra=extra,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "strategy": self.strategy,
+            "canonical_reference": self.canonical_reference,
+            "n_case": self.n_case,
+            "n_control": self.n_control,
+            "n_canonical_bins": self.n_canonical_bins,
+            "n_features": self.n_features,
+            "n_significant": self.n_significant,
+            "pct_significant": self.pct_significant,
+            "alpha": self.alpha,
+            "output_dir": self.output_dir,
+            "design_metadata": dict(self.design_metadata),
+            "warnings": list(self.warnings),
+            "skipped_subjects": list(self.skipped_subjects),
+            "missing_bins_diag_corr": self.missing_bins_diag_corr,
+            **self.extra,
+        }
 
 logger = logging.getLogger(__name__)
 
@@ -749,7 +847,32 @@ def run_group_pipeline(
 
     n_sig = int(results_df["significant"].sum())
     n_total = len(results_df)
+
+    warnings: list[str] = [GROUP_PIPELINE_EXPERIMENTAL_NOTICE]
+    if np.isfinite(missing_corr) and abs(missing_corr) >= COVERAGE_CONFOUND_THRESHOLD:
+        warnings.append(
+            f"coverage confound: |r(missing_bins, group)|={abs(missing_corr):.3f} "
+            f">= {COVERAGE_CONFOUND_THRESHOLD}"
+        )
+
+    design_metadata = {
+        "method": method,
+        "strategy": strategy,
+        "canonical_reference": ref,
+        "spatial_grid_size": int(spatial_grid_size),
+        "spatial_grid_method": str(spatial_grid_method),
+        "min_bin_coverage": float(min_bin_coverage),
+        "alpha": float(alpha),
+        "covariates": [],
+        "covariate_model": "none",
+        "stat_test": "mann_whitney_u",
+        "multiple_comparison": "fdr_bh",
+    }
+
     return {
+        "n_case": len(dfs_schiz),
+        "n_control": len(dfs_healthy),
+        # Backward-compat keys (старые пользователи).
         "n_schiz": len(dfs_schiz),
         "n_healthy": len(dfs_healthy),
         "n_canonical_bins": space.n_voxels,
@@ -770,4 +893,7 @@ def run_group_pipeline(
         ),
         "missing_bins_qc_path": str((out / "missing_bin_qc.csv").resolve()),
         "output_dir": str(out.resolve()),
+        "design_metadata": design_metadata,
+        "warnings": warnings,
+        "experimental": True,
     }

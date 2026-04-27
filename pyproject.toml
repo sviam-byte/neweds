@@ -86,7 +86,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011", "SIM117", "SIM115"]
 "neweds/__init__.py" = ["E402"]
-"neweds/config.py" = ["E402"]
+# F822: lazy module-level __getattr__ exposes names that are not defined in module scope.
+"neweds/config.py" = ["E402", "F822"]
+"neweds/methods.py" = ["F822"]
 "neweds/core/data_loader.py" = ["E402", "UP028"]
 "neweds/core/fft_analysis.py" = ["E402"]
 "neweds/core/variant_presets.py" = ["E402"]
