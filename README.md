@@ -1,230 +1,401 @@
 # NewEDS
 
-**NewEDS** — reproducible Python toolkit for connectivity analysis of multivariate time series and group fMRI comparisons.
+**NewEDS** — Python-пакет для анализа связности многомерных временных рядов. Проект рассчитан на исследовательские данные, в том числе fMRI-подобные временные ряды: он загружает данные, выполняет настраиваемый preprocessing, считает набор connectivity-метрик, сохраняет воспроизводимые контракты вычислений и формирует HTML/Excel-отчёты.
 
-The project demonstrates how a research prototype evolves into a layered, testable analytical pipeline with a strict public API: lazy plugin registry, structured result contracts, ground-truth tests, HTML/Excel reports, and an honest baseline group-comparison pipeline.
-
----
-
-## What is neweds?
-
-A reproducible Python package for analysis of multivariate time series and functional connectivity:
-
-- **input** — CSV / Excel / Parquet / MAT / HDF5 (single-file mode); CSV / Excel / Parquet directories (batch mode)
-- **preprocessing** — explicit, configurable: missing-value fill, normalization, outlier handling, AR-detrend
-- **connectivity metrics** — 24 metrics across correlation / information / causal / spectral / ordinal categories, registered via a plugin registry
-- **confound control** — explicit `controls` columns; metric metadata distinguishes precision-matrix partials from explicit-controls residualization
-- **reports** — HTML + Excel with the full computation contract attached
-- **group comparison** — baseline edge-wise pipeline (`neweds-group`), explicitly marked experimental
+Отдельно есть экспериментальный групповой пайплайн `neweds-group` для baseline-сравнения двух групп субъектов по edge-wise connectivity-признакам.
 
 ---
 
-## Why it exists
+## Что делает проект
 
-Connectivity research code typically grows into a monolith where everything imports everything. NewEDS keeps:
+Проект решает задачу:
 
-- a layered import graph (`import neweds` does not pull `statsmodels` until a Granger metric is requested)
-- structured, frozen result contracts (`AnalysisResult`, `MetricResult`, `ComputationContract`) so each number is paired with how it was produced
-- ground-truth tests (VAR(1), independent series, lagged copies) that check whether each metric actually does what it advertises
+> взять многоканальные временные ряды и посчитать, как связаны между собой каналы разными математическими способами.
+
+Типичный поток:
+
+```text
+таблица временных рядов
+→ загрузка данных
+→ preprocessing
+→ расчёт connectivity-метрик
+→ матрицы связности
+→ контракты вычислений
+→ HTML/Excel-отчёты
+```
+
+Если вход содержит `N` каналов, большинство метрик возвращает матрицу `N × N`, где элемент `[i, j]` описывает связь между каналами `i` и `j`. Для направленных метрик матрица может быть несимметричной: связь `i → j` не обязана совпадать со связью `j → i`.
+
+
+- Загрузка CSV, Excel, Parquet, MAT и HDF5-файлов.
+- Batch-режим для папок с CSV/Excel/Parquet.
+- Настраиваемый preprocessing: заполнение пропусков, нормализация, обработка выбросов, AR-detrend.
+- Набор connectivity-метрик: корреляционные, информационные, спектральные, ordinal и lag-based/направленные.
+- Plugin registry для метрик: каждая метрика имеет имя, категорию, описание и metadata-флаги.
+- Публичный Python API через `AnalysisConfig` и `run_analysis`.
+- CLI-интерфейс `neweds` для одиночного файла и batch-запуска.
+- HTML и Excel-отчёты.
+- `ComputationContract` для воспроизводимости: каждый результат хранит сведения о входе, preprocessing, controls, лаге, типе метрики и конфигурации.
+- Экспериментальный CLI `neweds-group` для сравнения двух групп субъектов.
 
 ---
 
-## Quickstart
+## Установка
+
+Требуется Python `>=3.11`.
+
+```bash
+pip install -e .
+```
+
+Для разработки и тестов:
 
 ```bash
 pip install -e ".[dev]"
-pytest
+```
 
-# single-file analysis
+Дополнительные зависимости для некоторых продвинутых методов:
+
+```bash
+pip install -e ".[advanced]"
+```
+
+---
+
+## Быстрый старт через CLI
+
+Запуск на демо-файле:
+
+```bash
 neweds examples/demo_timeseries.csv \
     --variants correlation_full,dcor_full,ordinal_full \
     --output-dir outputs/demo
-
-# baseline group comparison (experimental)
-neweds-group \
-    --case-dir examples/group/case \
-    --control-dir examples/group/control \
-    --output-dir outputs/group_demo \
-    --spatial-grid-size 10
 ```
 
-After the single-file run, `outputs/demo/` contains `report.html` and `report.xlsx`.
+После запуска в `outputs/demo/` появятся отчёты:
 
-Programmatic API:
+```text
+report.html
+report.xlsx
+```
+
+Пример с лаговыми метриками:
+
+```bash
+neweds examples/demo_timeseries.csv \
+    --variants correlation_directed,granger_full \
+    --lags 3 \
+    --lag-selection optimize \
+    --output-dir outputs/lagged_demo
+```
+
+Отключение отдельных шагов preprocessing:
+
+```bash
+neweds examples/demo_timeseries.csv \
+    --variants correlation_full,dcor_full \
+    --no-normalize \
+    --no-remove-outliers \
+    --output-dir outputs/no_norm_demo
+```
+
+Batch-запуск по папке:
+
+```bash
+neweds data/ \
+    --variants correlation_full,dcor_full,ordinal_full \
+    --recursive \
+    --batch-zip \
+    --output-dir outputs/batch
+```
+
+Batch-режим создаёт отдельную папку результата для каждого файла и общий `batch_manifest.csv`.
+
+--
+## Конфигурация анализа
+
+Настройки задаются через `AnalysisConfig`:
 
 ```python
-from neweds import AnalysisConfig, run_analysis
+from neweds import AnalysisConfig
 
-result = run_analysis(
-    "examples/demo_timeseries.csv",
-    AnalysisConfig(
-        variants=["correlation_full", "correlation_directed"],
-        max_lag=3,
-        lag_selection="optimize",
-        # explicit preprocessing — surfaces in ComputationContract.preprocess_steps
-        preprocess=True,
-        normalize=True,
-        fill_missing=True,
-        remove_outliers=True,
-        ar_order=0,
-    ),
+config = AnalysisConfig(
+    variants=["correlation_full", "correlation_partial", "granger_full"],
+    max_lag=3,
+    lag_selection="fixed",
+    pvalue_correction="none",
+    controls=["motion", "global_signal"],
+    preprocess=True,
+    fill_missing=True,
+    normalize=True,
+    remove_outliers=True,
+    ar_order=0,
 )
+```
 
-for name, metric in result.metrics.items():
-    print(name, metric.matrix.shape, "lag=", metric.lag)
-    print(metric.contract.summary_text())
+Ключевые параметры:
+
+- `variants` — список метрик, которые нужно посчитать.
+- `max_lag` — максимальный лаг для directed/lag-based метрик.
+- `lag_selection` — `fixed` или `optimize`.
+- `controls` — контрольные колонки для control-aware partial-метрик.
+- `preprocess` — общий флаг preprocessing.
+- `fill_missing` — заполнение пропусков.
+- `normalize` — нормализация временных рядов.
+- `remove_outliers` — обработка выбросов.
+- `ar_order` — AR-detrend порядка `p`; `0` означает, что AR-detrend выключен.
+- `pvalue_correction` — коррекция p-values, если метрика их возвращает.
+- `window_sizes`, `window_stride`, `window_policy` — настройки sliding-window анализа.
+
+---
+
+## Метрики
+
+Метрики регистрируются через plugin registry в `neweds.metrics.registry`. Каждая метрика хранит metadata:
+
+- `name` — имя метрики;
+- `category` — категория;
+- `description` — описание;
+- `directed` — направленная ли метрика;
+- `pvalue_based` — возвращает ли p-value-based результат;
+- `supports_control` — поддерживает ли control variables;
+- `experimental` — экспериментальный статус;
+- `stable` — стабильная метрика;
+- `partial_mode` — семантика partial-режима.
+
+Посмотреть доступные метрики можно так:
+
+```python
+from neweds.metrics import list_metrics
+
+for metric in list_metrics():
+    print(metric.name, metric.category, metric.directed, metric.experimental)
+```
+
+Основные группы метрик:
+
+```text
+correlation_full
+correlation_spearman
+correlation_kendall
+correlation_partial
+correlation_directed
+h2_full
+h2_partial
+h2_directed
+
+mutinf_full
+mutinf_partial
+dcor_full
+dcor_partial
+dcor_directed
+ah_full
+ah_partial
+ah_directed
+
+granger_full
+granger_partial
+te_full
+te_partial
+
+coherence_full
+coherence_partial
+
+ordinal_full
+ordinal_directed
+```
+## Controls и partial-метрики
+
+Контрольные колонки можно передать через Python API:
+
+```python
+config = AnalysisConfig(
+    variants=["correlation_partial", "dcor_partial"],
+    controls=["motion", "global_signal"],
+)
+```
+
+или через CLI:
+
+```bash
+neweds data.csv \
+    --variants correlation_partial,dcor_partial \
+    --controls motion,global_signal \
+    --output-dir outputs/partial
+```
+
+Важное различие:
+
+- `precision_matrix` — partial-метрика через обратную корреляционную матрицу, то есть условно “контроль остальных каналов”.
+- `explicit_controls_residualization` — метрика считается после регрессии пользовательских control-переменных.
+
+Фактический режим сохраняется в `MetricResult.contract.partial_mode` и metadata результата. Это нужно проверять при интерпретации, потому что слово `partial` в разных метриках означает не одно и то же.
+
+---
+
+## Форматы входных данных
+
+Одиночный запуск поддерживает:
+
+```text
+.csv
+.xlsx / .xls
+.parquet
+.mat
+.h5 / .hdf5 / .hdf
+```
+
+Batch-режим по папке поддерживает:
+
+```text
+.csv
+.xlsx / .xls
+.parquet
+```
+
+Для обычных табличных данных ожидается формат:
+
+```text
+time, channel_1, channel_2, channel_3, ...
+0,    ...
+1,    ...
+2,    ...
+```
+
+Колонка времени может быть частью таблицы, но в анализ должны попадать именно числовые signal columns. Control columns, если они указаны, отделяются от signal-блока и используются только теми метриками, которые поддерживают controls.
+
+HDF5/fMRI-подобные данные обрабатываются через spatial binning. Параметры пространственной агрегации задаются в `AnalysisConfig`:
+
+```python
+config = AnalysisConfig(
+    spatial_grid_size=10,
+    spatial_grid_method="mean",
+    lazy_spatial_bin=False,
+)
 ```
 
 ---
 
-## Architecture
+## Результаты
 
+Один запуск возвращает `AnalysisResult` и может сохранять файлы отчёта.
+
+В `AnalysisResult` есть:
+
+- `input_info` — информация о входных данных;
+- `config` — использованная конфигурация;
+- `metrics` — словарь `имя_метрики → MetricResult`;
+- `logs` — предупреждения и служебные сообщения;
+- `windows` — результаты sliding-window анализа, если он включён;
+- `artifacts` — пути к созданным артефактам.
+
+В `MetricResult` есть:
+
+- `matrix` — матрица связности;
+- `pvalues` — p-values, если применимо;
+- `labels` — имена каналов;
+- `method` — имя метрики;
+- `directed` — направленная ли матрица;
+- `lag` — использованный лаг;
+- `metadata` — дополнительные сведения;
+- `contract` — `ComputationContract`.
+
+`ComputationContract` нужен для воспроизводимости. Он фиксирует:
+
+- какая метрика считалась;
+- сколько было каналов и временных точек;
+- долю пропусков во входе;
+- какие preprocessing-шаги были применены;
+- какие controls использовались;
+- какой partial-mode был выбран;
+- directed/lag-настройки;
+- warnings;
+- форму результата;
+- seed и hash конфигурации.
+
+---
+
+## Групповое сравнение
+
+Для группового анализа есть отдельный CLI:
+
+```bash
+neweds-group \
+    --case-dir data/case \
+    --control-dir data/control \
+    --output-dir results/group \
+    --spatial-grid-size 10 \
+    --strategy intersection \
+    --alpha 0.05
 ```
+
+Текущий `neweds-group` делает:
+
+```text
+папка case
++ папка control
+→ загрузка субъектов
+→ построение canonical voxel space
+→ выравнивание субъектов
+→ расчёт connectivity-признаков
+→ Mann–Whitney U по каждому edge
+→ Benjamini–Hochberg FDR
+→ CSV-выводы
+```
+
+Основные выходные файлы:
+
+```text
+group_comparison.csv
+missing_bin_qc.csv
+top_significant_pairs.csv
+features_schiz.npy / features_healthy.npy, если сохранение признаков включено
+subject_ids_schiz.csv / subject_ids_healthy.csv
+```
+
+Несмотря на названия `schiz/healthy` внутри некоторых файлов и старых API-аргументов, внешний CLI уже использует более универсальные названия `case/control`. Это legacy-след конкретной исходной задачи HC/SZ.
+
+Групповой pipeline помечен как experimental. Его результаты подходят для разведочного анализа и инженерной демонстрации, но не должны использоваться как финальная публикационная статистика без расширения дизайна.
+
+---
+
+## Архитектура
+
+Упрощённая структура проекта:
+
+```text
 neweds/
-├── cli.py                    public CLI (time-series)
-├── cli_group.py              CLI for group fMRI comparison (experimental)
-├── config.py                 AnalysisConfig, ComputationContract
-├── methods.py                lazy facade over the metric registry
+├── cli.py                    CLI для одиночного и batch-анализа
+├── cli_group.py              CLI для группового сравнения
+├── config.py                 AnalysisConfig и ComputationContract
+├── methods.py                compatibility facade для старого API
 ├── core/
-│   ├── pipeline.py           run_analysis (public entry point)
-│   ├── batch_pipeline.py     batch mode + manifest + zip
-│   ├── group_pipeline.py     fMRI group-wise comparison + GroupComparisonResult
-│   ├── metric_runner.py      computation boundary → registry
-│   ├── results.py            AnalysisResult / MetricResult / WindowResult
-│   ├── data_loader.py        I/O orchestration (CSV / Excel / Parquet / MAT / HDF5)
-│   ├── preprocessing.py      normalization, missing fill, outliers
-│   ├── voxel_space.py        canonical voxel space for fMRI
-│   └── window_scanner.py     sliding-window scanning (joblib)
+│   ├── pipeline.py           run_analysis — главный публичный pipeline
+│   ├── batch_pipeline.py     batch-режим, manifest, zip
+│   ├── group_pipeline.py     экспериментальный group pipeline
+│   ├── metric_runner.py      граница между pipeline и registry метрик
+│   ├── results.py            AnalysisResult, MetricResult, WindowResult
+│   ├── data_loader.py        оркестрация загрузки данных
+│   ├── preprocessing.py      preprocessing временных рядов
+│   ├── voxel_space.py        canonical voxel space
+│   └── window_scanner.py     sliding-window анализ
 ├── metrics/
-│   ├── registry.py           plugin registry (decorator + dataclass + lazy bootstrap)
-│   ├── _shared.py            shared math utilities
-│   ├── correlation.py        Pearson / Spearman / Kendall / partial / lagged-directed / H²
-│   ├── information.py        KSG MI, distance correlation, Arnhold-H ratio
-│   ├── causal.py             Granger F-test, Transfer Entropy
-│   ├── spectral.py           coherence (full + partial)
-│   ├── ordinal.py            Bandt-Pompe permutation MI
-│   └── connectivity.py       backward-compat shim (re-exports)
-├── reporting/                HTML / Excel generators
-├── io/                       loaders (HDF5, user input)
-├── analysis/                 dimred / graph / stats helpers
-├── validation/               synthetic ground-truth scenarios
-└── visualization/            heatmap / connectome / FFT plots
+│   ├── registry.py           plugin registry метрик
+│   ├── correlation.py        корреляционные метрики
+│   ├── information.py        MI, dCor, AH
+│   ├── causal.py             Granger, transfer entropy
+│   ├── spectral.py           coherence
+│   └── ordinal.py            ordinal / permutation-pattern MI
+├── io/                       загрузчики и обработка пользовательского ввода
+├── reporting/                HTML, Excel и connectivity export
+├── analysis/                 вспомогательные graph/stats/dimred функции
+├── validation/               synthetic validation scenarios
+├── visualization/            графики
+└── tests/                    тесты
 ```
 
-Data flow:
 
-```
-CLI ─► run_analysis ─► load_or_generate ─► metric registry (lazy)
-                                               │
-                            ComputationContract │
-                                               ▼
-                                       AnalysisResult ─► HTML / Excel
-```
+- Directed metrics чувствительны к preprocessing. AR-detrend может подавлять lag-структуру, которую затем пытаются найти Granger/TE/directed-метрики.
+- Некоторые experimental-метрики вычислительно дорогие и должны проверяться на synthetic data перед содержательной интерпретацией.
+- Внутри проекта остаются compatibility-слои и legacy-имена, особенно в group pipeline (`schiz/healthy` рядом с `case/control`).
 
----
-
-## Supported metrics
-
-| Category    | Metrics                                                                         |
-| ----------- | ------------------------------------------------------------------------------- |
-| correlation | `correlation_full`, `correlation_spearman`, `correlation_kendall`, `correlation_partial`, `correlation_directed`, `h2_full`, `h2_partial`, `h2_directed` |
-| information | `mutinf_full`, `mutinf_partial`, `dcor_full`, `dcor_partial`, `dcor_directed`, `ah_full`, `ah_partial`, `ah_directed`, `te_full`, `te_partial` |
-| causal      | `granger_full`, `granger_partial`                                               |
-| spectral    | `coherence_full`, `coherence_partial`                                           |
-| ordinal     | `ordinal_full`, `ordinal_directed`                                              |
-
-Use `from neweds.metrics import list_metrics; list_metrics()` to inspect categories, descriptions, and flags (`directed`, `pvalue_based`, `supports_control`, `experimental`, `stable`, `partial_mode`).
-
-### Partial-mode semantics
-
-`*_partial` metrics carry a `partial_mode` field that disambiguates *what* "partial" means:
-
-- `precision_matrix` — `correlation_partial`, `h2_partial`. Conditioned on **all other variables** via the inverse correlation matrix (no explicit controls needed).
-- `explicit_controls_residualization` — `mutinf_partial`, `dcor_partial`, `coherence_partial`, `granger_partial`, `te_partial`, `ah_partial`. Each pair is computed on residuals after regressing out the user-provided `controls`.
-
-The chosen mode is stored in `MetricResult.contract.partial_mode` and in `MetricResult.metadata["partial_mode"]`, so downstream consumers can tell which interpretation applies.
-
----
-
-## Data formats
-
-- **single-file**: CSV, Excel, Parquet, MAT, HDF5 (`.h5`/`.hdf5`/`.hdf`); HDF5 is treated as 4D fMRI and reduced via spatial binning.
-- **directory batch**: CSV / Excel / Parquet only.
-- **group comparison**: subject-wise CSV / Excel / Parquet after spatial binning. HDF5 group input is **not** supported yet.
-
-CSV encoding is auto-probed (utf-8, utf-8-sig, cp1251, cp1252, latin1).
-
----
-
-## Controls / confounds
-
-Pass control columns either via `AnalysisConfig.controls=[...]` or via the `--controls` CLI flag. They are removed from the signal block before metric computation and made available to `*_partial` metrics that support `explicit_controls_residualization`.
-
-The active strategy and the resolved column list are recorded on every `ComputationContract`.
-
----
-
-## Group comparison (experimental)
-
-`neweds-group` performs an edge-wise Mann-Whitney U test on connectivity features extracted from a canonical voxel space, with Benjamini-Hochberg FDR correction.
-
-```bash
-neweds-group --case-dir data/case --control-dir data/control \
-             --output-dir results/group --spatial-grid-size 10
-```
-
-The CLI prints an explicit `[experimental]` notice on start. The returned summary contains `design_metadata`, `warnings`, and `experimental: True`. A typed `GroupComparisonResult` dataclass is available via `from neweds.core.group_pipeline import GroupComparisonResult; GroupComparisonResult.from_summary(summary)`.
-
----
-
-## Limitations
-
-- The group pipeline currently supports **baseline edge-wise comparison only** (Mann-Whitney + BH-FDR). Covariate-aware GLM, permutation tests, and site-aware design are on the roadmap, not implemented.
-- HDF5 group input is not supported by `neweds-group` (subject-wise CSV/Excel/Parquet only).
-- Several metrics (`mutinf_*`, `te_*`, `ah_*`, `dcor_directed`, `ordinal_directed`) are computationally expensive and marked `experimental`. They should be validated on synthetic data before drawing conclusions.
-- Directed metrics depend on careful preprocessing: enabling AR-detrend (`ar_order > 0`) can suppress lag structure that those metrics try to detect.
-- `correlation_partial` (precision-matrix variant) requires `n_rows > n_cols + 2`; otherwise it returns NaN and emits a warning.
-- Distance correlation falls back from O(N log N) (`dcor` package) to O(N²) with subsampling at N > 5000 — the result will note `_subsampled = True`.
-- `data_loader.py` is intentionally large (3000+ lines) — splitting it is on the roadmap for the next refactor.
-
----
-
-## Roadmap
-
-- Split `data_loader.py` into `io/tabular.py`, `io/mat.py`, `io/voxel.py`, `io/hdf5.py`.
-- Group pipeline v2: covariates, permutation GLM, site-aware design, effect sizes + confidence intervals.
-- Extended ground-truth scenarios (Lorenz, Rössler, NARMA).
-- Group `*_partial` metrics behind a unified control-aware framework.
-- Result export to Parquet/Arrow.
-
----
-
-## Key code locations for review
-
-- [neweds/metrics/registry.py](neweds/metrics/registry.py) — plugin registry with decorator support, `partial_mode` metadata, lazy `ensure_builtins()`.
-- [neweds/metrics/correlation.py](neweds/metrics/correlation.py), [information.py](neweds/metrics/information.py), [causal.py](neweds/metrics/causal.py), [spectral.py](neweds/metrics/spectral.py), [ordinal.py](neweds/metrics/ordinal.py) — per-category implementations.
-- [neweds/core/pipeline.py](neweds/core/pipeline.py) — public entry point; lag-selection via matrix scoring, builds `ComputationContract`.
-- [neweds/core/group_pipeline.py](neweds/core/group_pipeline.py) — group comparison + `GroupComparisonResult`.
-- [neweds/core/results.py](neweds/core/results.py) — structured result contracts.
-- [neweds/config.py](neweds/config.py) — `AnalysisConfig` (with explicit preprocessing flags), `ComputationContract`.
-- [tests/test_metric_ground_truth.py](tests/test_metric_ground_truth.py) — VAR(1) / independent / lagged-copy scenarios.
-- [tests/test_pipeline_snapshot.py](tests/test_pipeline_snapshot.py) — numerical regression of the public pipeline.
-- [tests/test_cli_integration.py](tests/test_cli_integration.py) — subprocess-level CLI smoke test.
-
----
-
-## Development
-
-```bash
-ruff check .
-ruff format --check .
-pytest --cov=neweds --cov-report=term-missing
-```
-
-CI ([.github/workflows/tests.yml](.github/workflows/tests.yml)) runs `ubuntu-latest × windows-latest × Python 3.11/3.12`.
-
----
-
-## License
-
-MIT.
