@@ -1,4 +1,4 @@
-"""I/O loaders for large datasets (including lazy HDF5 paths)."""
+"""Загрузчики больших датасетов, в т.ч. ленивая обработка HDF5 чанками по времени."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def load_h5_spatial_binned_lazy(
         data = f[dataset]
         if data.ndim != 4:
             raise ValueError(
-                f"load_h5_spatial_binned_lazy expects 4D dataset, got shape={data.shape}"
+                f"load_h5_spatial_binned_lazy ждёт 4D dataset, получил shape={data.shape}"
             )
 
         X, Y, Z, T = map(int, data.shape)

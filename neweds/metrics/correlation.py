@@ -1,6 +1,7 @@
-"""Correlation-family metrics: Pearson / Spearman / Kendall / partial / lagged-directed / H².
+"""Метрики семейства корреляций: Пирсон, Спирмен, Кендалл, частичная, лаговая, H².
 
-Всё в этом модуле — линейная или ранговая корреляция. Никаких statsmodels / scipy.signal.
+Всё в этом модуле — линейная или ранговая корреляция. Сюда сознательно не тащатся
+statsmodels и scipy.signal: импорт модуля остаётся лёгким.
 """
 
 from __future__ import annotations

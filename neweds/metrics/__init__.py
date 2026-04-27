@@ -1,8 +1,8 @@
-"""Connectivity metrics: registry + per-category implementations.
+"""Метрики связности: плагин-реестр + реализации по категориям.
 
-Регистрация метрик ленивая: ``import neweds`` (и ``import neweds.metrics``) сами по себе
-НЕ тянут statsmodels/scipy.signal. Тяжёлые импорты выполняются внутри
-``ensure_builtins()`` или при первом обращении к ``METRICS_REGISTRY[...]``.
+Регистрация метрик ленивая: сам по себе ``import neweds`` (и ``import neweds.metrics``)
+НЕ тянет statsmodels и scipy.signal. Тяжёлые импорты происходят внутри
+``ensure_builtins()`` либо при первом обращении к ``METRICS_REGISTRY[...]``.
 """
 
 from .registry import (

@@ -1,4 +1,4 @@
-"""Information-theoretic metrics: KSG mutual information, distance correlation, AH ratio."""
+"""Информационные метрики: взаимная информация (KSG), distance correlation, AH-ratio."""
 
 from __future__ import annotations
 
@@ -21,12 +21,16 @@ from ._shared import (
 from .registry import register_metric
 
 # ---------------------------------------------------------------------------
-# KSG mutual information
+# Взаимная информация (KSG kNN-оценка)
 # ---------------------------------------------------------------------------
 
 
 def _neighbor_counts_with_fallback(tree, points: np.ndarray, eps: np.ndarray) -> np.ndarray:
-    """Counts neighbors per-point under Chebyshev metric with SciPy-version fallback."""
+    """Считает число соседей для каждой точки в Chebyshev-метрике.
+
+    На старых версиях SciPy ``query_ball_point`` не принимает массив радиусов —
+    в этом случае откатываемся на поточечный вызов.
+    """
     try:
         neighbors = tree.query_ball_point(points, r=eps, p=np.inf)
         return np.array([max(0, len(lst) - 1) for lst in neighbors], dtype=float)
@@ -142,7 +146,9 @@ def mutual_info_matrix_partial(
     pairs: list[tuple[int, int]] | None = None,
     **extra: dict,
 ) -> np.ndarray:
-    """Partial MI."""
+    """Частичная взаимная информация: либо резидуализуем по ``control`` и считаем MI,
+    либо для каждой пары считаем условную MI при контроле остальных каналов.
+    """
     control_matrix = extra.get("control_matrix")
     if control_matrix is not None:
         sub = data.copy()
@@ -339,7 +345,7 @@ def _H_ratio_direction(
     m: int = DEFAULT_EMBED_DIM,
     tau: int = DEFAULT_EMBED_TAU,
 ) -> float | None:
-    """Return the AH nearest-neighbor ratio for one directed pair."""
+    """Возвращает Arnhold-H ratio (ближайших соседей) для одной направленной пары."""
     from scipy.spatial import cKDTree
 
     source_values = np.asarray(source, dtype=np.float64).reshape(-1)
@@ -405,7 +411,7 @@ def AH_matrix(
     pairs: list[tuple[int, int]] | None = None,
     **_: dict,
 ) -> np.ndarray:
-    """Compute directed Arnhold-H ratio connectivity."""
+    """Направленная связность через Arnhold-H ratio."""
 
     df = data.dropna(axis=0, how="any")
     n_cols = int(df.shape[1])
@@ -437,7 +443,7 @@ def compute_partial_AH_matrix(
     pairs: list[tuple[int, int]] | None = None,
     **extra: dict,
 ) -> np.ndarray:
-    """Compute AH after residualizing control effects or VAR residuals."""
+    """AH-ratio на остатках: либо после регрессии по контролям, либо после ``VAR(p)``-чистки."""
 
     df = data.dropna(axis=0, how="any")
     n_cols = int(df.shape[1])
@@ -466,7 +472,7 @@ def AH_matrix_directed(
     control: list[str] | None = None,
     **kwargs: dict,
 ) -> np.ndarray:
-    """Compatibility wrapper for the directed AH variant."""
+    """Обёртка совместимости для направленного варианта AH (с ``control`` или без)."""
     if control:
         return compute_partial_AH_matrix(data, lag=lag, control=control, **kwargs)
     return AH_matrix(data, lag=lag, control=control, **kwargs)

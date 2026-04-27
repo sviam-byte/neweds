@@ -1,4 +1,4 @@
-"""Spectral-family metrics: coherence (full + partial)."""
+"""Спектральные метрики: квадратичная когерентность и её частичная версия."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def coherence_matrix(
     pairs: list[tuple[int, int]] | None = None,
     **_: dict,
 ) -> np.ndarray:
-    """Mean magnitude-squared coherence через scipy.signal.coherence."""
+    """Средняя magnitude-squared coherence по парам каналов через ``scipy.signal.coherence``."""
     import scipy.signal as signal
 
     fs = fs if np.isfinite(fs) and fs > 0 else 1.0

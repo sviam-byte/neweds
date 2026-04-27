@@ -1,12 +1,15 @@
-"""Backward-compat shim: метрики разъехались по категорийным модулям.
+"""Совместимый прокси-модуль: реальные реализации живут в категорийных подмодулях.
 
-Старые импорты ``from neweds.metrics.connectivity import correlation_matrix`` и т.д.
+Старые импорты вида ``from neweds.metrics.connectivity import correlation_matrix``
 продолжают работать через реэкспорт из:
-- ``neweds.metrics.correlation``
-- ``neweds.metrics.spectral``
-- ``neweds.metrics.causal``
-- ``neweds.metrics.information``
-- ``neweds.metrics.ordinal``
+
+- :mod:`neweds.metrics.correlation`
+- :mod:`neweds.metrics.spectral`
+- :mod:`neweds.metrics.causal`
+- :mod:`neweds.metrics.information`
+- :mod:`neweds.metrics.ordinal`
+
+Новый код лучше импортировать напрямую из конкретного подмодуля.
 """
 
 from __future__ import annotations

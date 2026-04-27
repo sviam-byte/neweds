@@ -1,16 +1,18 @@
-"""Tabular file I/O: CSV/Excel encoding probing, header detection, voxel-wide streaming.
+"""I/O табличных форматов: CSV/Excel, автодетект кодировки, потоковая voxel-wide загрузка.
 
-Содержит:
-- ``CSV_ENCODING_CANDIDATES`` — список типовых кодировок Windows/UTF.
-- ``probe_csv_encoding`` / ``read_csv_with_encoding_fallback`` —
-  устойчивое чтение CSV даже когда файл не utf-8.
-- ``detect_header`` / ``maybe_split_single_column`` — heuristics для CSV
-  без явной шапки и для XLSX, где вся строка лежит в одной ячейке.
-- ``probe_csv_voxel_wide_layout`` / ``iter_csv_voxel_wide_chunks`` /
-  ``stream_csv_voxel_wide_to_timeseries`` — потоковая загрузка giant CSV
-  формата ``x, y, z, t0..tN`` с детерминированным spatial binning.
+Здесь живут:
 
-Никаких тяжёлых ML-зависимостей: только pandas, numpy, scipy.sparse.
+- ``CSV_ENCODING_CANDIDATES`` — список типовых кодировок Windows/UTF, по которым
+  делается перебор;
+- ``probe_csv_encoding`` / ``read_csv_with_encoding_fallback`` — устойчивое
+  чтение CSV даже когда файл не в UTF-8;
+- ``detect_header`` / ``maybe_split_single_column`` — эвристики для CSV без
+  явной шапки и для XLSX, в котором вся строка лежит в одной ячейке;
+- ``probe_csv_voxel_wide_layout``, ``iter_csv_voxel_wide_chunks``,
+  ``stream_csv_voxel_wide_to_timeseries`` — потоковая загрузка очень больших
+  CSV формата ``x, y, z, t0..tN`` с детерминированным пространственным биннингом.
+
+Ничего тяжёлого из ML тут нет: только pandas, numpy и scipy.sparse.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ CSV_ENCODING_CANDIDATES = ("utf-8", "utf-8-sig", "cp1251", "cp1252", "latin1")
 
 
 def looks_like_encoding_error(exc: Exception) -> bool:
+    """Проверяет, что исключение похоже на проблему с кодировкой CSV."""
     msg = str(exc).lower()
     return (
         isinstance(exc, UnicodeDecodeError)
@@ -40,11 +43,11 @@ def looks_like_encoding_error(exc: Exception) -> bool:
 
 
 def probe_csv_encoding(filepath: str, *, engine: str = "") -> str:
-    """Быстро подбирает рабочую кодировку CSV по первым строкам файла.
+    """Быстро подбирает рабочую кодировку CSV по первым 32 строкам файла.
 
-    Пытается прочитать небольшой префикс файла (32 строки) с типовыми
-    кодировками. Это позволяет избежать полного fallback-перебора на каждом
-    вызове ``read_csv`` в потоковом режиме.
+    Перебираем кандидатов из ``CSV_ENCODING_CANDIDATES`` и возвращаем первую,
+    с которой pandas смог прочитать префикс. Так в потоковом режиме мы не
+    повторяем тяжёлый fallback-перебор на каждом куске.
     """
     base_engine = str(engine or "").strip().lower()
     for enc in CSV_ENCODING_CANDIDATES:
@@ -68,12 +71,13 @@ def probe_csv_encoding(filepath: str, *, engine: str = "") -> str:
 
 
 def read_csv_with_encoding_fallback(filepath: str, **kw):
-    """Читает CSV/итератор CSV, перебирая частые кодировки Windows/UTF.
+    """Читает CSV (или итератор по чанкам) с перебором типовых кодировок.
 
-    Это нужно для giant voxel CSV, где один не-UTF8 байт ломал stream-path и
-    заставлял код сваливаться в regular loader с риском OOM.
+    Нужно для гигантских voxel-wide CSV, где один битый не-UTF-8 байт ломал
+    потоковую загрузку и заставлял всё проваливаться в обычный pandas-путь
+    с реальным риском OOM.
 
-    Если ``encoding`` уже передан, fallback-перебор не выполняется.
+    Если ``encoding`` уже передан явно — fallback-перебор не выполняется.
     """
     if "encoding" in kw:
         return pd.read_csv(filepath, **kw)
@@ -85,6 +89,8 @@ def read_csv_with_encoding_fallback(filepath: str, **kw):
     for enc in CSV_ENCODING_CANDIDATES:
         trial = dict(kw)
         trial["encoding"] = enc
+        # pyarrow стабильно работает только с UTF-8; для legacy-кодировок
+        # принудительно уходим на pandas C-engine.
         if base_engine == "pyarrow" and enc not in {"utf-8", "utf8", "utf-8-sig"}:
             trial["engine"] = "c"
         try:
@@ -105,13 +111,13 @@ def read_csv_with_encoding_fallback(filepath: str, **kw):
             b"",
             0,
             1,
-            f"Could not decode CSV with encodings {tried}: {last_exc}",
+            f"Не удалось распознать кодировку CSV из {tried}: {last_exc}",
         )
     return pd.read_csv(filepath, **kw)
 
 
 def csv_probe_ncols(filepath: str, *, nrows: int = 2) -> int:
-    """Быстрый probe числа колонок CSV без полной загрузки. 0 при ошибке."""
+    """Быстро узнаёт число колонок CSV без полной загрузки файла; 0 при ошибке."""
     try:
         probe = read_csv_with_encoding_fallback(filepath, header=None, nrows=nrows, low_memory=False)
         return int(probe.shape[1])
@@ -150,16 +156,19 @@ def detect_header(df_raw: pd.DataFrame) -> bool:
 
 
 def maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Поддержка формата: «CSV в ячейке».
+    """Разбирает «CSV внутри одной ячейки».
 
-    Встречается в XLSX, когда каждая строка лежит в одной ячейке и содержит
-    ``x,y,z,t0,t1,...`` (или ``;``/tab разделители). Также бывает вариант, когда
-    Excel разнёс 1-2 первых колонки, а остальное пустое.
+    Часто встречается в XLSX: вся строка лежит в одной ячейке как текст
+    ``x,y,z,t0,t1,...`` (с разделителями ``,``, ``;`` или табом). Бывает
+    и так, что Excel разнёс 1-2 первых поля по колонкам, а остальное в первом
+    столбце пустое — тогда тоже надо распарсить вручную.
     """
     try:
+        # Случай 1: ровно одна колонка, в ней строка с разделителями.
         if df_raw.shape[1] == 1 and isinstance(df_raw.iloc[0, 0], str):
             return df_raw[0].astype(str).str.split(r"[,;\t]", expand=True)
 
+        # Случай 2: первая колонка плотно заполнена, остальные почти пустые.
         if df_raw.shape[1] > 1:
             nonnull = df_raw.notna().mean(axis=0)
             if float(nonnull.iloc[0]) >= 0.8 and bool((nonnull.iloc[1:] <= 0.05).all()):
@@ -172,6 +181,8 @@ def maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
                         .str.split(r"[,;\t]", expand=True)
                     )
 
+        # Случай 3: «настоящая» колонка где-то правее. Ищем колонку, где
+        # большинство значений выглядят как строка с разделителями.
         if df_raw.shape[1] > 1:
             best_j = None
             best_score = 0.0
@@ -198,7 +209,11 @@ def maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def csv_choose_stream_engine(csv_engine: str = "auto") -> str:
-    """Выбирает движок CSV, совместимый с chunksize/итерацией."""
+    """Выбирает движок pandas для CSV, который совместим с ``chunksize``-итерацией.
+
+    pyarrow-движок не умеет в потоковый режим, поэтому для стриминга всегда
+    откатываемся на ``c`` (или ``python``, если явно попросили).
+    """
     eng = str(csv_engine or "auto").strip().lower()
     if eng in {"c", "python"}:
         return eng
@@ -211,7 +226,7 @@ def read_csv_probe_raw(
     nrows: int = 8,
     csv_engine: str = "auto",
 ) -> pd.DataFrame:
-    """Читает небольшой сырой probe CSV без полной загрузки файла."""
+    """Читает короткий «сырой» префикс CSV (без шапки) для дальнейшей детекции формата."""
     kw: dict[str, Any] = {"header": None, "nrows": int(nrows), "low_memory": False}
     kw["engine"] = csv_choose_stream_engine(csv_engine)
     return read_csv_with_encoding_fallback(filepath, **kw)
@@ -223,9 +238,9 @@ def probe_csv_voxel_wide_layout(
     header: str = "auto",
     csv_engine: str = "auto",
 ) -> dict[str, Any]:
-    """Пробует дешёво определить, что CSV имеет формат ``x, y, z, t0..tN``."""
+    """По первым строкам CSV пытается понять, что формат — ``x, y, z, t0..tN``."""
     if header not in {"auto", "yes", "no"}:
-        raise ValueError("header must be one of: auto|yes|no")
+        raise ValueError("header должен быть одним из: auto|yes|no")
 
     raw = read_csv_probe_raw(filepath, nrows=8, csv_engine=csv_engine)
     raw = maybe_split_single_column(raw)
@@ -265,10 +280,10 @@ def iter_csv_voxel_wide_chunks(
     _layout: dict[str, Any] | None = None,
     _encoding: str | None = None,
 ):
-    """Итератор по чанкам CSV для формата ``x, y, z, t0..tN``."""
+    """Возвращает итератор по чанкам CSV формата ``x, y, z, t0..tN``."""
     layout = _layout or probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
     if not bool(layout.get("is_voxel_wide")):
-        raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+        raise ValueError("CSV не в voxel-wide формате (ожидался x,y,z,t0..tN)")
 
     stream_engine = csv_choose_stream_engine(csv_engine)
     encoding = _encoding or probe_csv_encoding(filepath, engine=stream_engine)
@@ -300,24 +315,26 @@ def stream_csv_voxel_wide_to_timeseries(
     eps: float = 1e-12,
     min_voxels_per_bin: int = 1,
 ) -> pd.DataFrame:
-    """Потоковая загрузка giant CSV ``x, y, z, t0..tN`` → ``time × bins``.
+    """Потоково загружает огромный voxel-wide CSV (``x, y, z, t0..tN``) → ``time × bins``.
 
-    Режим ориентирован на локально-детерминированную биннизацию: bin каждого
-    вокселя зависит только от его координат и ``bin_size``. Для скорости
-    потоково поддерживаются только ``mean`` и ``sum``.
+    Биннинг локально-детерминирован: бин для каждого вокселя зависит только
+    от его координат и ``bin_size``. В стриминговом режиме сознательно
+    поддерживаем только ``mean`` и ``sum`` — для медианы пришлось бы хранить
+    все значения внутри бина в памяти.
     """
     layout = probe_csv_voxel_wide_layout(filepath, header=header, csv_engine=csv_engine)
     if not bool(layout.get("is_voxel_wide")):
-        raise ValueError("CSV is not in voxel-wide format x,y,z,t0..tN")
+        raise ValueError("CSV не в voxel-wide формате (ожидался x,y,z,t0..tN)")
 
+    # Кодировку определяем один раз на файл и переиспользуем во всех чанках.
     _stream_engine = csv_choose_stream_engine(csv_engine)
     _encoding = probe_csv_encoding(filepath, engine=_stream_engine)
 
     method_eff = str(spatial_bin_method or "mean").strip().lower()
     if method_eff not in {"mean", "sum"}:
         raise ValueError(
-            "Streaming CSV spatial binning currently supports only mean/sum; "
-            f"got method={spatial_bin_method!r}"
+            "Потоковый spatial binning поддерживает только mean/sum; "
+            f"получено method={spatial_bin_method!r}"
         )
     b = max(1, int(spatial_bin_size or 1))
     fixed_range = spatial_bin_range is not None

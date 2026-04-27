@@ -208,7 +208,7 @@ def remove_ar1(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return df, "remove_ar1 (prewhitening)"
 
 
-# Существующие функции (сохраняем обратную совместимость)
+# Дальше — исторические функции; имена сохраняем ради обратной совместимости.
 
 
 def additional_preprocessing(
@@ -316,7 +316,7 @@ def spatial_grid_bin_fmri(
     """
     arr = np.asarray(volume4d)
     if arr.ndim != 4:
-        raise ValueError(f"spatial_grid_bin_fmri expects 4D array, got shape={arr.shape}")
+        raise ValueError(f"spatial_grid_bin_fmri ждёт 4D массив, получил shape={arr.shape}")
 
     X, Y, Z, T = arr.shape
     g = max(1, int(grid_size))
@@ -347,8 +347,8 @@ def spatial_grid_bin_fmri(
 
 
 # ---------------------------------------------------------------------------
-# Pipeline-level orchestration: PreprocessReport + preprocess_timeseries.
-# Перенесены из ``data_loader.py``: эти штуки прямо относятся к препроцессингу.
+# Уровень оркестрации пайплайна: PreprocessReport + preprocess_timeseries.
+# Раньше всё это лежало в ``data_loader.py``, теперь по смыслу здесь.
 # ---------------------------------------------------------------------------
 
 

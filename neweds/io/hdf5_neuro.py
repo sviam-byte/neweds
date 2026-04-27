@@ -1,15 +1,18 @@
-"""HDF5 neuroimaging loaders: 4D (X,Y,Z,T) → DataFrame (T × voxels).
+"""Загрузчики нейровизуализационных HDF5: 4D ``(X, Y, Z, T)`` → DataFrame ``T × voxels``.
 
-Содержит:
-- ``h5_4d_to_voxel_wide`` — плоский voxel-wide формат с координатами в attrs.
-- ``h5_4d_to_spatial_bins`` — детерминированная агрегация по spatial bins.
+Здесь живут:
+
+- ``h5_4d_to_voxel_wide`` — «плоский» voxel-wide формат, координаты
+  сохраняются в ``attrs``;
+- ``h5_4d_to_spatial_bins`` — детерминированная агрегация по spatial bins;
 - ``save_aggregated_h5`` / ``load_aggregated_h5`` — кеш агрегированных
-  субъектов в отдельный H5 (для повторных прогонов group pipeline).
-- ``load_h5_neuroimaging`` — полный путь загрузки 4D H5 с time-slicing,
-  spatial-grid агрегацией и pre-cap для сырых вокселей.
+  субъектов в отдельный H5 (чтобы не пересчитывать биннинг на каждом прогоне
+  group pipeline);
+- ``load_h5_neuroimaging`` — полный путь загрузки 4D HDF5 с обрезкой по
+  времени, spatial-grid агрегацией и pre-cap'ом числа сырых вокселей.
 
-Импорт ``h5py`` и ``scipy`` происходит при создании модуля только в
-наименее тяжёлой части. Тяжёлые операции с h5py запускаются по факту вызова.
+На уровне модуля импортируется только ``h5py`` (в try/except). Всё остальное —
+``scipy``, ленивая spatial-агрегация — подгружается уже внутри функций.
 """
 
 from __future__ import annotations
@@ -43,10 +46,11 @@ def h5_4d_to_voxel_wide(
     max_voxels: int | None = None,
     seed: int = 0,
 ) -> pd.DataFrame:
-    """Преобразует 4D массив (X,Y,Z,T) в DataFrame формата (T, N_voxels).
+    """Превращает 4D-массив ``(X, Y, Z, T)`` в DataFrame ``(T, N_voxels)``.
 
-    Колонки получают имена с координатами вокселей, а в attrs добавляются
-    метаданные для downstream-пайплайна (``coords``, ``format``, ``source_kind``).
+    В именах колонок зашиты координаты вокселей, а в ``attrs`` кладутся
+    метаданные для downstream-пайплайна (``coords``, ``format``, ``source_kind``)
+    — чтобы потом можно было восстановить пространственное расположение.
     """
     if not isinstance(arr4d, np.ndarray):
         arr4d = np.asarray(arr4d)
@@ -56,8 +60,9 @@ def h5_4d_to_voxel_wide(
 
     x, y, z, t = arr4d.shape
     if t < 2:
-        raise ValueError(f"Invalid time axis length: {t}")
+        raise ValueError(f"Слишком короткая временная ось: {t}")
 
+    # View без копии: (voxels, time).
     flat = arr4d.reshape(x * y * z, t)
 
     mode = str(nonzero_mode or "any").strip().lower()
@@ -66,11 +71,11 @@ def h5_4d_to_voxel_wide(
     elif mode == "var":
         keep_mask = np.nanvar(flat, axis=1) > float(eps)
     else:
-        raise ValueError(f"Unknown nonzero_mode: {nonzero_mode}")
+        raise ValueError(f"Неизвестный nonzero_mode: {nonzero_mode}")
 
     keep_idx = np.flatnonzero(keep_mask)
     if keep_idx.size == 0:
-        raise ValueError("No nonzero/valid voxels found in 4D H5 dataset")
+        raise ValueError("В 4D HDF5 не найдено ни одного валидного вокселя")
 
     if max_voxels is not None and keep_idx.size > int(max_voxels):
         rng = np.random.default_rng(int(seed))
@@ -99,14 +104,14 @@ def h5_4d_to_spatial_bins(
     eps: float = 1e-12,
     min_voxels_per_bin: int = 1,
 ) -> pd.DataFrame:
-    """Агрегирует 4D массив (X,Y,Z,T) в фиксированные spatial bins → T×K DataFrame.
+    """Агрегирует 4D массив ``(X, Y, Z, T)`` в фиксированные spatial bins → DataFrame ``T × K``.
 
-    Схема одинакова для всех субъектов при одинаковой геометрии и ``bin_size``.
-    Это предпочтительный режим для межсубъектного сравнения.
+    При одинаковой геометрии и ``bin_size`` схема будет одинакова у всех
+    субъектов — поэтому этот режим предпочтителен для межсубъектного сравнения.
     """
     arr4d = np.asarray(arr4d)
     if arr4d.ndim != 4:
-        raise ValueError(f"h5_4d_to_spatial_bins expects 4D array, got shape={arr4d.shape}")
+        raise ValueError(f"h5_4d_to_spatial_bins ждёт 4D массив, получил shape={arr4d.shape}")
 
     b = max(1, int(bin_size))
     x_dim, y_dim, z_dim, t_dim = [int(v) for v in arr4d.shape]
@@ -152,7 +157,7 @@ def h5_4d_to_spatial_bins(
                 )
 
     if not reduced_cols:
-        raise ValueError("No spatial bins survived variance filtering in HDF5 volume")
+        raise ValueError("Ни один spatial bin не прошёл фильтр по дисперсии — пустой объём?")
 
     df = pd.DataFrame(reduced_cols)
     df.attrs["coords"] = pd.DataFrame(coords_rows)
@@ -171,7 +176,7 @@ def build_aggregated_h5_path(
     bin_size: int = 5,
     aggregation: str = "mean",
 ) -> str:
-    """Строит канонический путь для сохранения агрегированного H5."""
+    """Строит канонический путь для сохранения агрегированного H5-кэша."""
     src_path = Path(source_path)
     root = Path(output_dir) if output_dir else (src_path.parent / "results" / "aggregated_h5")
     folder = root / f"spatialbin_b{int(bin_size)}_{aggregation}"
@@ -188,7 +193,7 @@ def save_aggregated_h5(
     original_shape: tuple[int, ...] | list[int] | None = None,
     aggregation: str = "mean",
 ) -> str:
-    """Сохраняет агрегированные spatial-bins в отдельный H5."""
+    """Сохраняет агрегированные spatial-bins в отдельный HDF5 (для повторных прогонов)."""
     import h5py
 
     out_path = str(out_path)
@@ -250,7 +255,7 @@ def save_aggregated_h5(
 
 
 def load_aggregated_h5(filepath: str) -> pd.DataFrame:
-    """Читает ранее сохранённый aggregated H5 и возвращает DataFrame T×K."""
+    """Читает ранее сохранённый агрегированный HDF5-кэш и возвращает DataFrame ``T × K``."""
     import h5py
 
     with h5py.File(filepath, "r") as f:

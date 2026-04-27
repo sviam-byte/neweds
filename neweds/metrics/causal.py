@@ -1,7 +1,7 @@
-"""Causal metrics: Granger F-test, Transfer Entropy.
+"""Метрики причинности: F-тест Грейнджера и transfer entropy.
 
-statsmodels (VAR / grangercausalitytests) грузится лениво — только когда метрика реально
-вычисляется.
+``statsmodels`` (``VAR``, ``grangercausalitytests``) подгружается лениво — только
+когда метрика реально вызывается, чтобы ``import neweds`` оставался лёгким.
 """
 
 from __future__ import annotations

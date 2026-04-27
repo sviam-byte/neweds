@@ -1,7 +1,7 @@
-"""Shared defaults for NewEDS core modules.
+"""Общие константы по умолчанию для core-модулей NewEDS.
 
-This module intentionally has no imports from the rest of ``neweds`` so it can
-be used by config, metrics, and registry code without creating import cycles.
+В этом модуле сознательно нет импортов из остального ``neweds`` — так его можно
+использовать из ``config``, ``metrics`` и ``registry`` без циклических импортов.
 """
 
 from __future__ import annotations

@@ -45,9 +45,10 @@ def _init_matrix(
 def _iter_pairs(
     n: int, pairs: list[tuple[int, int]] | None, *, directed: bool
 ) -> list[tuple[int, int]]:
-    """Normalize user pairs.
+    """Нормализует список пар, переданный пользователем.
 
-    For undirected metrics we return unique (min,max) pairs.
+    Для ненаправленных метрик возвращаем уникальные пары в порядке (min, max),
+    чтобы одна и та же связь не считалась дважды.
     """
     if pairs is None:
         return []
@@ -230,6 +231,7 @@ def _residualize_1d(y: np.ndarray, X: np.ndarray) -> np.ndarray:
     n = int(min(y.size, X.shape[0]))
     y = y[:n]
     X = X[:n, :]
+    # Добавляем константу — чтобы регрессия включала свободный член.
     A = np.c_[np.ones(n), X]
     try:
         beta, *_ = np.linalg.lstsq(A, y, rcond=None)
@@ -241,12 +243,19 @@ def _residualize_1d(y: np.ndarray, X: np.ndarray) -> np.ndarray:
 def _residualize_df(
     df: pd.DataFrame, control: list[str] | None = None, control_matrix: np.ndarray | None = None
 ) -> tuple[pd.DataFrame, list[str]]:
+    """Резидуализует каждую колонку ``df`` относительно контрольных переменных.
+
+    Возвращает новый DataFrame того же размера, где из каждого ряда вычтена
+    линейная проекция на ``control`` / ``control_matrix``.
+    """
     X_ctrl, desc = _as_2d_controls(df, control=control, control_matrix=control_matrix)
     if X_ctrl.size == 0:
         return df, []
     out = pd.DataFrame(index=df.index)
     for c in df.columns:
         s = pd.to_numeric(df[c], errors="coerce")
+        # Считаем регрессию только по строкам, где конечны и y, и все контроли —
+        # иначе синхронизация по времени съедет.
         y = s.to_numpy(dtype=np.float64)
         mask = np.isfinite(y)
         if X_ctrl.size:
@@ -255,6 +264,7 @@ def _residualize_df(
             out[c] = np.nan
             continue
         y_res = _residualize_1d(y[mask], X_ctrl[mask])
+        # Возвращаем остатки на исходную длину, дыры остаются NaN.
         tmp = np.full_like(y, np.nan, dtype=np.float64)
         tmp[mask] = y_res
         out[c] = tmp
@@ -262,7 +272,7 @@ def _residualize_df(
 
 
 def _fast_corr_matrix(X: np.ndarray) -> np.ndarray:
-    """Vectorized Pearson correlation via numpy для больших матриц."""
+    """Векторная корреляция Пирсона на numpy — быстрее ``pandas.corr()`` для больших матриц."""
     X = np.asarray(X, dtype=np.float64)
     X_centered = X - X.mean(axis=0, keepdims=True)
     norms = np.sqrt((X_centered**2).sum(axis=0, keepdims=True))

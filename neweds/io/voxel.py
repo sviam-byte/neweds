@@ -1,17 +1,18 @@
-"""Voxel-wide CSV format helpers.
+"""Хелперы для voxel-wide CSV-формата.
 
-Voxel-wide layout: ``x, y, z, t0, t1, ..., tN`` — каждая строка это один воксель,
-каждый столбец после ``z`` это значение в момент времени.
+Voxel-wide раскладка: ``x, y, z, t0, t1, ..., tN`` — одна строка на воксель,
+каждый столбец после ``z`` это значение сигнала в соответствующий момент времени.
 
-Этот модуль содержит:
+Здесь живут:
+
 - автодетект voxel-wide формата (``detect_voxel_wide``);
 - транспонирование к стандартной матрице ``time × voxel`` с детерминированным
-  voxel_id (``voxel_wide_to_timeseries``);
-- spatial binning по целочисленной решётке ``floor(coord / bin_size)``
+  ``voxel_id`` (``voxel_wide_to_timeseries``);
+- пространственный биннинг по целочисленной решётке ``floor(coord / bin_size)``
   (``voxel_wide_spatial_bin``);
 - эвристика для time-like колонки (``detect_time_like_col``).
 
-Никаких тяжёлых импортов: всё работает на numpy + pandas.
+Никаких тяжёлых импортов — модуль работает только на numpy и pandas.
 """
 
 from __future__ import annotations
@@ -25,9 +26,11 @@ import pandas as pd
 
 
 def detect_voxel_wide(df: pd.DataFrame) -> tuple[bool, dict[str, str]]:
-    """Проверяет формат вида ``x, y, z, t0..tN``.
+    """Проверяет, что таблица в формате ``x, y, z, t0..tN``.
 
-    Возвращает ``(is_voxel_wide, lower_to_original_name_map)``.
+    Возвращает пару ``(is_voxel_wide, lower_to_original)``: первый флаг —
+    подходит ли формат, второй — словарь «нижний регистр имени → оригинал»,
+    чтобы дальше можно было обращаться к колонкам без оглядки на регистр.
     """
     cols = list(df.columns)
     lower = {str(c).strip().lower(): str(c) for c in cols}
@@ -42,9 +45,9 @@ def detect_voxel_wide(df: pd.DataFrame) -> tuple[bool, dict[str, str]]:
 def detect_time_like_col(col: pd.Series) -> bool:
     """Эвристика для авто-обнаружения временной/индексной колонки.
 
-    Сначала пытается trivial numeric index (дёшево), затем — datetime parsing
-    на коротком префиксе (чтобы не тратить dateutil на сотни тысяч строк
-    voxel-wide матрицы).
+    Сначала проверяем простой числовой индекс (это дёшево), и только потом
+    парсим datetime на коротком префиксе. Так мы не тратим dateutil впустую
+    на сотни тысяч строк voxel-wide матрицы.
     """
     sample = col.dropna()
     if sample.empty:
@@ -78,15 +81,17 @@ def _select_voxels_wide(
     feature_sampling: str,
     feature_seed: int,
 ) -> pd.DataFrame:
-    """Сэмплинг/сокращение вокселей ДО транспонирования.
+    """Сэмплирует/сокращает воксели ДО транспонирования.
 
-    Для формата ``x, y, z, t0..tN`` это критично: транспонирование превращает
-    N_voxels в число колонок. При N~250k это резко увеличивает память.
+    Для формата ``x, y, z, t0..tN`` это принципиально: после транспонирования
+    число вокселей становится числом колонок. При N≈250k это очень больно
+    бьёт по памяти, поэтому режем сразу.
 
     Режимы:
-      - ``first``: первые K строк;
-      - ``random``: случайные K строк;
-      - ``variance``: топ-K по дисперсии по time_cols.
+
+    - ``first`` — первые K строк;
+    - ``random`` — случайные K строк (детерминировано через ``feature_seed``);
+    - ``variance`` — топ-K по дисперсии вдоль ``time_cols``.
     """
     _ = (xcol, ycol, zcol)
     if feature_limit is None:
@@ -169,10 +174,12 @@ def voxel_wide_to_timeseries(
 ) -> pd.DataFrame:
     """Конвертирует таблицу ``x, y, z, t0..tN`` в матрицу ``time × voxel``.
 
-    Метаданные координат сохраняются в ``out.attrs['coords']`` как DataFrame.
+    Координаты вокселей складываются в ``out.attrs['coords']`` как отдельный
+    DataFrame — чтобы downstream-код мог восстановить пространственный смысл.
 
     Если ``spatial_bin_size > 1`` — пространственный биннинг по координатам.
-    Абсолютно детерминирован — зависит только от ``(x, y, z)`` и ``bin_size``.
+    Биннинг абсолютно детерминирован: результат зависит только от ``(x, y, z)``
+    и ``bin_size``, а не от значений временных рядов.
     """
     is_vox, lower = detect_voxel_wide(df)
     if not is_vox:
@@ -239,6 +246,7 @@ def voxel_wide_to_timeseries(
     z = coords["z"].to_numpy(dtype=float, copy=False)
 
     def _to_int_safe(a: np.ndarray) -> np.ndarray:
+        """Аккуратно приводит float-координаты к int64: NaN/inf → 0, дробные усекаются."""
         m = np.isfinite(a)
         out = np.full(a.shape[0], 0, dtype=np.int64)
         if np.any(~m):
@@ -258,6 +266,7 @@ def voxel_wide_to_timeseries(
     yi = _to_int_safe(y)
     zi = _to_int_safe(z)
 
+    # Детерминированный порядок строк: сортировка по (x, y, z).
     row_order = np.lexsort((zi, yi, xi))
     xi = xi[row_order]
     yi = yi[row_order]
@@ -284,6 +293,9 @@ def voxel_wide_to_timeseries(
         else np.array([], dtype=bool)
     )
 
+    # voxel_id строим только из координат — одинаковая (x,y,z) у разных
+    # субъектов даёт одинаковый voxel_id. Это нужно для канонического
+    # выравнивания в group pipeline.
     voxel_ids = np.array(
         [f"x{xi[i]}_y{yi[i]}_z{zi[i]}" for i in range(len(xi))],
         dtype=object,
@@ -319,15 +331,16 @@ def voxel_wide_spatial_bin(
     min_voxels_per_bin: int = 1,
     bin_range: tuple | None = None,
 ) -> pd.DataFrame:
-    """Spatial binning для CSV voxel-wide формата (строки = воксели).
+    """Пространственный биннинг для voxel-wide CSV (строки = воксели).
 
-    Bin key: ``floor(coord / bin_size)`` — целочисленная решётка.
-    Абсолютно детерминирован: результат зависит **только** от координат
-    ``(x, y, z)``, ``bin_size`` и ``bin_range``.
+    Ключ бина: ``floor(coord / bin_size)`` — целочисленная решётка по каждой оси.
+    Биннинг абсолютно детерминирован: результат зависит **только** от координат
+    ``(x, y, z)``, параметра ``bin_size`` и явного ``bin_range``.
 
-    Если ``bin_range`` задан — все бины этого диапазона будут в выходе
-    (пустые = NaN). Это гарантирует идентичный набор колонок между файлами
-    даже при разном покрытии вокселей.
+    Если ``bin_range`` задан — в выходе будут **все** бины из этого диапазона,
+    включая пустые (заполненные NaN). Это гарантирует одинаковый набор колонок
+    между файлами даже при разном покрытии вокселей — необходимо для
+    канонического выравнивания между субъектами.
     """
     b = max(1, int(bin_size))
     method_eff = str(method or "mean").strip().lower()

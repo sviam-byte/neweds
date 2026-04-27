@@ -3,10 +3,12 @@
 Реализации регистрируются декоратором ``@register_metric(...)`` в категорийных
 модулях (``correlation.py``, ``information.py``, ``causal.py``, ``spectral.py``,
 ``ordinal.py``). Регистрация ленивая: ``ensure_builtins()`` импортирует модули
-по требованию, чтобы ``import neweds`` не тянул statsmodels/scipy на старте.
+только по требованию, чтобы ``import neweds`` не тянул statsmodels и
+scipy.signal на старте.
 
 Классический ``METRICS_REGISTRY: Mapping[str, MetricFunc]`` оставлен как
-read-only view для обратной совместимости со старыми импортами.
+read-only представление (имя → функция) — для обратной совместимости со старым
+кодом, который ожидал словарь.
 """
 
 from __future__ import annotations
