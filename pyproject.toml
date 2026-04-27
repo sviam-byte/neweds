@@ -89,7 +89,7 @@ ignore = [
 # F822: lazy module-level __getattr__ exposes names that are not defined in module scope.
 "neweds/config.py" = ["E402", "F822"]
 "neweds/methods.py" = ["F822"]
-"neweds/core/data_loader.py" = ["E402", "UP028"]
+"neweds/core/data_loader.py" = ["E402", "I001", "UP028"]
 "neweds/core/fft_analysis.py" = ["E402"]
 "neweds/core/variant_presets.py" = ["E402"]
 "neweds/core/voxel_space.py" = ["SIM103", "UP042"]
