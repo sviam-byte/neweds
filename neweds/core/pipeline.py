@@ -158,7 +158,8 @@ def _select_lag(
             best_score = score
             best_matrix = matrix
             best_lag = lag
-    assert best_matrix is not None
+    if best_matrix is None:
+        raise RuntimeError(f"No connectivity matrix was produced for variant={variant!r}")
     return best_matrix, best_lag
 
 

@@ -58,7 +58,7 @@ def _iter_pairs(
         try:
             i = int(i)
             j = int(j)
-        except Exception:
+        except (TypeError, ValueError):
             continue
         if i == j or i < 0 or j < 0 or i >= n or j >= n:
             continue
@@ -118,13 +118,10 @@ def _safe_parallel_backend(n_jobs: int = -1) -> tuple[int, str]:
     """Подбирает безопасный backend/число воркеров с учётом переменных окружения."""
     env_jobs = str(os.getenv("TS_TOOL_N_JOBS", "")).strip()
     env_backend = str(os.getenv("TS_TOOL_PARALLEL_BACKEND", "")).strip().lower()
-    try:
-        cpu_n = max(1, int(os.cpu_count() or 1))
-    except Exception:
-        cpu_n = 1
+    cpu_n = max(1, int(os.cpu_count() or 1))
     try:
         nj = int(env_jobs) if env_jobs else int(n_jobs)
-    except Exception:
+    except (TypeError, ValueError):
         nj = 1
     if nj == -1:
         nj = max(1, min(cpu_n - 1 if cpu_n > 1 else 1, 4))
@@ -179,7 +176,7 @@ def _spearman_1d(x: np.ndarray, y: np.ndarray) -> float:
         return float("nan")
     try:
         return float(stats.spearmanr(xx, yy, nan_policy="omit").statistic)
-    except Exception:
+    except (ValueError, TypeError, FloatingPointError):
         return float("nan")
 
 
@@ -196,7 +193,7 @@ def _kendall_1d(x: np.ndarray, y: np.ndarray) -> float:
         return float("nan")
     try:
         return float(stats.kendalltau(xx, yy, nan_policy="omit", variant="b").statistic)
-    except Exception:
+    except (ValueError, TypeError, FloatingPointError):
         return float("nan")
 
 
@@ -236,7 +233,7 @@ def _residualize_1d(y: np.ndarray, X: np.ndarray) -> np.ndarray:
     try:
         beta, *_ = np.linalg.lstsq(A, y, rcond=None)
         return y - A @ beta
-    except Exception:
+    except np.linalg.LinAlgError:
         return y
 
 

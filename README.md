@@ -102,6 +102,7 @@ signal_a, signal_b_lagged, noise_control, seasonal_component
 - [Метрики](docs/metrics.md)
 - [Group pipeline](docs/group_pipeline.md)
 - [Ограничения](docs/limitations.md)
+- [Refactoring story](docs/refactoring_story.md)
 - [Demo](examples/README.md)
 
 ## License

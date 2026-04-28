@@ -5,7 +5,7 @@ description = "Research-oriented toolkit for multivariate time-series connectivi
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    { name = "Project author" },
+    { name = "kudrl" },
 ]
 keywords = ["time-series", "connectivity", "scientific-python", "neuroscience"]
 classifiers = [
@@ -79,10 +79,6 @@ ignore = [
     "SIM105", # contextlib.suppress is slower than try/except/pass in tight loops
     "SIM102", # nested-if collapse can hide branch intent
     "B905",   # zip strict=False is the correct default for numerical code
-    "E701",   # cosmetic
-    "E702",   # cosmetic
-    "E741",   # cosmetic
-    "E731",   # lambda-assignment is fine in scientific code
 ]
 
 [tool.ruff.lint.per-file-ignores]

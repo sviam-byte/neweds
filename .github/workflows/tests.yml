@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install
-        run: pip install -e ".[dev,advanced]"
+        run: pip install -e ".[dev,advanced,io]"
       - name: Lint
         run: ruff check .
       - name: Format check

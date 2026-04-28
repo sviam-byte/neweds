@@ -83,7 +83,7 @@ def _parse_int_list(v: Any) -> list[int] | None:
         for x in v:
             try:
                 xs.append(int(x))
-            except Exception:
+            except (TypeError, ValueError):
                 continue
         return xs or None
 
@@ -98,7 +98,7 @@ def _parse_int_list(v: Any) -> list[int] | None:
             continue
         try:
             xs.append(int(tok))
-        except Exception:
+        except (TypeError, ValueError):
             continue
     return xs or None
 
@@ -125,7 +125,7 @@ def _parse_int(v: Any, default: int, *, min_v: int | None = None, max_v: int | N
     """Нормализует int с дефолтом и опциональным clamping границ."""
     try:
         x = int(v)
-    except Exception:
+    except (TypeError, ValueError):
         x = int(default)
     if min_v is not None:
         x = max(int(min_v), x)
@@ -155,7 +155,7 @@ def parse_user_input(text: str) -> dict[str, Any]:
             obj = json.loads(text)
             if isinstance(obj, dict):
                 return obj
-        except Exception:
+        except json.JSONDecodeError:
             pass
 
     if text.startswith("{") and text.endswith("}"):
@@ -163,7 +163,7 @@ def parse_user_input(text: str) -> dict[str, Any]:
             obj = ast.literal_eval(text)
             if isinstance(obj, dict):
                 return obj
-        except Exception:
+        except (ValueError, SyntaxError):
             pass
 
     return _split_kv(text)

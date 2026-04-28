@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -14,6 +15,12 @@ import numpy as np
 
 from neweds.config import METHOD_INFO, is_directed_method, is_pvalue_method
 from neweds.core.results import AnalysisResult
+from neweds.reporting.html_assets import REPORT_CSS
+from neweds.reporting.html_sections import (
+    render_harmonics_section,
+    render_preprocessing_section,
+    render_series_preview_section,
+)
 from neweds.reporting.report_context import context_from_result
 from neweds.visualization import plots
 
@@ -43,6 +50,14 @@ class HTMLReportGenerator:
 
     def _b64_png(self, buf: BytesIO) -> str:
         return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _safe_html_block(self, name: str, fn, default: str = "") -> str:
+        try:
+            value = fn()
+        except Exception as exc:  # reporting must degrade instead of killing the whole run
+            logging.warning("HTML block %s skipped: %s", name, exc)
+            return default
+        return value if value is not None else default
 
     def _plot_matrix_b64(self, mat: np.ndarray, title: str, cols: list) -> str:
         buf = plots.plot_heatmap(mat, title, labels=cols)
@@ -515,21 +530,20 @@ class HTMLReportGenerator:
         if df is None:
             raise ValueError("No data available for HTML report")
         # Предрасчёт компактных pairwise-таблиц для UI/секции отчёта.
-        try:
-            self.tool.build_pairwise_summaries(p_alpha=float(p_alpha))
-        except Exception:
-            pass
+        self._safe_html_block(
+            "pairwise_summaries",
+            lambda: self.tool.build_pairwise_summaries(p_alpha=float(p_alpha)) or "",
+        )
         cols = list(df.columns)
         variants = list(self.tool.results.keys())
 
         # Короткое русское описание параметров/предобработки/partial/direct.
-        run_summary = ""
-        try:
+        def _run_summary_html():
             from neweds.reporting.run_summary import build_run_summary_ru
 
-            run_summary = build_run_summary_ru(self.tool, run_dir=str(Path(output_path).parent))
-        except Exception:
-            run_summary = ""
+            return build_run_summary_ru(self.tool, run_dir=str(Path(output_path).parent))
+
+        run_summary = self._safe_html_block("run_summary", _run_summary_html)
 
         sections = []
         toc = []
@@ -543,13 +557,13 @@ class HTMLReportGenerator:
         # Явный блок про автокорреляцию/AR-очистку (если включено в параметрах отчёта).
         ac_html = ""
         if include_ar_diagnostics:
-            try:
+            def _autocorr_html():
+                out = ""
                 if hasattr(self.tool, "_render_ar_diagnostics_html"):
-                    ac_html = self.tool._render_ar_diagnostics_html()
-                if not ac_html:
-                    ac_html = self._render_autocorr_section()
-            except Exception:
-                ac_html = ""
+                    out = self.tool._render_ar_diagnostics_html()
+                return out or self._render_autocorr_section()
+
+            ac_html = self._safe_html_block("autocorr", _autocorr_html)
         if ac_html:
             toc.append("<li><a href='#autocorr'>Автокорреляция</a></li>")
             sections.append(f"<div id='autocorr'>{ac_html}</div>")
@@ -706,6 +720,7 @@ class HTMLReportGenerator:
             prep_html = (
                 "<div class='meta'>" + "<br/>".join(prep_lines) + "</div>" if prep_lines else ""
             )
+            prep_html = render_preprocessing_section(prep_html)
 
             harm = {}
             try:
@@ -731,6 +746,7 @@ class HTMLReportGenerator:
                     f"<div class='mono'>{html.escape(' | '.join(lines) if lines else '—')}</div>"
                     "</div>"
                 )
+            harm_cards = render_harmonics_section(harm_cards)
 
             toc.insert(0, "<li><a href='#main'>Главный экран</a></li>")
 
@@ -765,6 +781,7 @@ class HTMLReportGenerator:
                     f"<div class='scroll'>{raw_preview_html}</div>"
                     "</details>"
                 )
+            table_details = render_series_preview_section(table_details)
 
             sections.insert(
                 0,
@@ -781,11 +798,7 @@ class HTMLReportGenerator:
 
         if include_diagnostics:
             toc.append("<li><a href='#diagnostics'>Первичный анализ</a></li>")
-            diag = {}
-            try:
-                diag = self.tool.get_diagnostics()
-            except Exception:
-                diag = {}
+            diag = self._safe_html_block("diagnostics_data", self.tool.get_diagnostics, default={})
 
             cards = []
             if not diag:
@@ -1138,30 +1151,7 @@ document.addEventListener('DOMContentLoaded', _initScans);
 <meta charset='utf-8'/>
 <title>Отчет: Анализ временных рядов</title>
 <style>
-body{{font-family:Arial, sans-serif; margin:0; background:#fafafa;}}
-header{{padding:16px 20px; background:#111; color:#fff;}}
-main{{display:flex; gap:16px; padding:16px 20px;}}
-nav{{width:260px; position:sticky; top:16px; align-self:flex-start; background:#fff; border:1px solid #ddd; border-radius:10px; padding:12px;}}
-.card{{background:#fff; border:1px solid #ddd; border-radius:12px; padding:14px; margin-bottom:14px;}}
-.muted{{color:#666; font-size:13px;}}
-.carousel{{border:1px solid #eee; border-radius:12px; padding:10px; margin-top:10px;}}
-.tabs{{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;}}
-.tab{{border:1px solid #ccc; background:#f6f6f6; border-radius:15px; padding:6px 12px; cursor:pointer; font-size:12px;}}
-.slide img{{max-width:100%; border-radius:10px;}}
-img.inline{{max-width:100%;height:auto;border-radius:10px;}}
-table.pairs{{width:100%;border-collapse:collapse;font-size:12px;}}
-table.pairs th, table.pairs td{{border:1px solid #ddd;padding:6px;}}
-table.pairs th{{background:#f5f5f5;text-align:left;}}
-table.matrix{{border-collapse:collapse; font-size:11px; width:100%; overflow-x:auto; display:block;}}
-table.matrix th, table.matrix td{{border:1px solid #eee; padding:4px 6px; text-align:right;}}
-table.matrix th{{background:#f9f9f9; text-align:center;}}
-.grid{{display:grid; grid-template-columns:repeat(auto-fit, minmax(220px,1fr)); gap:8px; margin-top:10px;}}
-.meta{{margin-top:8px; padding:8px 10px; border:1px dashed #ddd; border-radius:10px; font-size:12px; color:#444; background:#fcfcfc;}}
-.grid2{{display:grid; grid-template-columns:1fr 1fr; gap:12px;}}
-.scroll{{max-height:420px; overflow:auto; border:1px solid #ddd; border-radius:10px; padding:8px; background:#fff;}}
-.scroll table{{width:100%; border-collapse:collapse; font-size:12px;}}
-.scroll th, .scroll td{{border-bottom:1px solid #eee; padding:4px 6px; text-align:left;}}
-.mono{{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;}}
+{REPORT_CSS}
 </style>
 {scan_js}
 </head>

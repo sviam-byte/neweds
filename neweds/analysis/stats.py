@@ -32,7 +32,7 @@ def _adfuller():
 def _acorr_ljungbox():
     try:
         from statsmodels.stats.diagnostic import acorr_ljungbox as _f
-    except Exception:  # pragma: no cover - optional dependency path
+    except ImportError:  # pragma: no cover - optional dependency path
         return None
     return _f
 
@@ -48,7 +48,7 @@ def _coerce_1d_numeric(series_like) -> np.ndarray:
             arr = np.asarray(s)
         arr = np.asarray(arr, dtype=np.float64).reshape(-1)
         return arr[np.isfinite(arr)]
-    except Exception:
+    except (TypeError, ValueError):
         arr = np.asarray(series_like, dtype=np.float64).reshape(-1)
         return arr[np.isfinite(arr)]
 
@@ -80,7 +80,7 @@ def test_stationarity(series: pd.Series) -> tuple[float | None, float | None]:
     try:
         res = _adfuller()(arr, autolag="AIC")
         return float(res[0]), float(res[1])
-    except Exception as exc:
+    except (ValueError, TypeError, np.linalg.LinAlgError) as exc:
         logging.debug("ADF skipped/failed: %s", exc)
         return None, None
 
@@ -94,13 +94,13 @@ def compute_hurst_rs(series: pd.Series) -> float:
             if compute_Hc is not None:
                 hurst_exp, _, _ = compute_Hc(arr, kind="change", simplified=True)
                 return float(hurst_exp)
-        except Exception:
-            pass
+        except (ValueError, FloatingPointError, ZeroDivisionError) as exc:
+            logging.debug("compute_Hc failed, falling back to nolds.hurst_rs: %s", exc)
         if nolds is None:
             return np.nan
         return float(nolds.hurst_rs(arr))
-    except Exception as exc:
-        logging.error("[Hurst RS] %s", exc)
+    except (ValueError, TypeError, FloatingPointError, ZeroDivisionError) as exc:
+        logging.warning("[Hurst RS] %s", exc)
         return np.nan
 
 
@@ -226,6 +226,57 @@ def permutation_entropy(
     return float(pe / (math.log2(math.factorial(m)) + 1e-12))
 
 
+def _safe_robust_std(x: np.ndarray) -> float:
+    xf = x[np.isfinite(x)]
+    if xf.size < 5:
+        return np.nan
+    med = np.median(xf)
+    mad = np.median(np.abs(xf - med))
+    return float(mad * 1.4826)
+
+
+def _safe_outlier_frac(x: np.ndarray, robust_std: float) -> float:
+    xf = x[np.isfinite(x)]
+    if xf.size < 5 or not np.isfinite(robust_std) or robust_std <= 1e-12:
+        return np.nan
+    med = np.median(xf)
+    rz = np.abs(xf - med) / (robust_std + 1e-12)
+    return float((rz > 3.0).mean())
+
+
+def _safe_linear_slope(x: np.ndarray, t0: np.ndarray) -> float:
+    mask = np.isfinite(x)
+    if int(mask.sum()) < 8:
+        return np.nan
+    A = np.c_[np.ones(int(mask.sum())), t0[mask]]
+    try:
+        beta, *_ = np.linalg.lstsq(A, x[mask], rcond=None)
+    except np.linalg.LinAlgError:
+        return np.nan
+    return float(beta[1])
+
+
+def _safe_spikes_frac(x: np.ndarray) -> float:
+    dx = np.diff(x)
+    dx = dx[np.isfinite(dx)]
+    if dx.size < 8:
+        return np.nan
+    med = np.median(dx)
+    mad = np.median(np.abs(dx - med)) + 1e-12
+    thr = 5.0 * mad
+    return float((np.abs(dx - med) > thr).mean())
+
+
+def _safe_ar1(x: np.ndarray) -> float:
+    x0 = x[:-1]
+    x1 = x[1:]
+    mask = np.isfinite(x0) & np.isfinite(x1)
+    if int(mask.sum()) < 8:
+        return np.nan
+    value = np.corrcoef(x0[mask], x1[mask])[0, 1]
+    return float(value) if np.isfinite(value) else np.nan
+
+
 def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) -> pd.DataFrame:
     """QC по каждому вокселю/ряду.
 
@@ -261,60 +312,11 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
         mean = float(np.nanmean(x)) if np.isfinite(np.nanmean(x)) else np.nan
         std = float(np.nanstd(x)) if np.isfinite(np.nanstd(x)) else np.nan
 
-        # Робастное σ: MAD · 1.4826 (для нормального распределения)
-        robust_std = np.nan
-        try:
-            xf = x[np.isfinite(x)]
-            if xf.size >= 5:
-                med = np.median(xf)
-                mad = np.median(np.abs(xf - med))
-                robust_std = float(mad * 1.4826)  # scale для совпадения с std при нормальности
-        except Exception:
-            robust_std = np.nan
-
-        outlier_frac = np.nan
-        try:
-            xf = x[np.isfinite(x)]
-            if xf.size >= 5 and robust_std > 1e-12:
-                med = np.median(xf)
-                rz = np.abs(xf - med) / (robust_std + 1e-12)
-                outlier_frac = float((rz > 3.0).mean())
-        except Exception:
-            outlier_frac = np.nan
-
-        slope = np.nan
-        try:
-            mask = np.isfinite(x)
-            if int(mask.sum()) >= 8:
-                A = np.c_[np.ones(int(mask.sum())), t0[mask]]
-                beta, *_ = np.linalg.lstsq(A, x[mask], rcond=None)
-                slope = float(beta[1])
-        except Exception:
-            slope = np.nan
-
-        # spikes по производной (robust)
-        spikes_frac = np.nan
-        try:
-            dx = np.diff(x)
-            dx = dx[np.isfinite(dx)]
-            if dx.size >= 8:
-                med = np.median(dx)
-                mad = np.median(np.abs(dx - med)) + 1e-12
-                thr = 5.0 * mad
-                spikes_frac = float((np.abs(dx - med) > thr).mean())
-        except Exception:
-            spikes_frac = np.nan
-
-        # AR(1)
-        ar1 = np.nan
-        try:
-            x0 = x[:-1]
-            x1 = x[1:]
-            mask = np.isfinite(x0) & np.isfinite(x1)
-            if int(mask.sum()) >= 8:
-                ar1 = float(np.corrcoef(x0[mask], x1[mask])[0, 1])
-        except Exception:
-            ar1 = np.nan
+        robust_std = _safe_robust_std(x)
+        outlier_frac = _safe_outlier_frac(x, robust_std)
+        slope = _safe_linear_slope(x, t0)
+        spikes_frac = _safe_spikes_frac(x)
+        ar1 = _safe_ar1(x)
 
         # Подсказка по стационности: p-value ADF (не доказательство)
         stationarity_pval = np.nan
@@ -326,7 +328,7 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
                     stationarity_pval = np.nan
                 else:
                     stationarity_pval = float(stationarity_pval)
-        except Exception:
+        except (ValueError, TypeError, np.linalg.LinAlgError):
             stationarity_pval = np.nan
 
         out_rows.append(
@@ -353,7 +355,7 @@ def voxel_qc(df_time_voxel: pd.DataFrame, coords: pd.DataFrame | None = None) ->
                 if cc.columns.size >= 1:
                     cc = cc.rename(columns={cc.columns[0]: "voxel_id"})
             qc = qc.merge(cc, on="voxel_id", how="left")
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             pass
     return qc
 
@@ -525,7 +527,7 @@ def autocorr_summary(series: pd.Series, *, max_lag: int | None = None) -> dict:
             res = _lb(x, lags=[lb_lags], return_df=True)
             pv = float(res["lb_pvalue"].iloc[0])
             lb_p = pv if np.isfinite(pv) else None
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             lb_p = None
 
     return {

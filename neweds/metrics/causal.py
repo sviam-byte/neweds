@@ -55,7 +55,10 @@ def granger_matrix(
         )
         try:
             tests = grangercausalitytests(pair_df, maxlag=int(lag), verbose=False)
-            p_values = [float(tests[l][0]["ssr_ftest"][1]) for l in range(1, int(lag) + 1)]
+            p_values = [
+                float(tests[lag_idx][0]["ssr_ftest"][1])
+                for lag_idx in range(1, int(lag) + 1)
+            ]
             p_min = min(p_values) if p_values else 1.0
             p_corr = min(1.0, p_min * max(1, len(p_values)))
             return src, tgt, p_corr

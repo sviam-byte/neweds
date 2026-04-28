@@ -23,6 +23,33 @@ class DimRedResult:
     meta: dict
 
 
+def _as_positive_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 else None
+
+
+def _as_nonnegative_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out >= 0 else None
+
+
+def _as_unit_float(value) -> float | None:
+    out = _as_nonnegative_float(value)
+    if out is None:
+        return None
+    return out if 0.0 < out <= 1.0 else None
+
+
 def _variance_select(data: pd.DataFrame, target_n: int) -> DimRedResult:
     vars_ = data.var(axis=0, numeric_only=True).fillna(0.0)
     keep = list(vars_.sort_values(ascending=False).head(int(target_n)).index)
@@ -163,19 +190,8 @@ def _choose_k_from_priority(
     elif pr not in {"auto", "explained_variance", "n_components"}:
         pr = "auto"
 
-    tv = None
-    try:
-        tv = float(target_var) if target_var is not None else None
-    except Exception:
-        tv = None
-    if tv is not None and not (0.0 < tv <= 1.0):
-        tv = None
-
-    tn = None
-    try:
-        tn = int(target_n) if target_n is not None and int(target_n) > 0 else None
-    except Exception:
-        tn = None
+    tv = _as_unit_float(target_var)
+    tn = _as_positive_int(target_n)
 
     # auto: если есть target_var — приоритет на дисперсию, иначе на k
     pr_used = pr
@@ -307,18 +323,8 @@ def _pca_reduce(
         mapping_rows = []
         sources = np.asarray([str(c) for c in data.columns], dtype=object)
 
-        topk = None
-        try:
-            topk = int(mapping_topk) if mapping_topk is not None and int(mapping_topk) > 0 else None
-        except Exception:
-            topk = None
-        min_abs = None
-        try:
-            min_abs = float(mapping_min_abs) if mapping_min_abs is not None else None
-        except Exception:
-            min_abs = None
-        if min_abs is not None and min_abs < 0:
-            min_abs = None
+        topk = _as_positive_int(mapping_topk)
+        min_abs = _as_nonnegative_float(mapping_min_abs)
 
         for ci, cname in enumerate(cols):
             ww_row = np.asarray(comps[ci], dtype=float)
@@ -390,18 +396,8 @@ def _pca_reduce(
         sources = np.asarray([str(c) for c in data.columns], dtype=object)
         comps = np.asarray(pca.components_, dtype=float)
 
-        topk = None
-        try:
-            topk = int(mapping_topk) if mapping_topk is not None and int(mapping_topk) > 0 else None
-        except Exception:
-            topk = None
-        min_abs = None
-        try:
-            min_abs = float(mapping_min_abs) if mapping_min_abs is not None else None
-        except Exception:
-            min_abs = None
-        if min_abs is not None and min_abs < 0:
-            min_abs = None
+        topk = _as_positive_int(mapping_topk)
+        min_abs = _as_nonnegative_float(mapping_min_abs)
 
         for ci, cname in enumerate(cols):
             w = comps[ci]
@@ -420,7 +416,7 @@ def _pca_reduce(
     if getattr(pca, "explained_variance_ratio_", None) is not None:
         try:
             evr_list = [float(v) for v in pca.explained_variance_ratio_.tolist()]
-        except Exception:
+        except (TypeError, ValueError):
             evr_list = []
 
     meta = {
@@ -514,14 +510,9 @@ def apply_dimred(
 
     method_norm = str(method or "variance").strip().lower()
     n_features = int(data.shape[1])
-    tn = int(target_n or 0)
+    tn = _as_positive_int(target_n) or 0
     target_n = int(max(1, min(tn, n_features))) if tn > 0 else None
-    try:
-        target_var = (
-            float(target_var) if target_var is not None and str(target_var).strip() != "" else None
-        )
-    except Exception:
-        target_var = None
+    target_var = _as_unit_float(target_var)
 
     if method_norm == "variance":
         return _variance_select(data, target_n or n_features)

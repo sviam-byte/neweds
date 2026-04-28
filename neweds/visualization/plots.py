@@ -401,15 +401,15 @@ def plot_acf_before_after(
         buf.seek(0)
         return buf
 
-    L = int(max(5, min(int(lags), int(min(bv.size, av.size) // 2))))
+    lag_count = int(max(5, min(int(lags), int(min(bv.size, av.size) // 2))))
     try:
-        acf_b = acf(bv, nlags=L, fft=True)
-        acf_a = acf(av, nlags=L, fft=True)
+        acf_b = acf(bv, nlags=lag_count, fft=True)
+        acf_a = acf(av, nlags=lag_count, fft=True)
     except Exception:
-        acf_b = np.full((L + 1,), np.nan)
-        acf_a = np.full((L + 1,), np.nan)
+        acf_b = np.full((lag_count + 1,), np.nan)
+        acf_a = np.full((lag_count + 1,), np.nan)
 
-    xs = np.arange(L + 1)
+    xs = np.arange(lag_count + 1)
     fig, axes = plt.subplots(2, 1, figsize=(8, 3.2), sharex=True)
     axes[0].bar(xs, acf_b)
     axes[0].set_title("ACF до", fontsize=9)
