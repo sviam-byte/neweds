@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import warnings
 
 from ._shared import (
     _get_effective_pairs,
@@ -44,8 +45,9 @@ def coherence_matrix(
             cxy = np.clip(np.asarray(cxy, dtype=np.float64), 0.0, 1.0)
             cxy[~np.isfinite(cxy)] = np.nan
             coh[i, j] = coh[j, i] = float(np.nanmean(cxy)) if np.isfinite(cxy).any() else 0.0
-        except Exception:
-            coh[i, j] = coh[j, i] = 0.0
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            warnings.warn(f"Coherence failed for pair ({i}, {j}): {exc}", stacklevel=2)
+            coh[i, j] = coh[j, i] = np.nan
     return coh
 
 

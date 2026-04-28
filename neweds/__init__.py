@@ -1,4 +1,4 @@
-"""NewEDS — пакет для анализа связности временных рядов и групповых fMRI-данных."""
+"""NewEDS: tools for connectivity analysis of multivariate time-series."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from neweds.config import (
 from neweds.core.pipeline import run_analysis
 from neweds.core.results import AnalysisResult, MetricResult, WindowResult
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 __all__ = [
     "AnalysisConfig",

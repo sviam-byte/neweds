@@ -59,7 +59,7 @@ def _spatial_bin(
     cdf = coords_df.copy()
     cols_low = {c.lower(): c for c in cdf.columns}
     # Поддерживаем несколько схем именования признака, чтобы spatial-режим
-    # работал как для legacy-таблиц (name/node), так и для H5 pipeline,
+    # работал как для старых таблиц (name/node), так и для H5 pipeline,
     # где идентификатор часто хранится в `voxel_id`.
     name_col = (
         cols_low.get("name")

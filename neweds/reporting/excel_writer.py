@@ -16,7 +16,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 from neweds.config import is_directed_method, is_pvalue_method
 from neweds.core.results import AnalysisResult
-from neweds.reporting._adapter import adapter_from_result
+from neweds.reporting.report_context import context_from_result
 from neweds.visualization import plots
 
 
@@ -32,7 +32,7 @@ def write_excel_report(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    return ExcelReportWriter(adapter_from_result(result)).write(str(out / filename), **kwargs)
+    return ExcelReportWriter(context_from_result(result)).write(str(out / filename), **kwargs)
 
 
 @dataclass(slots=True)

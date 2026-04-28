@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import warnings
 from collections import Counter
 
 import numpy as np
@@ -58,8 +59,9 @@ def granger_matrix(
             p_min = min(p_values) if p_values else 1.0
             p_corr = min(1.0, p_min * max(1, len(p_values)))
             return src, tgt, p_corr
-        except Exception:
-            return src, tgt, 1.0
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            warnings.warn(f"Granger failed for pair ({src}, {tgt}): {exc}", stacklevel=2)
+            return src, tgt, float("nan")
 
     for src, tgt, value in _try_parallel(_compute_granger_pair, effective):
         out[src, tgt] = value
@@ -110,11 +112,15 @@ def granger_matrix_partial(
                         out[src_i, tgt_j] = (
                             float(causality.pvalue) if np.isfinite(causality.pvalue) else 1.0
                         )
-                    except Exception:
-                        out[src_i, tgt_j] = 1.0
+                    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                        warnings.warn(
+                            f"Partial Granger failed for pair ({src_i}, {tgt_j}): {exc}",
+                            stacklevel=2,
+                        )
+                        out[src_i, tgt_j] = np.nan
                 return out
-            except Exception:
-                pass
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                logging.debug("Joint VAR fit skipped, falling back to pairwise VAR: %s", exc)
 
     for src_i, tgt_j in effective:
         src = columns[src_i]
@@ -131,8 +137,12 @@ def granger_matrix_partial(
             result = VAR(sub).fit(maxlags=p, ic=None, trend="c")
             causality = result.test_causality(caused=tgt, causing=[src], kind="f")
             out[src_i, tgt_j] = float(causality.pvalue) if np.isfinite(causality.pvalue) else 1.0
-        except Exception:
-            out[src_i, tgt_j] = 1.0
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            warnings.warn(
+                f"Partial Granger failed for pair ({src_i}, {tgt_j}): {exc}",
+                stacklevel=2,
+            )
+            out[src_i, tgt_j] = np.nan
     return out
 
 
@@ -312,8 +322,9 @@ def transfer_entropy_matrix_partial(
             tgt_res = residualize(sub[tgt].values, x_ctrl)
             v = compute_te_jitter(src_res, tgt_res, lag=lag, bins=bins)
             out[i, j] = float(v) if np.isfinite(v) else 0.0
-        except Exception:
-            out[i, j] = 0.0
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            warnings.warn(f"Transfer entropy failed for pair ({i}, {j}): {exc}", stacklevel=2)
+            out[i, j] = np.nan
     return out
 
 

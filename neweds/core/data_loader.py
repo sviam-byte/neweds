@@ -107,7 +107,7 @@ def read_input_table(
         excel_engine = None
 
         # Явно выбираем движок по расширению, чтобы чтение Excel было стабильнее.
-        # openpyxl покрывает .xlsx/.xlsm, а xlrd нужен для legacy .xls.
+        # openpyxl покрывает .xlsx/.xlsm, а xlrd нужен для старых .xls.
         if low.endswith(".xls"):
             excel_engine = "xlrd"
         elif low.endswith((".xlsx", ".xlsm")):
@@ -127,8 +127,9 @@ def read_input_table(
                     "Для чтения .xls нужен пакет xlrd. Установи: pip install xlrd>=2.0.1"
                 ) from exc
             raise
-        except Exception:
+        except (ValueError, TypeError, OSError) as exc:
             # Если чтение с выбором колонок не удалось, мягко падаем на полное чтение.
+            logging.debug("Excel usecols read failed; reading full sheet: %s", exc)
             df0 = pd.read_excel(fp, header=None, engine=excel_engine)
             excel_probe_single_col = False
 
@@ -146,7 +147,8 @@ def read_input_table(
             if not probe_is_embedded_csv:
                 try:
                     df0 = pd.read_excel(fp, header=None, engine=excel_engine)
-                except Exception:
+                except (ValueError, TypeError, OSError) as exc:
+                    logging.debug("Excel full reread failed; using probe data: %s", exc)
                     df0 = probe_df
     df0 = _maybe_split_single_column(df0)
 
@@ -196,8 +198,8 @@ def tidy_timeseries_table(
             spatial_bin_range=spatial_bin_range,
             on_duplicate_voxels=on_duplicate_voxels,
         )
-    except Exception:
-        pass
+    except (ValueError, TypeError, KeyError) as exc:
+        logging.debug("voxel-wide autodetection skipped: %s", exc)
 
     # Важно: voxel_wide_to_timeseries кладёт в out.attrs['coords'] DataFrame координат.
     # Pandas при многих операциях (например, Series.notna()) делает deepcopy attrs,
@@ -206,11 +208,12 @@ def tidy_timeseries_table(
     _saved_attrs: dict[str, Any] = dict(getattr(out, "attrs", {}) or {})
     try:
         out.attrs = {}
-    except Exception:
+    except (AttributeError, TypeError, ValueError) as exc:
+        logging.debug("attrs reset via assignment failed; trying clear(): %s", exc)
         try:
             out.attrs.clear()
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as clear_exc:
+            logging.debug("attrs clear skipped: %s", clear_exc)
 
     # Если есть coords — это уже time×voxel. Авто-транспонирование запрещаем,
     # иначе можно случайно перевернуть огромные данные и убить память.
@@ -234,7 +237,8 @@ def tidy_timeseries_table(
         else:
             col_frac = pd.notna(arr).mean(axis=0)
         out = out.loc[:, col_frac >= 0.2]
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logging.debug("fast finite-column filter skipped; using pandas fallback: %s", exc)
         col_frac = out.notna().mean(axis=0)
         out = out.loc[:, col_frac >= 0.2]
 
@@ -258,8 +262,8 @@ def tidy_timeseries_table(
             ts = None
         if t0 is not None or t1 is not None or ts is not None:
             out = out.iloc[slice(t0, t1, ts), :]
-    except Exception:
-        pass
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid time slicing options: {exc}") from exc
 
     # Ограничение числа признаков
     try:
@@ -285,8 +289,8 @@ def tidy_timeseries_table(
                 out = out.loc[:, keep]
             else:
                 out = out.iloc[:, :k]
-    except Exception:
-        pass
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid feature_limit/feature_sampling options: {exc}") from exc
 
     # Приведение типа (последним, чтобы не плодить копии)
     if dtype:
@@ -309,11 +313,11 @@ def tidy_timeseries_table(
                     idx = coords.set_index("voxel_id", drop=False)
                     idx = idx.loc[[c for c in out.columns if c in idx.index]]
                     _saved_attrs["coords"] = idx.reset_index(drop=True)
-                except Exception:
-                    pass
+                except (KeyError, ValueError, TypeError) as exc:
+                    logging.debug("coords metadata sync skipped: %s", exc)
             out.attrs.update(_saved_attrs)
-    except Exception:
-        pass
+    except (AttributeError, TypeError, ValueError) as exc:
+        logging.debug("attrs restore skipped: %s", exc)
     return out
 
 
@@ -567,8 +571,8 @@ def load_or_generate(
                         n_cells = n_rows * n_cols
                         if n_cols >= 128 or n_cells >= 2_000_000:
                             dtype_eff = "float32"
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        logging.debug("auto_float32 size probe skipped: %s", exc)
 
                 df = tidy_timeseries_table(
                     raw,
@@ -589,7 +593,7 @@ def load_or_generate(
         coords_df = None
         try:
             coords_df = df.attrs.get("coords")
-        except Exception:
+        except (AttributeError, TypeError):
             coords_df = None
 
         df_out = preprocess_timeseries(
@@ -633,8 +637,8 @@ def load_or_generate(
                 report.notes["format"] = str(df.attrs.get("format", "voxel_wide"))
                 report.notes["n_voxels"] = int(getattr(coords_df, "shape", [0])[0])
                 report.notes["coords"] = coords_df.to_dict(orient="records")
-            except Exception:
-                pass
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                logging.debug("voxel metadata report notes skipped: %s", exc)
 
         if report is not None:
             try:
@@ -647,8 +651,8 @@ def load_or_generate(
                         f"(bin_size={sb_report.get('bin_size', '?')}, "
                         f"метод={sb_report.get('method', '?')}, детерминирован)"
                     )
-            except Exception:
-                pass
+            except (AttributeError, TypeError, ValueError) as exc:
+                logging.debug("spatial bin report notes skipped: %s", exc)
 
         try:
             if hasattr(df, "attrs"):
@@ -656,8 +660,8 @@ def load_or_generate(
                 df.attrs.pop("voxel_time_cols", None)
                 if len(df.attrs) == 0:
                     df.attrs = {}
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            logging.debug("final attrs cleanup skipped: %s", exc)
         logging.info(
             f"[Load] OK shape={df.shape} header={header} time_col={time_col} transpose={transpose} preprocess={preprocess}"
         )

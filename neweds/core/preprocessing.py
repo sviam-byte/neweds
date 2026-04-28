@@ -114,8 +114,8 @@ def detrend_linear(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
                 beta, *_ = np.linalg.lstsq(A[mask], y[mask], rcond=None)
                 y[mask] -= A[mask] @ beta
                 df[col] = y
-            except Exception:
-                pass
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                logging.warning("Linear detrend skipped for column %s: %s", col, exc)
     return df, "detrend_linear"
 
 
@@ -222,11 +222,11 @@ def additional_preprocessing(
     """
     Дополнительная предобработка данных:
     - Удаление вырожденных колонок (all-NaN, нулевая дисперсия/диапазон)
-    - Опционально: legacy-фильтр по числу уникальных значений
+    - Опционально: дополнительный фильтр по числу уникальных значений
 
     Args:
         df: Исходный DataFrame
-        unique_thresh: Порог уникальности для legacy-фильтра
+        unique_thresh: Порог уникальности для дополнительный фильтра
         low_variance_eps: Порог дисперсии/диапазона для удаления вырожденных колонок
         skip_unique_filter: Если True, не применять фильтр по unique ratio
         drop_all_nan: Если True, удалять колонки, где после coercion нет finite-значений
@@ -569,19 +569,20 @@ def preprocess_timeseries(
     out = df.copy()
     try:
         out.attrs = {}
-    except Exception:
+    except (AttributeError, TypeError, ValueError) as exc:
+        logging.debug("attrs reset via assignment failed; trying clear(): %s", exc)
         try:
             out.attrs.clear()
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as clear_exc:
+            logging.debug("attrs clear skipped: %s", clear_exc)
     report = PreprocessReport(enabled=bool(enabled))
     if not enabled:
         report.add("[Preprocess] disabled: using raw numeric matrix as-is.")
         try:
             if _saved_attrs:
                 out.attrs.update(_saved_attrs)
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            logging.debug("attrs restore skipped for disabled preprocessing: %s", exc)
         return (out, report) if return_report else out
 
     report.add("[Preprocess] enabled")
@@ -624,7 +625,7 @@ def preprocess_timeseries(
         fn = lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x
         try:
             out = out.map(fn)  # type: ignore[attr-defined]
-        except Exception:
+        except AttributeError:
             out = out.applymap(fn)
 
     if remove_outliers:
@@ -739,7 +740,7 @@ def preprocess_timeseries(
         def _ljung_box_p(x: np.ndarray, lag: int) -> float:
             try:
                 from statsmodels.stats.diagnostic import acorr_ljungbox
-            except Exception:
+            except ImportError:
                 return float("nan")
             lag = int(max(1, lag))
             xx = np.asarray(x, dtype=float)
@@ -750,7 +751,8 @@ def preprocess_timeseries(
                 res = acorr_ljungbox(xx, lags=[lag], return_df=True)
                 pv = float(res["lb_pvalue"].iloc[0])
                 return pv if np.isfinite(pv) else float("nan")
-            except Exception:
+            except (ValueError, TypeError, KeyError, FloatingPointError) as exc:
+                logging.debug("Ljung-Box diagnostic skipped: %s", exc)
                 return float("nan")
 
         cols_all = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
@@ -851,8 +853,8 @@ def preprocess_timeseries(
                             for k in range(1, p_order + 1)
                         },
                     }
-                except Exception:
-                    pass
+                except (ValueError, TypeError, FloatingPointError) as exc:
+                    report.add(f"[Preprocess] AR diagnostics example skipped for {col}: {exc}")
             ac_note["examples"] = ex
         report.add(f"[Preprocess] remove AR(p): p={p_order} (OLS on lags)")
         for col in out.columns:
@@ -881,8 +883,9 @@ def preprocess_timeseries(
             x_lags = np.column_stack([x[p_order - i : t_size - i] for i in range(1, p_order + 1)])
             try:
                 phi, *_ = np.linalg.lstsq(x_lags, y_target, rcond=None)
-            except Exception:
-                phi = np.zeros((p_order,), dtype=float)
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                report.add(f"[Preprocess] AR(p) skipped for {col}: {exc}")
+                continue
             phi = np.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
 
             y = np.zeros_like(x)
@@ -973,8 +976,8 @@ def preprocess_timeseries(
                                 f"lag{int(k)}": _safe_corr_at_lag(xa, int(k))
                                 for k in range(1, p_order + 1)
                             }
-                    except Exception:
-                        pass
+                    except (KeyError, ValueError, TypeError, FloatingPointError) as exc:
+                        report.add(f"[Preprocess] AR diagnostics after-example skipped for {col}: {exc}")
             ac_note["examples"] = ex
 
             try:
@@ -986,8 +989,8 @@ def preprocess_timeseries(
                     ac_note["lag1_reduction_median"] = float(
                         1.0 - (abs(amed) / max(1e-12, abs(bmed)))
                     )
-            except Exception:
-                pass
+            except (ValueError, TypeError, FloatingPointError, ZeroDivisionError) as exc:
+                report.add(f"[Preprocess] AR lag1 reduction summary skipped: {exc}")
 
             try:
                 before_corr = (ac_note.get("before") or {}).get("corr_by_lag") or {}
@@ -1004,8 +1007,8 @@ def preprocess_timeseries(
                     else:
                         lag_reduction[kb] = float("nan")
                 ac_note["lag_reduction_median_by_lag"] = lag_reduction
-            except Exception:
-                pass
+            except (ValueError, TypeError, FloatingPointError, ZeroDivisionError) as exc:
+                report.add(f"[Preprocess] AR lag reduction summary skipped: {exc}")
 
             report.notes["autocorr"] = ac_note
 
@@ -1015,7 +1018,7 @@ def preprocess_timeseries(
             from statsmodels.tsa.seasonal import STL
 
             from neweds.analysis import stats as seasonality_stats
-        except Exception:
+        except ImportError:
             STL = None
             seasonality_stats = None
 
@@ -1038,7 +1041,8 @@ def preprocess_timeseries(
                         strength = ss.get("acf_strength")
                         if cand is not None and strength is not None and float(strength) >= 0.2:
                             per = int(cand)
-                    except Exception:
+                    except (ValueError, TypeError, FloatingPointError, KeyError) as exc:
+                        report.add(f"[Preprocess] seasonality detection skipped for {col}: {exc}")
                         per = None
                 if per is None or per < 2:
                     continue
@@ -1046,7 +1050,8 @@ def preprocess_timeseries(
                     stl = STL(x, period=int(per), robust=True).fit()
                     out[col] = (x - stl.seasonal).to_numpy()
                     report.add(f"[Preprocess] STL period={int(per)}", col=col)
-                except Exception:
+                except (ValueError, TypeError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                    report.add(f"[Preprocess] STL skipped for {col}: {exc}")
                     continue
 
     if normalize:
@@ -1134,6 +1139,6 @@ def preprocess_timeseries(
     try:
         if _saved_attrs:
             out.attrs.update(_saved_attrs)
-    except Exception:
-        pass
+    except (AttributeError, TypeError, ValueError) as exc:
+        logging.debug("attrs restore skipped after preprocessing: %s", exc)
     return (out, report) if return_report else out

@@ -11,7 +11,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="neweds-group",
         description=(
-            "Group fMRI connectivity comparison. Inputs are subject-wise CSV/Excel/Parquet "
+            "Exploratory group connectivity comparison. Inputs are subject-wise CSV/Excel/Parquet "
             "after spatial binning; HDF5 group input is not supported yet."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--canonical-reference",
         default="all",
-        choices=["case", "control", "schiz", "healthy", "all"],
+        choices=["case", "control", "all"],
         help="По какой группе строится canonical space (по умолчанию: all).",
     )
     p.add_argument(
@@ -119,8 +119,8 @@ def main() -> None:
 
     try:
         summary = run_group_pipeline(
-            schiz_dir=args.case_dir,
-            healthy_dir=args.control_dir,
+            case_dir=args.case_dir,
+            control_dir=args.control_dir,
             output_dir=args.output_dir,
             method=args.method,
             spatial_grid_size=args.spatial_grid_size,

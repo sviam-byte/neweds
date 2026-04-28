@@ -1,7 +1,7 @@
-"""Групповой pipeline: загрузка субъектов, canonical alignment, connectivity, сравнение групп.
+"""Экспериментальный case/control pipeline для исследовательских групповых сравнений.
 
-⚠️ EXPERIMENTAL: это baseline edge-wise сравнение (Mann-Whitney U + Benjamini-Hochberg FDR).
-covariate-aware GLM, permutation tests, site-aware design — на дорожной карте, но пока нет.
+EXPERIMENTAL: результаты являются exploratory и требуют отдельной статистической проверки.
+Ковариатные модели, permutation tests и site-aware design сейчас не реализованы.
 Не используйте результаты как финальную статистику для публикации.
 """
 
@@ -22,9 +22,8 @@ from .data_loader import load_or_generate
 from .voxel_space import CanonicalVoxelSpace
 
 GROUP_PIPELINE_EXPERIMENTAL_NOTICE = (
-    "[experimental] neweds-group is a baseline edge-wise group-comparison pipeline. "
-    "Covariate-aware GLM, permutation tests, and site-aware design are NOT yet implemented. "
-    "Treat outputs as exploratory."
+    "[experimental] neweds-group is an exploratory case/control comparison pipeline. "
+    "Use it for engineering demos and early analysis, not for final statistical claims."
 )
 
 
@@ -77,8 +76,8 @@ class GroupComparisonResult:
             method=str(summary.get("method", "")),
             strategy=str(summary.get("strategy", "")),
             canonical_reference=str(summary.get("canonical_reference", "")),
-            n_case=int(summary.get("n_case", summary.get("n_schiz", 0))),
-            n_control=int(summary.get("n_control", summary.get("n_healthy", 0))),
+            n_case=int(summary.get("n_case", 0)),
+            n_control=int(summary.get("n_control", 0)),
             n_canonical_bins=int(summary.get("n_canonical_bins", 0)),
             n_features=int(summary.get("n_features", 0)),
             n_significant=int(summary.get("n_significant", 0)),
@@ -671,8 +670,8 @@ def group_comparison(
 
 
 def run_group_pipeline(
-    schiz_dir: str | Path,
-    healthy_dir: str | Path,
+    case_dir: str | Path,
+    control_dir: str | Path,
     output_dir: str | Path,
     *,
     method: str = "correlation",
@@ -705,47 +704,47 @@ def run_group_pipeline(
     out.mkdir(parents=True, exist_ok=True)
 
     # 1. Загрузка
-    logger.info("=== Загрузка: шизофрения (%s) ===", schiz_dir)
-    dfs_schiz = load_group(
-        schiz_dir,
-        "schiz",
+    logger.info("=== Loading case group (%s) ===", case_dir)
+    dfs_case = load_group(
+        case_dir,
+        "case",
         spatial_grid_size=spatial_grid_size,
         spatial_grid_method=spatial_grid_method,
         csv_chunk_rows=csv_chunk_rows,
         allow_skip=allow_skip,
     )
-    logger.info("=== Загрузка: здоровые (%s) ===", healthy_dir)
-    dfs_healthy = load_group(
-        healthy_dir,
-        "healthy",
+    logger.info("=== Loading control group (%s) ===", control_dir)
+    dfs_control = load_group(
+        control_dir,
+        "control",
         spatial_grid_size=spatial_grid_size,
         spatial_grid_method=spatial_grid_method,
         csv_chunk_rows=csv_chunk_rows,
         allow_skip=allow_skip,
     )
 
-    all_dfs = {**dfs_schiz, **dfs_healthy}
+    all_dfs = {**dfs_case, **dfs_control}
     logger.info(
-        "Загружено: %d шизофрения + %d здоровые = %d субъектов",
-        len(dfs_schiz),
-        len(dfs_healthy),
+        "Loaded: %d case + %d control = %d subjects",
+        len(dfs_case),
+        len(dfs_control),
         len(all_dfs),
     )
 
     # 2. Canonical space
     logger.info("=== Canonical voxel space (strategy=%s) ===", strategy)
     raw_ref = str(canonical_reference or "all").strip().lower()
-    ref = {"case": "schiz", "control": "healthy"}.get(raw_ref, raw_ref)
-    if ref == "healthy":
-        ref_dfs = dfs_healthy
-    elif ref == "schiz":
-        ref_dfs = dfs_schiz
+    ref = raw_ref
+    if ref == "control":
+        ref_dfs = dfs_control
+    elif ref == "case":
+        ref_dfs = dfs_case
     elif ref == "all":
         ref_dfs = all_dfs
         logger.warning("canonical_reference='all' может давать leakage при train/test сценариях.")
     else:
         raise ValueError(
-            "canonical_reference must be one of: 'case', 'control', 'healthy', 'schiz', 'all'."
+            "canonical_reference must be one of: 'case', 'control', 'all'."
         )
 
     space = fit_canonical_space(ref_dfs, strategy=strategy)
@@ -759,32 +758,32 @@ def run_group_pipeline(
 
     # 3. Выравнивание
     logger.info("=== Выравнивание ===")
-    dfs_schiz_al = align_all(dfs_schiz, space)
-    dfs_healthy_al = align_all(dfs_healthy, space)
+    dfs_case_al = align_all(dfs_case, space)
+    dfs_control_al = align_all(dfs_control, space)
 
     # 4. QC по отсутствующим бинам (потенциальный конфаундер покрытия)
-    qc_schiz = build_missing_bin_qc_table(dfs_schiz_al)
-    qc_schiz["group"] = "schiz"
-    qc_healthy = build_missing_bin_qc_table(dfs_healthy_al)
-    qc_healthy["group"] = "healthy"
-    qc_missing = pd.concat([qc_schiz, qc_healthy], axis=0, ignore_index=True)
+    qc_case = build_missing_bin_qc_table(dfs_case_al)
+    qc_case["group"] = "case"
+    qc_control = build_missing_bin_qc_table(dfs_control_al)
+    qc_control["group"] = "control"
+    qc_missing = pd.concat([qc_case, qc_control], axis=0, ignore_index=True)
 
     labels = np.concatenate(
         [
-            np.zeros(len(qc_schiz), dtype=np.float64),
-            np.ones(len(qc_healthy), dtype=np.float64),
+            np.zeros(len(qc_case), dtype=np.float64),
+            np.ones(len(qc_control), dtype=np.float64),
         ]
     )
     missing_corr = _point_biserial_binary(labels, qc_missing["n_missing_bins"].to_numpy())
     if np.isfinite(missing_corr) and abs(missing_corr) >= 0.3:
         logger.warning(
-            "n_missing_bins заметно коррелирует с диагнозом (r=%.4f). "
+            "n_missing_bins заметно коррелирует с группой (r=%.4f). "
             "Результаты группового сравнения могут быть конфаундированы покрытием.",
             missing_corr,
         )
     if np.isfinite(missing_corr) and abs(missing_corr) >= COVERAGE_CONFOUND_THRESHOLD:
         logger.error(
-            "КРИТИЧНО: n_missing_bins сильно коррелирует с диагнозом (r=%.4f >= %.2f). "
+            "КРИТИЧНО: n_missing_bins сильно коррелирует с группой (r=%.4f >= %.2f). "
             "Рекомендуется фиксированный spatial_bin_range и/или более строгий coverage-filter.",
             missing_corr,
             COVERAGE_CONFOUND_THRESHOLD,
@@ -794,39 +793,39 @@ def run_group_pipeline(
 
     # 5. Connectivity + признаки
     logger.info("=== Connectivity (%s) + признаки ===", method)
-    feat_schiz, ids_schiz = build_feature_matrix(dfs_schiz_al, method=method)
-    feat_healthy, ids_healthy = build_feature_matrix(dfs_healthy_al, method=method)
+    feat_case, ids_case = build_feature_matrix(dfs_case_al, method=method)
+    feat_control, ids_control = build_feature_matrix(dfs_control_al, method=method)
 
     pair_mask: np.ndarray | None = None
     if min_bin_coverage > 0.0:
         logger.info(
             "=== Фильтрация признаков по покрытию бинов (min=%.0f%%) ===", min_bin_coverage * 100
         )
-        feat_schiz, feat_healthy, pair_mask = filter_features_by_bin_coverage(
-            feat_schiz,
-            feat_healthy,
+        feat_case, feat_control, pair_mask = filter_features_by_bin_coverage(
+            feat_case,
+            feat_control,
             bin_ids=space.voxel_ids,
-            dfs_a=dfs_schiz_al,
-            dfs_b=dfs_healthy_al,
+            dfs_a=dfs_case_al,
+            dfs_b=dfs_control_al,
             min_coverage=min_bin_coverage,
         )
 
     if save_feature_matrix:
-        np.save(out / "features_schiz.npy", feat_schiz)
-        np.save(out / "features_healthy.npy", feat_healthy)
-        pd.Series(ids_schiz).to_csv(
-            out / "subject_ids_schiz.csv", index=False, header=["subject_id"]
+        np.save(out / "features_case.npy", feat_case)
+        np.save(out / "features_control.npy", feat_control)
+        pd.Series(ids_case).to_csv(
+            out / "subject_ids_case.csv", index=False, header=["subject_id"]
         )
-        pd.Series(ids_healthy).to_csv(
-            out / "subject_ids_healthy.csv", index=False, header=["subject_id"]
+        pd.Series(ids_control).to_csv(
+            out / "subject_ids_control.csv", index=False, header=["subject_id"]
         )
         logger.info("Матрицы признаков → %s", out)
 
     # 6. Статистика
     logger.info("=== Mann-Whitney + FDR ===")
     results_df = group_comparison(
-        feat_schiz,
-        feat_healthy,
+        feat_case,
+        feat_control,
         bin_ids=space.voxel_ids,
         alpha=alpha,
         pair_mask=pair_mask,
@@ -870,11 +869,8 @@ def run_group_pipeline(
     }
 
     return {
-        "n_case": len(dfs_schiz),
-        "n_control": len(dfs_healthy),
-        # Ключи для обратной совместимости (старые пользователи).
-        "n_schiz": len(dfs_schiz),
-        "n_healthy": len(dfs_healthy),
+        "n_case": len(dfs_case),
+        "n_control": len(dfs_control),
         "n_canonical_bins": space.n_voxels,
         "n_features": n_total,
         "n_significant": n_sig,
@@ -884,8 +880,8 @@ def run_group_pipeline(
         "strategy": strategy,
         "canonical_reference": ref,
         "allow_skip": bool(allow_skip),
-        "skipped_subjects": list(getattr(dfs_schiz, "skipped_subjects", []))
-        + list(getattr(dfs_healthy, "skipped_subjects", [])),
+        "skipped_subjects": list(getattr(dfs_case, "skipped_subjects", []))
+        + list(getattr(dfs_control, "skipped_subjects", [])),
         "min_bin_coverage": min_bin_coverage,
         "spatial_grid_size": spatial_grid_size,
         "missing_bins_diag_corr": (

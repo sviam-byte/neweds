@@ -13,7 +13,7 @@ VARIANT_ALIASES: dict[str, str] = {
     "corr_directed": "correlation_directed",
     "coh_full": "coherence_full",
     "coh_partial": "coherence_partial",
-    "fftcoh_full": "coherence_full",  # legacy alias
+    "fftcoh_full": "coherence_full",  # short alias
 }
 
 
@@ -22,9 +22,11 @@ def _resolve_alias(name: str) -> str:
     return VARIANT_ALIASES.get(name, name)
 
 
-LEGACY_OPT_IN_VARIANTS = {"ah_full", "ah_partial", "ah_directed"}
+OPT_IN_EXPERIMENTAL_VARIANTS = {"ah_full", "ah_partial", "ah_directed"}
 ALL_REGISTRY_VARIANTS = list(METRICS_REGISTRY.keys())
-PUBLIC_REGISTRY_VARIANTS = [v for v in ALL_REGISTRY_VARIANTS if v not in LEGACY_OPT_IN_VARIANTS]
+PUBLIC_REGISTRY_VARIANTS = [
+    v for v in ALL_REGISTRY_VARIANTS if v not in OPT_IN_EXPERIMENTAL_VARIANTS
+]
 
 
 PRESETS = {

@@ -89,7 +89,7 @@ def read_csv_with_encoding_fallback(filepath: str, **kw):
     for enc in CSV_ENCODING_CANDIDATES:
         trial = dict(kw)
         trial["encoding"] = enc
-        # pyarrow стабильно работает только с UTF-8; для legacy-кодировок
+        # pyarrow стабильно работает только с UTF-8; для старых кодировок
         # принудительно уходим на pandas C-engine.
         if base_engine == "pyarrow" and enc not in {"utf-8", "utf8", "utf-8-sig"}:
             trial["engine"] = "c"
@@ -121,7 +121,8 @@ def csv_probe_ncols(filepath: str, *, nrows: int = 2) -> int:
     try:
         probe = read_csv_with_encoding_fallback(filepath, header=None, nrows=nrows, low_memory=False)
         return int(probe.shape[1])
-    except Exception:
+    except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as exc:
+        logging.debug("CSV column probe failed for %s: %s", filepath, exc)
         return 0
 
 
@@ -141,8 +142,8 @@ def is_mostly_numeric_row(row) -> bool:
         try:
             float(v)
             numeric += 1
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            continue
     return numeric / max(1, len(vals)) >= 0.8
 
 
@@ -203,8 +204,8 @@ def maybe_split_single_column(df_raw: pd.DataFrame) -> pd.DataFrame:
                     .astype(str)
                     .str.split(r"[,;\t]", expand=True)
                 )
-    except Exception:
-        pass
+    except (IndexError, TypeError, ValueError) as exc:
+        logging.debug("single-column table split skipped: %s", exc)
     return df_raw
 
 

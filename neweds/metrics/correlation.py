@@ -7,6 +7,7 @@ statsmodels и scipy.signal: импорт модуля остаётся лёгк
 from __future__ import annotations
 
 import logging
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -67,7 +68,8 @@ def spearman_matrix(
         return out
     try:
         return data.corr(method="spearman").values
-    except Exception:
+    except (ValueError, TypeError, FloatingPointError) as exc:
+        logging.debug("pandas Spearman correlation failed; using pairwise fallback: %s", exc)
         X = _prepare_numpy(data)
         out = _init_matrix(n_cols, 0.0, diag=1.0)
         for i in range(n_cols):
@@ -95,7 +97,8 @@ def kendall_matrix(
         return out
     try:
         return data.corr(method="kendall").values
-    except Exception:
+    except (ValueError, TypeError, FloatingPointError) as exc:
+        logging.debug("pandas Kendall correlation failed; using pairwise fallback: %s", exc)
         X = _prepare_numpy(data)
         out = _init_matrix(n_cols, 0.0, diag=1.0)
         for i in range(n_cols):
@@ -178,8 +181,8 @@ def partial_correlation_matrix(
                     out[i, j] = out[j, i] = pcor[i, j]
                 return out
             return pcor
-        except Exception:
-            pass
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            warnings.warn(f"Partial correlation precision matrix failed: {exc}", stacklevel=2)
 
     out = _init_matrix(n_cols, 0.0, diag=1.0)
     effective = _get_effective_pairs(n_cols, pairs, directed=False)
@@ -196,9 +199,10 @@ def partial_correlation_matrix(
                 corr_matrix = sub.corr().values
                 precision = np.linalg.pinv(corr_matrix)
                 pcor = -precision[0, 1] / np.sqrt(precision[0, 0] * precision[1, 1])
-            except Exception:
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                warnings.warn(f"Partial correlation failed for pair ({i}, {j}): {exc}", stacklevel=2)
                 pcor = np.nan
-        out[i, j] = out[j, i] = float(pcor) if np.isfinite(pcor) else 0.0
+        out[i, j] = out[j, i] = float(pcor) if np.isfinite(pcor) else np.nan
     return out
 
 

@@ -65,8 +65,8 @@ def test_load_subject_disables_subjectwise_preprocessing(monkeypatch, tmp_path: 
 def test_missing_bin_qc_table_and_diag_correlation() -> None:
     """QC-таблица должна содержать счётчики пропущенных бинов, корреляция — конечная."""
     dfs = {
-        "schiz::a": pd.DataFrame({"b1": [1.0, 2.0], "b2": [np.nan, np.nan]}),
-        "healthy::b": pd.DataFrame({"b1": [1.0, 2.0], "b2": [1.0, 2.0]}),
+        "case::a": pd.DataFrame({"b1": [1.0, 2.0], "b2": [np.nan, np.nan]}),
+        "control::b": pd.DataFrame({"b1": [1.0, 2.0], "b2": [1.0, 2.0]}),
     }
 
     qc = build_missing_bin_qc_table(dfs)
@@ -182,14 +182,14 @@ def test_load_group_fail_fast_by_default_and_allows_explicit_skip(monkeypatch, t
     monkeypatch.setattr(gp, "_cross_validate_group_schemas", lambda schemas, group_label: None)
 
     with pytest.raises(RuntimeError, match="failed to load"):
-        load_group(tmp_path, "schiz")
+        load_group(tmp_path, "case")
 
-    loaded = load_group(tmp_path, "schiz", allow_skip=True)
-    assert list(loaded) == ["schiz::ok"]
+    loaded = load_group(tmp_path, "case", allow_skip=True)
+    assert list(loaded) == ["case::ok"]
     assert loaded.skipped_subjects == [{"file": "bad.csv", "error": "boom"}]
 
 
-def test_group_pipeline_normalizes_canonical_reference_aliases(monkeypatch, tmp_path: Path) -> None:
+def test_group_pipeline_uses_case_control_canonical_references(monkeypatch, tmp_path: Path) -> None:
     refs: list[str] = []
 
     def _fake_load_group(directory, group_label, **kwargs):
@@ -248,14 +248,14 @@ def test_group_pipeline_normalizes_canonical_reference_aliases(monkeypatch, tmp_
         save_feature_matrix=False,
     )
 
-    assert summary_case["canonical_reference"] == "schiz"
-    assert summary_control["canonical_reference"] == "healthy"
-    assert refs[:2] == ["schiz", "healthy"]
+    assert summary_case["canonical_reference"] == "case"
+    assert summary_control["canonical_reference"] == "control"
+    assert refs[:2] == ["case", "control"]
 
 
-def test_cli_group_accepts_legacy_and_internal_canonical_reference_names() -> None:
+def test_cli_group_accepts_public_canonical_reference_names() -> None:
     parser = cli_group.build_parser()
-    for ref in ["case", "control", "schiz", "healthy", "all"]:
+    for ref in ["case", "control", "all"]:
         args = parser.parse_args(
             [
                 "--case-dir",

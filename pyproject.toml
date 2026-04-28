@@ -1,19 +1,17 @@
 [project]
 name = "neweds"
-version = "0.2.0"
-description = "Multivariate time-series and fMRI connectivity analysis toolkit."
+version = "0.1.0"
+description = "Research-oriented toolkit for multivariate time-series connectivity analysis."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
 authors = [
-    { name = "NewEDS contributors" },
+    { name = "Project author" },
 ]
-keywords = ["time-series", "connectivity", "fmri", "neuroscience", "graph"]
+keywords = ["time-series", "connectivity", "scientific-python", "neuroscience"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Information Analysis",
@@ -43,6 +41,10 @@ advanced = [
     "dcor>=0.6",
     "hurst>=0.0.5",
     "nolds>=0.5.2",
+]
+io = [
+    "pyarrow>=15",
+    "xlrd>=2.0.1",
 ]
 
 [project.scripts]

@@ -1,7 +1,8 @@
-"""Фасад совместимости: исторические имена STABLE_METHODS, METHOD_INFO и др.
+"""Deprecated lazy metric tables.
 
-Источник истины — neweds.metrics.registry; здесь — ленивые re-exports через __getattr__,
-чтобы ``import neweds`` не тянул statsmodels/scipy.signal.
+The source of truth is ``neweds.metrics.registry``. This module keeps a few
+older table-style imports available without importing heavy metric dependencies
+at package import time.
 """
 
 from __future__ import annotations

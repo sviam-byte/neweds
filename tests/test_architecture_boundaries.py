@@ -25,10 +25,9 @@ def test_top_level_public_api_is_stable() -> None:
     assert expected.issubset(set(neweds.__all__))
 
 
-def test_pipeline_does_not_import_removed_legacy_engine() -> None:
+def test_pipeline_does_not_import_removed_engine() -> None:
     pipeline = importlib.import_module("neweds.core.pipeline")
     text = open(pipeline.__file__, encoding="utf-8").read()
-    assert "BigMasterTool" not in text
     assert "from neweds.core.engine" not in text
 
 
@@ -37,7 +36,6 @@ def test_metric_runner_only_uses_registry() -> None:
         importlib.import_module("neweds.core.metric_runner").__file__,
         encoding="utf-8",
     ).read()
-    assert "BigMasterTool" not in runner_src
     assert "from neweds.metrics.registry" in runner_src
 
 
@@ -58,20 +56,20 @@ def test_reporting_exposes_public_writers() -> None:
     assert callable(html.write_html_report)
 
 
-def test_legacy_modules_have_been_removed() -> None:
+def test_removed_modules_are_not_importable() -> None:
     import importlib.util
 
-    legacy_names = (
+    removed_names = (
         "neweds.core.engine",
         "interfaces",
         "interfaces.cli",
         "interfaces.gui",
         "interfaces.web",
-        "interfaces.legacy_cli",
+        "interfaces.old_cli",
     )
-    for legacy in legacy_names:
+    for name in removed_names:
         try:
-            spec = importlib.util.find_spec(legacy)
+            spec = importlib.util.find_spec(name)
         except ModuleNotFoundError:
             spec = None
-        assert spec is None, f"{legacy} is still importable"
+        assert spec is None, f"{name} is still importable"

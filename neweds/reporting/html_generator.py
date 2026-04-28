@@ -14,7 +14,7 @@ import numpy as np
 
 from neweds.config import METHOD_INFO, is_directed_method, is_pvalue_method
 from neweds.core.results import AnalysisResult
-from neweds.reporting._adapter import adapter_from_result
+from neweds.reporting.report_context import context_from_result
 from neweds.visualization import plots
 
 
@@ -31,13 +31,13 @@ def write_html_report(
     out.mkdir(parents=True, exist_ok=True)
 
     save_path = out / filename
-    generator = HTMLReportGenerator(adapter_from_result(result))
+    generator = HTMLReportGenerator(context_from_result(result))
     return generator.generate(str(save_path), **kwargs)
 
 
 @dataclass(slots=True)
 class HTMLReportGenerator:
-    """Рендерит HTML-отчёт из объекта типа ReportAdapter."""
+    """Рендерит HTML-отчет из объекта report context."""
 
     tool: object
 

@@ -42,7 +42,7 @@ def test_run_analysis_respects_lag_for_directed_metrics(tmp_path) -> None:
     assert result.metrics["dcor_directed"].contract.directed_lag == 3
 
 
-def test_public_presets_do_not_advertise_legacy_ah_metrics() -> None:
+def test_public_presets_do_not_advertise_opt_in_ah_metrics() -> None:
     variants, _ = expand_variants(["causal", "full", "all"])
 
     assert "ah_full" not in variants

@@ -1,7 +1,8 @@
-"""Адаптер AnalysisResult для генераторов отчётов.
+"""Internal report context built from an AnalysisResult.
 
-HTML/Excel-генераторы исходно работали с legacy BigMasterTool; этот тонкий
-duck-typed слой подаёт им современный AnalysisResult без изменения генераторов.
+Report writers consume this small object instead of reaching into the pipeline
+result directly. It keeps report generation focused on rendering, while the
+pipeline owns computation and result assembly.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ class _LogShim:
         self.items = list(items)
 
 
-class ReportAdapter:
-    """Duck-typed обёртка AnalysisResult для генераторов отчётов."""
+class ReportContext:
+    """Duck-typed context object used by HTML and Excel report writers."""
 
     def __init__(self, result: AnalysisResult) -> None:
         self.result = result
@@ -69,8 +70,8 @@ class ReportAdapter:
         return {}
 
 
-def adapter_from_result(result: AnalysisResult) -> ReportAdapter:
-    return ReportAdapter(result)
+def context_from_result(result: AnalysisResult) -> ReportContext:
+    return ReportContext(result)
 
 
-__all__ = ["ReportAdapter", "adapter_from_result"]
+__all__ = ["ReportContext", "context_from_result"]
