@@ -200,7 +200,9 @@ def partial_correlation_matrix(
                 precision = np.linalg.pinv(corr_matrix)
                 pcor = -precision[0, 1] / np.sqrt(precision[0, 0] * precision[1, 1])
             except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
-                warnings.warn(f"Partial correlation failed for pair ({i}, {j}): {exc}", stacklevel=2)
+                warnings.warn(
+                    f"Partial correlation failed for pair ({i}, {j}): {exc}", stacklevel=2
+                )
                 pcor = np.nan
         out[i, j] = out[j, i] = float(pcor) if np.isfinite(pcor) else np.nan
     return out

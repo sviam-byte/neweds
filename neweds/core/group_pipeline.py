@@ -111,6 +111,7 @@ class GroupComparisonResult:
             **self.extra,
         }
 
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_EXTS = {".csv", ".xlsx", ".xls", ".parquet"}
@@ -743,9 +744,7 @@ def run_group_pipeline(
         ref_dfs = all_dfs
         logger.warning("canonical_reference='all' может давать leakage при train/test сценариях.")
     else:
-        raise ValueError(
-            "canonical_reference must be one of: 'case', 'control', 'all'."
-        )
+        raise ValueError("canonical_reference must be one of: 'case', 'control', 'all'.")
 
     space = fit_canonical_space(ref_dfs, strategy=strategy)
     space.source_info["reference_group"] = ref
@@ -813,9 +812,7 @@ def run_group_pipeline(
     if save_feature_matrix:
         np.save(out / "features_case.npy", feat_case)
         np.save(out / "features_control.npy", feat_control)
-        pd.Series(ids_case).to_csv(
-            out / "subject_ids_case.csv", index=False, header=["subject_id"]
-        )
+        pd.Series(ids_case).to_csv(out / "subject_ids_case.csv", index=False, header=["subject_id"])
         pd.Series(ids_control).to_csv(
             out / "subject_ids_control.csv", index=False, header=["subject_id"]
         )

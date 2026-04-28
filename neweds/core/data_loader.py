@@ -669,5 +669,3 @@ def load_or_generate(
     except Exception as e:
         logging.error(f"[Load] Ошибка загрузки: {e}")
         raise
-
-

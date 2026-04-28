@@ -37,7 +37,7 @@ def granger_matrix(
     from statsmodels.tsa.stattools import grangercausalitytests
 
     n_cols = int(df.shape[1])
-    out = _init_matrix(n_cols, 1.0, diag=0.0)
+    out = _init_matrix(n_cols, np.nan, diag=0.0)
     columns = df.columns.tolist()
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     X = _prepare_numpy(df)
@@ -49,15 +49,17 @@ def granger_matrix(
         mask = col_finite[:, src] & col_finite[:, tgt]
         n_valid = int(mask.sum())
         if n_valid <= min_obs:
-            return src, tgt, 1.0
-        pair_df = pd.DataFrame(
-            {columns[tgt]: X[mask, tgt], columns[src]: X[mask, src]}, copy=False
-        )
+            warnings.warn(
+                f"Granger skipped for pair ({src}, {tgt}): "
+                f"{n_valid} valid observations <= required {min_obs}.",
+                stacklevel=2,
+            )
+            return src, tgt, float("nan")
+        pair_df = pd.DataFrame({columns[tgt]: X[mask, tgt], columns[src]: X[mask, src]}, copy=False)
         try:
             tests = grangercausalitytests(pair_df, maxlag=int(lag), verbose=False)
             p_values = [
-                float(tests[lag_idx][0]["ssr_ftest"][1])
-                for lag_idx in range(1, int(lag) + 1)
+                float(tests[lag_idx][0]["ssr_ftest"][1]) for lag_idx in range(1, int(lag) + 1)
             ]
             p_min = min(p_values) if p_values else 1.0
             p_corr = min(1.0, p_min * max(1, len(p_values)))
@@ -87,7 +89,7 @@ def granger_matrix_partial(
         return granger_matrix(sub, lag=lag, control=None, pairs=pairs)
     columns = list(df.columns)
     n_cols = len(columns)
-    out = _init_matrix(n_cols, 1.0, diag=0.0)
+    out = _init_matrix(n_cols, np.nan, diag=0.0)
     if len(df) <= n_cols + 2:
         logging.warning(
             "Слишком мало данных для Granger partial: строк %s <= колонок %s. Возвращаю NaN.",

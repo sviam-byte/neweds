@@ -24,7 +24,7 @@ def _mat_value_candidates(obj: Any) -> list[tuple[str, np.ndarray]]:
                     if value.size == 1:
                         _walk(prefix, value.reshape(-1)[0])
                     return
-                except Exception:
+                except (IndexError, ValueError):
                     return
             if value.ndim in (1, 2) and np.issubdtype(value.dtype, np.number):
                 out.append((prefix, value))
@@ -66,10 +66,7 @@ def mat_to_dataframe(filepath: str) -> pd.DataFrame:
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     df = pd.DataFrame(arr)
-    try:
-        df.attrs["mat_source"] = str(name)
-    except Exception:
-        pass
+    df.attrs["mat_source"] = str(name)
     return df
 
 

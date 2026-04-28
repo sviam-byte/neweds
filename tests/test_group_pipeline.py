@@ -18,8 +18,8 @@ from neweds.core.group_pipeline import (
     extract_upper_triangle,
     filter_features_by_bin_coverage,
     group_comparison,
-    load_subject,
     load_group,
+    load_subject,
     run_group_pipeline,
 )
 
@@ -72,9 +72,9 @@ def test_missing_bin_qc_table_and_diag_correlation() -> None:
     qc = build_missing_bin_qc_table(dfs)
     qc = qc.sort_values("subject_id").reset_index(drop=True)
 
-    assert list(qc["n_missing_bins"]) == [0, 1]
-    assert np.isclose(float(qc.loc[0, "missing_bin_fraction"]), 0.0)
-    assert np.isclose(float(qc.loc[1, "missing_bin_fraction"]), 0.5)
+    assert list(qc["n_missing_bins"]) == [1, 0]
+    assert np.isclose(float(qc.loc[0, "missing_bin_fraction"]), 0.5)
+    assert np.isclose(float(qc.loc[1, "missing_bin_fraction"]), 0.0)
 
     labels = np.array([1.0, 0.0])
     corr = _point_biserial_binary(labels, qc["n_missing_bins"].to_numpy())
@@ -167,7 +167,9 @@ def test_group_comparison_reports_effect_size_and_respects_pair_mask() -> None:
     assert set(zip(df["bin_i"], df["bin_j"])) == {("b0", "b1"), ("b1", "b2")}
 
 
-def test_load_group_fail_fast_by_default_and_allows_explicit_skip(monkeypatch, tmp_path: Path) -> None:
+def test_load_group_fail_fast_by_default_and_allows_explicit_skip(
+    monkeypatch, tmp_path: Path
+) -> None:
     (tmp_path / "ok.csv").write_text("x,y,z,t0\n0,0,0,1\n", encoding="utf-8")
     (tmp_path / "bad.csv").write_text("x,y,z,t0\n0,0,0,1\n", encoding="utf-8")
 
@@ -210,9 +212,13 @@ def test_group_pipeline_uses_case_control_canonical_references(monkeypatch, tmp_
     monkeypatch.setattr(
         gp,
         "build_missing_bin_qc_table",
-        lambda dfs: pd.DataFrame({"subject_id": list(dfs), "n_missing_bins": [0], "missing_bin_fraction": [0.0]}),
+        lambda dfs: pd.DataFrame(
+            {"subject_id": list(dfs), "n_missing_bins": [0], "missing_bin_fraction": [0.0]}
+        ),
     )
-    monkeypatch.setattr(gp, "build_feature_matrix", lambda dfs, method: (np.array([[0.1]]), list(dfs)))
+    monkeypatch.setattr(
+        gp, "build_feature_matrix", lambda dfs, method: (np.array([[0.1]]), list(dfs))
+    )
     monkeypatch.setattr(
         gp,
         "group_comparison",

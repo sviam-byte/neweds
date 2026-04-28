@@ -192,7 +192,7 @@ def _voxel_id_sort_key(voxel_id: str) -> tuple[int, int, int]:
     try:
         parts = voxel_id.split("_")
         return int(parts[0][1:]), int(parts[1][1:]), int(parts[2][1:])
-    except Exception:
+    except (AttributeError, IndexError, ValueError):
         logger.debug("Некорректный voxel_id при сортировке: %r", voxel_id)
         return 0, 0, 0
 

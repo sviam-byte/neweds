@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 REPORT_CSS = """
 body{font-family:Arial, sans-serif; margin:0; background:#fafafa;}
 header{padding:16px 20px; background:#111; color:#fff;}

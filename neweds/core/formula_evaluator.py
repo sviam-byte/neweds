@@ -168,9 +168,7 @@ def safe_eval_vector(expr: str, *, env: Mapping[str, Any], names: Mapping[str, A
         arr = np.full((int(len(names["t"])),), float(arr), dtype=float)
 
     if arr.shape[0] != len(names["t"]):
-        raise ValueError(
-            f"Formula returned length {arr.shape[0]}, expected {len(names['t'])}"
-        )
+        raise ValueError(f"Formula returned length {arr.shape[0]}, expected {len(names['t'])}")
     return arr
 
 

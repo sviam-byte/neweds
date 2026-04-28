@@ -557,6 +557,7 @@ class HTMLReportGenerator:
         # Явный блок про автокорреляцию/AR-очистку (если включено в параметрах отчёта).
         ac_html = ""
         if include_ar_diagnostics:
+
             def _autocorr_html():
                 out = ""
                 if hasattr(self.tool, "_render_ar_diagnostics_html"):
