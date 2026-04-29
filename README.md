@@ -95,7 +95,3 @@ signal_a, signal_b_lagged, noise_control, seasonal_component
 - [Ограничения](docs/limitations.md)
 - [Refactoring story](docs/refactoring_story.md)
 - [Demo](examples/README.md)
-
-## License
-
-Open-source license сейчас не выдана.
