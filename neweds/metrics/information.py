@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -54,7 +55,11 @@ def _knn_mutual_info(x: np.ndarray, y: np.ndarray, k: int = DEFAULT_K_MI) -> flo
     y = np.asarray(y, dtype=np.float64).ravel()
     n = int(min(x.size, y.size))
     if n <= k or n <= 3:
-        return 0.0
+        warnings.warn(
+            f"Mutual information requires more than max(k={k}, 3) observations; got {n}.",
+            stacklevel=2,
+        )
+        return float("nan")
     x = x[:n]
     y = y[:n]
 
@@ -85,7 +90,11 @@ def _knn_conditional_mutual_info(
         z = z.reshape(-1, 1)
     n = int(min(x.size, y.size, z.shape[0]))
     if n <= k or n <= 3:
-        return 0.0
+        warnings.warn(
+            f"Conditional mutual information requires more than max(k={k}, 3) observations; got {n}.",
+            stacklevel=2,
+        )
+        return float("nan")
     x = x[:n]
     y = y[:n]
     z = z[:n, :]
@@ -120,7 +129,7 @@ def mutual_info_matrix(
     """Взаимная информация (KSG kNN)."""
     n_vars = int(len(data.columns))
     effective = _get_effective_pairs(n_vars, pairs, directed=False)
-    mi_matrix = _init_matrix(n_vars, 0.0, diag=0.0)
+    mi_matrix = _init_matrix(n_vars, np.nan, diag=0.0)
     X = _prepare_numpy(data)
     col_finite = np.isfinite(X)
 
@@ -129,9 +138,14 @@ def mutual_info_matrix(
         mask = col_finite[:, i] & col_finite[:, j]
         n_valid = int(mask.sum())
         if n_valid <= k:
-            return i, j, 0.0
+            warnings.warn(
+                f"Mutual information skipped for pair ({i}, {j}): "
+                f"{n_valid} valid observations <= k={k}.",
+                stacklevel=2,
+            )
+            return i, j, float("nan")
         v = _knn_mutual_info(X[mask, i], X[mask, j], k=k)
-        return i, j, float(v) if np.isfinite(v) else 0.0
+        return i, j, float(v) if np.isfinite(v) else float("nan")
 
     for i, j, value in _try_parallel(_compute_mi_pair, effective, heavy=True):
         mi_matrix[i, j] = mi_matrix[j, i] = value
@@ -156,7 +170,7 @@ def mutual_info_matrix_partial(
         return mutual_info_matrix(sub, lag=lag, control=None, k=k, pairs=pairs)
     cols = list(data.columns)
     n_cols = len(cols)
-    pmi = _init_matrix(n_cols, 0.0, diag=0.0)
+    pmi = _init_matrix(n_cols, np.nan, diag=0.0)
     it = (
         _iter_pairs(n_cols, pairs, directed=False)
         if pairs is not None
@@ -168,23 +182,31 @@ def mutual_info_matrix_partial(
         z_cols = [c for c in z_cols if c in data.columns and c not in (xi, xj)]
         if not z_cols:
             pair = data[[xi, xj]].dropna()
-            value = (
-                float(_knn_mutual_info(pair[xi].values, pair[xj].values, k=k))
-                if pair.shape[0] > k
-                else 0.0
-            )
+            if pair.shape[0] <= k:
+                warnings.warn(
+                    f"Partial mutual information skipped for pair ({i}, {j}): "
+                    f"{pair.shape[0]} valid observations <= k={k}.",
+                    stacklevel=2,
+                )
+                value = float("nan")
+            else:
+                value = float(_knn_mutual_info(pair[xi].values, pair[xj].values, k=k))
         else:
             sub = data[[xi, xj] + z_cols].dropna()
-            value = (
-                float(
+            if sub.shape[0] <= k:
+                warnings.warn(
+                    f"Conditional mutual information skipped for pair ({i}, {j}): "
+                    f"{sub.shape[0]} valid observations <= k={k}.",
+                    stacklevel=2,
+                )
+                value = float("nan")
+            else:
+                value = float(
                     _knn_conditional_mutual_info(
                         sub[xi].values, sub[xj].values, sub[z_cols].values, k=k
                     )
                 )
-                if sub.shape[0] > k
-                else 0.0
-            )
-        pmi[i, j] = pmi[j, i] = value if np.isfinite(value) else 0.0
+        pmi[i, j] = pmi[j, i] = value if np.isfinite(value) else np.nan
     return pmi
 
 
@@ -239,8 +261,8 @@ def _dcor(x: np.ndarray, y: np.ndarray) -> float:
         try:
             val = float(pkg.distance_correlation(x, y, method="AVL"))
             return val if np.isfinite(val) else np.nan
-        except Exception:
-            pass
+        except (TypeError, ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            logging.debug("dcor package failed; using local distance correlation: %s", exc)
 
     dcov2 = _dcov_sq(x, y)
     dvar_x = _dcov_sq(x, x)
@@ -394,9 +416,7 @@ def _H_ratio_direction(
     if target_distances.ndim != 2 or target_distances.shape[1] < 2:
         return None
 
-    target_nearest_distance = np.where(
-        target_distances[:, 1] == 0.0, 1e-10, target_distances[:, 1]
-    )
+    target_nearest_distance = np.where(target_distances[:, 1] == 0.0, 1e-10, target_distances[:, 1])
     ratios = target_distance_by_source_neighbor / target_nearest_distance
     ratios = ratios[np.isfinite(ratios)]
     return float(np.mean(ratios)) if ratios.size > 0 else None
@@ -460,9 +480,9 @@ def compute_partial_AH_matrix(
 
         model = VAR(df.values).fit(int(max(1, lag)), ic=None)
         residualized = pd.DataFrame(model.resid, columns=df.columns)
-    except Exception as exc:
-        logging.warning("[AH] VAR residualization failed; using raw data: %s", exc)
-        residualized = df
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+        logging.warning("[AH] VAR residualization failed; returning NaN matrix: %s", exc)
+        return _init_matrix(n_cols, np.nan, diag=0.0)
     return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs)
 
 

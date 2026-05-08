@@ -63,7 +63,7 @@ def build_neighbor_pairs(
             continue
         try:
             x, y, z = int(r.get("x")), int(r.get("y")), int(r.get("z"))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             continue
         coord_to_idx[(x, y, z)] = int(col_to_idx[vid])
 

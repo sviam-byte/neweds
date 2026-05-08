@@ -1,23 +1,21 @@
 # Refactoring story
 
-This project started as a compact exploratory analysis script and is being gradually refactored into a cleaner scientific Python package.
+NewEDS started as a compact research script and was later split into a small Python package for tabular time-series connectivity analysis.
 
 ## Initial state
 
-- monolithic analysis flow;
-- mixed loading, preprocessing, metrics and reporting;
-- domain-specific group labels;
-- report generation coupled to an older result structure;
-- broad fallback handling in exploratory branches.
+- loading, preprocessing, metric execution and reporting lived in one flow;
+- report generation depended on an older result shape;
+- group comparison used domain-specific labels;
+- fallback handling was broad in several exploratory branches.
 
 ## Current state
 
-- stable single-file connectivity pipeline;
-- metric registry as the source of truth;
-- neutral case/control group layer;
-- isolated restricted formula evaluator;
-- split documentation;
-- tests for public API, CLI and metric behavior.
+- the single-file tabular pipeline is the stable entry point;
+- metric metadata and lookup live in the registry;
+- case/control naming is neutral in the group layer;
+- formula evaluation is isolated behind a restricted evaluator;
+- tests cover the public API, CLI, loader behavior and metric regressions.
 
 ## Remaining technical debt
 
@@ -26,7 +24,3 @@ This project started as a compact exploratory analysis script and is being gradu
 - split preprocessing into smaller stages;
 - make group pipeline thinner;
 - tighten optional dependency handling.
-
-## Why this is kept visible
-
-The repository is intended as a portfolio project: it shows both the final toolkit and the engineering process of turning exploratory scientific code into a more maintainable package.

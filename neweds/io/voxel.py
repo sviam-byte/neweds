@@ -65,8 +65,8 @@ def detect_time_like_col(col: pd.Series) -> bool:
             dt = pd.to_datetime(probe, errors="coerce", utc=False)
         if dt.notna().mean() >= 0.9:
             return dt.is_monotonic_increasing or dt.is_monotonic_decreasing
-    except Exception:
-        pass
+    except (TypeError, ValueError, OverflowError) as exc:
+        logging.debug("Datetime probe failed while detecting time-like column: %s", exc)
     return False
 
 
@@ -98,7 +98,7 @@ def _select_voxels_wide(
         return df
     try:
         k = int(feature_limit)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return df
     if k <= 0 or int(df.shape[0]) <= k:
         return df

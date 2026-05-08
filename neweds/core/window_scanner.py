@@ -58,7 +58,7 @@ def analyze_sliding_windows(
 
     try:
         nj = int(n_jobs) if n_jobs is not None else 1
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         nj = 1
     nj = int(max(1, nj))
 

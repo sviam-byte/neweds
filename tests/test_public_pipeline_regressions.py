@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from neweds.config import AnalysisConfig
 import neweds.core.pipeline as public_pipeline
+from neweds.config import AnalysisConfig
 from neweds.core.pipeline import run_analysis
 from neweds.core.variant_presets import expand_variants
 from neweds.metrics.connectivity import lagged_directed_correlation
@@ -109,7 +109,9 @@ def test_run_analysis_rejects_missing_and_nonnumeric_controls(monkeypatch) -> No
     monkeypatch.setattr(public_pipeline, "load_or_generate", _fake_loader)
 
     with pytest.raises(ValueError, match="Unknown control"):
-        run_analysis("input.csv", AnalysisConfig(variants=["correlation_full"], controls=["missing"]))
+        run_analysis(
+            "input.csv", AnalysisConfig(variants=["correlation_full"], controls=["missing"])
+        )
 
     with pytest.raises(ValueError, match="numeric"):
         run_analysis("input.csv", AnalysisConfig(variants=["correlation_full"], controls=["label"]))

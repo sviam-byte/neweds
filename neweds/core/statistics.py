@@ -83,7 +83,7 @@ def residualize_series(y: np.ndarray, X: np.ndarray) -> np.ndarray:
         m = np.nanmean(resid)
         resid = np.where(np.isfinite(resid), resid, m)
         return resid
-    except Exception:
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError):
         return y - np.nanmean(y)
 
 
@@ -124,7 +124,7 @@ def pair_score(
                 return float("nan")
             return float(1.0 - np.clip(v, 0.0, 1.0))
         return float(abs(v)) if np.isfinite(v) else float("nan")
-    except Exception:
+    except (TypeError, ValueError, IndexError):
         return float("nan")
 
 
@@ -137,7 +137,7 @@ def select_best_median_worst(items: list[dict], *, key: str = "metric") -> dict:
     for i, it in enumerate(items):
         try:
             v = float(it.get(key, float("nan")))
-        except Exception:
+        except (TypeError, ValueError):
             v = float("nan")
         if np.isfinite(v):
             vals.append((i, v))

@@ -119,7 +119,9 @@ def read_csv_with_encoding_fallback(filepath: str, **kw):
 def csv_probe_ncols(filepath: str, *, nrows: int = 2) -> int:
     """Быстро узнаёт число колонок CSV без полной загрузки файла; 0 при ошибке."""
     try:
-        probe = read_csv_with_encoding_fallback(filepath, header=None, nrows=nrows, low_memory=False)
+        probe = read_csv_with_encoding_fallback(
+            filepath, header=None, nrows=nrows, low_memory=False
+        )
         return int(probe.shape[1])
     except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as exc:
         logging.debug("CSV column probe failed for %s: %s", filepath, exc)

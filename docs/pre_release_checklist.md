@@ -1,9 +1,34 @@
 # Pre-release checklist
 
-- Generated Python caches are not included:
+- Test suite passes:
 
 ```bash
-find . -name "__pycache__" -o -name "*.pyc"
+pytest
 ```
 
-The command should return no paths.
+- Lint and format checks pass:
+
+```bash
+ruff check .
+ruff format --check .
+```
+
+- Demo CLI command runs from a clean checkout:
+
+```bash
+python -m neweds.cli examples/demo_timeseries.csv --output-dir outputs/demo
+```
+
+- Generated files are not committed:
+
+```bash
+git status --short --ignored
+```
+
+Check that `__pycache__`, `.pytest_cache`, `.ruff_cache`, `outputs/`, reports and local data files are absent from tracked changes.
+
+- README commands are still correct.
+- No large local datasets are staged.
+- No private paths, usernames, tokens or absolute machine-specific paths are present.
+- License status is explicit in `README.md`.
+- `examples/run_demo.sh` has executable mode in Git when publishing from a Unix-like environment.

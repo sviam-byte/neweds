@@ -100,7 +100,9 @@ def _resolve_controls(
     missing = [c for c in requested if c not in data.columns]
     if missing:
         raise ValueError(f"Unknown control columns: {missing}")
-    nonnumeric = [c for c in requested if c in data.columns and not pd.api.types.is_numeric_dtype(data[c])]
+    nonnumeric = [
+        c for c in requested if c in data.columns and not pd.api.types.is_numeric_dtype(data[c])
+    ]
     if nonnumeric:
         raise ValueError(f"Control columns must be numeric: {nonnumeric}")
 
@@ -198,7 +200,9 @@ def _run_windows(
     if not config.window_sizes:
         return {}
     windows: dict[str, dict[str, Any]] = {}
-    stride_default = config.window_stride or max(1, min(int(config.window_sizes[0]), len(signal_data)) // 2)
+    stride_default = config.window_stride or max(
+        1, min(int(config.window_sizes[0]), len(signal_data)) // 2
+    )
     for variant in variants:
         metric = get_metric(variant)
         per_size: dict[int, dict[str, Any]] = {}
@@ -336,7 +340,9 @@ def run_analysis(
             metadata=metadata,
             contract=contract,
         )
-        logs.append(f"Computed {variant}: shape={matrix_np.shape} lag={used_lag if metric.directed else 'none'}")
+        logs.append(
+            f"Computed {variant}: shape={matrix_np.shape} lag={used_lag if metric.directed else 'none'}"
+        )
 
     windows = _run_windows(
         signal_data,

@@ -60,9 +60,7 @@ def test_registry_metadata_consistency() -> None:
         seen_names.add(m.name)
         assert m.category in VALID_CATEGORIES, f"{m.name}: invalid category {m.category}"
         partial_mode = getattr(m, "partial_mode", "none")
-        assert partial_mode in VALID_PARTIAL_MODES, (
-            f"{m.name}: invalid partial_mode {partial_mode}"
-        )
+        assert partial_mode in VALID_PARTIAL_MODES, f"{m.name}: invalid partial_mode {partial_mode}"
         if m.supports_control:
             assert partial_mode != "none", (
                 f"{m.name}: supports_control=True but partial_mode='none'"

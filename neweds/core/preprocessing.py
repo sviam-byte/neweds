@@ -622,7 +622,10 @@ def preprocess_timeseries(
 
     if log_transform:
         report.add("[Preprocess] log-transform: applied to positive values")
-        fn = lambda x: np.log(x) if x is not None and not np.isnan(x) and x > 0 else x
+
+        def fn(x):
+            return np.log(x) if x is not None and not np.isnan(x) and x > 0 else x
+
         try:
             out = out.map(fn)  # type: ignore[attr-defined]
         except AttributeError:
@@ -977,7 +980,9 @@ def preprocess_timeseries(
                                 for k in range(1, p_order + 1)
                             }
                     except (KeyError, ValueError, TypeError, FloatingPointError) as exc:
-                        report.add(f"[Preprocess] AR diagnostics after-example skipped for {col}: {exc}")
+                        report.add(
+                            f"[Preprocess] AR diagnostics after-example skipped for {col}: {exc}"
+                        )
             ac_note["examples"] = ex
 
             try:
