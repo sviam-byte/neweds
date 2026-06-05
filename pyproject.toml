@@ -50,6 +50,7 @@ io = [
 [project.scripts]
 neweds = "neweds.cli:main"
 neweds-group = "neweds.cli_group:main"
+neweds-fmri-audit = "neweds.cli_fmri_audit:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

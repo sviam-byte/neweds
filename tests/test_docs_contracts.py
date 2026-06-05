@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -48,3 +47,24 @@ def test_runtime_contract_contains_required_flow_constraints() -> None:
     assert "Keep at most five active records at a time" in text
     assert "Never produce a novelty verdict without `SearchTrace`" in text
     assert "forbidden-verdict check" in text
+
+
+def test_fmri_roi_audit_docs_include_subject_level_outputs_and_limits() -> None:
+    text = _read("docs/fmri_roi_audit.md")
+    assert "subject_level_fc_summary.csv" in text
+    assert "subject_level_group_comparison.csv" in text
+    assert "outputs/figures" in text
+    assert "outputs/preprocessed" in text
+    assert "<group>_<subject_id>_pearson_z.npy" in text
+    assert "AR(2) coefficients" in text
+    assert "fc_group_comparison_edges_ttest.csv" in text
+    assert "permutation_summary.csv" in text
+    assert "conservative common-bad-ROI baseline remains the default FC path" in text
+    assert "alternative FC/statistics path" in text
+    assert "threshold" in text
+    assert "hcp_region_adjacency_report.csv" in text
+    assert "volume-space atlas geometry only" in text
+    assert "functional homogeneity" in text
+    assert "mean_abs_fc" in text
+    assert "not a classifier" in text
+    assert "Lobe/system summaries are intentionally deferred" in text

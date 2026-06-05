@@ -4,6 +4,10 @@ NewEDS - Python-проект для анализа связности много
 
 Основной сценарий: взять CSV/Excel-таблицу, применить preprocessing, посчитать connectivity-метрики между каналами и сохранить HTML/Excel-отчет. Дополнительные сценарии для group comparison, HDF5/fMRI-like данных и voxel/bin-представлений остаются экспериментальными.
 
+NewEDS is also an experimental pipeline for auditing how fMRI-like functional connectivity results depend on node definition, regional signal construction, temporal preprocessing, and connectivity metric choice. The goal is not to provide a clinical biomarker, but to make the preprocessing and metric-comparison steps explicit, auditable, and reproducible.
+
+The project treats brain regions not as automatically valid units, but as objects that require quality control. Spatial bins or atlas parcels are candidate nodes: their mask validity and internal functional homogeneity should be checked before representative time series are used for connectivity analysis.
+
 ## Стабильное ядро
 
 - загрузка табличных временных рядов из CSV и Excel;
@@ -80,18 +84,23 @@ signal_a, signal_b_lagged, noise_control, seasonal_component
 
 ## Экспериментальные сценарии
 
+- signal QC before connectivity: ROI/bin homogeneity checks, regional-signal construction choices, and PCA sign-orientation metadata;
+- `neweds-fmri-audit` для первичного аудита уже извлечённых ROI time series HC/SZ: inventory, ROI QC, temporal QC, baseline Pearson FC и FDR;
+- node-definition QC for experimental voxel/bin workflows: mask coverage, volume-space adjacency constrained by mask, and explicit warnings that XYZ adjacency is not cortical-surface adjacency;
 - `neweds-group` для case/control-сравнения;
 - HDF5/fMRI-like эксперименты;
 - выравнивание voxel/bin-пространства;
 - validation-сценарии.
 
-Эти сценарии полезны для раннего анализа и проверки pipeline на исследовательских данных, но их результаты нужно валидировать отдельно. Подробнее: [Ограничения](docs/limitations.md).
+Эти сценарии полезны для раннего анализа и проверки pipeline на исследовательских данных, но их результаты нужно валидировать отдельно. Подробнее: [fMRI ROI audit MVP](docs/fmri_roi_audit.md), [Signal QC protocol](docs/fmri_signal_qc_protocol.md) и [Ограничения](docs/limitations.md).
 
 ## Документация
 
 - [Архитектура](docs/architecture.md)
 - [Метрики](docs/metrics.md)
 - [Group pipeline](docs/group_pipeline.md)
+- [fMRI ROI audit MVP](docs/fmri_roi_audit.md)
+- [fMRI-like signal QC protocol](docs/fmri_signal_qc_protocol.md)
 - [Ограничения](docs/limitations.md)
 - [Refactoring story](docs/refactoring_story.md)
 - [Demo](examples/README.md)

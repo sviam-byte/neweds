@@ -165,6 +165,77 @@ def _standardize_matrix(data: pd.DataFrame) -> tuple[np.ndarray, dict]:
     return x, meta
 
 
+def _safe_corr_1d(a: np.ndarray, b: np.ndarray, *, eps: float = 1e-12) -> float:
+    aa = np.asarray(a, dtype=float)
+    bb = np.asarray(b, dtype=float)
+    mask = np.isfinite(aa) & np.isfinite(bb)
+    if int(np.sum(mask)) < 3:
+        return float("nan")
+    aa = aa[mask]
+    bb = bb[mask]
+    if float(np.std(aa)) <= eps or float(np.std(bb)) <= eps:
+        return float("nan")
+    out = float(np.corrcoef(aa, bb)[0, 1])
+    return out if np.isfinite(out) else float("nan")
+
+
+def _orient_pca_sign(
+    x: np.ndarray,
+    scores: np.ndarray,
+    comps: np.ndarray,
+    orient_sign: str = "none",
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Orient PC1 for sign-sensitive downstream metrics.
+
+    PCA signs are mathematically arbitrary. This helper only touches the first
+    component and records enough metadata for reports/tests to see what happened.
+    """
+    mode = str(orient_sign or "none").strip().lower()
+    if mode not in {"none", "mean_corr", "sum_loading"}:
+        mode = "none"
+
+    meta = {
+        "pca_orient_sign": mode,
+        "orientation_rule": "none",
+        "sign_flip": False,
+        "corr_pc1_mean": None,
+        "pc1_loading_sum": None,
+    }
+    if mode == "none" or scores.size == 0 or comps.size == 0:
+        return scores, comps, meta
+
+    scores = np.asarray(scores, dtype=float).copy()
+    comps = np.asarray(comps, dtype=float).copy()
+    loading_sum = float(np.nansum(comps[0])) if comps.shape[0] >= 1 else float("nan")
+    meta["pc1_loading_sum"] = loading_sum if np.isfinite(loading_sum) else None
+
+    flip = False
+    if mode == "mean_corr":
+        mean_signal = np.nanmean(np.asarray(x, dtype=float), axis=1)
+        corr_pc1_mean = _safe_corr_1d(scores[:, 0], mean_signal)
+        meta["corr_pc1_mean"] = corr_pc1_mean if np.isfinite(corr_pc1_mean) else None
+        if np.isfinite(corr_pc1_mean):
+            flip = corr_pc1_mean < 0.0
+            meta["orientation_rule"] = "mean_corr"
+        elif np.isfinite(loading_sum):
+            flip = loading_sum < 0.0
+            meta["orientation_rule"] = "sum_loading_fallback"
+    elif mode == "sum_loading":
+        if np.isfinite(loading_sum):
+            flip = loading_sum < 0.0
+            meta["orientation_rule"] = "sum_loading"
+
+    if flip:
+        scores[:, 0] *= -1.0
+        comps[0, :] *= -1.0
+        meta["sign_flip"] = True
+        if meta["corr_pc1_mean"] is not None:
+            meta["corr_pc1_mean"] = float(-meta["corr_pc1_mean"])
+        if meta["pc1_loading_sum"] is not None:
+            meta["pc1_loading_sum"] = float(-meta["pc1_loading_sum"])
+    return scores, comps, meta
+
+
 def _choose_k_from_priority(
     *,
     eigvals_desc: np.ndarray | None,
@@ -256,6 +327,7 @@ def _pca_reduce(
     solver: str = "full",
     mapping_topk: int | None = None,
     mapping_min_abs: float | None = None,
+    orient_sign: str = "none",
 ) -> DimRedResult:
     """PCA по оси колонок (рядам): вход T×N -> выход T×K.
 
@@ -267,6 +339,11 @@ def _pca_reduce(
     priority:
       - "explained_variance" | "n_components" | "auto"
       Если заданы и target_n, и target_var, выбираем согласно priority.
+
+    orient_sign:
+      - "none" keeps historical PCA signs for backward compatibility.
+      - "mean_corr" flips PC1 when corr(PC1, mean standardized signal) < 0.
+      - "sum_loading" flips PC1 when the sum of PC1 loadings is negative.
     """
     solver_norm = (solver or "full").strip().lower()
     if solver_norm in {"gram", "gram_matrix", "gram-matrix", "grammatrix"}:
@@ -316,6 +393,7 @@ def _pca_reduce(
         # Components V^T = (S^{-1} U^T X)
         denom = np.where(s == 0.0, 1.0, s)
         comps = (u[:, :k].T @ x) / denom.reshape(-1, 1)  # (k x N)
+        scores, comps, orientation_meta = _orient_pca_sign(x, scores, comps, orient_sign)
 
         cols = [f"pc_{i + 1:04d}" for i in range(int(k))]
         reduced = pd.DataFrame(scores, index=data.index, columns=cols)
@@ -354,6 +432,7 @@ def _pca_reduce(
             "n_samples": n_samples,
             "n_features": n_features,
             **x_meta,
+            **orientation_meta,
         }
         return DimRedResult(reduced=reduced, mapping=pd.DataFrame(mapping_rows), meta=meta)
 
@@ -386,15 +465,16 @@ def _pca_reduce(
         svd_solver=("randomized" if solver_norm == "randomized" else "full"),
     )
     scores = pca.fit_transform(x)
+    comps = np.asarray(getattr(pca, "components_", np.empty((0, n_features))), dtype=float)
+    scores, comps, orientation_meta = _orient_pca_sign(x, scores, comps, orient_sign)
 
     k_out = int(scores.shape[1])
     cols = [f"pc_{i + 1:04d}" for i in range(k_out)]
     reduced = pd.DataFrame(scores, index=data.index, columns=cols)
 
     mapping_rows = []
-    if getattr(pca, "components_", None) is not None:
+    if comps.size:
         sources = np.asarray([str(c) for c in data.columns], dtype=object)
-        comps = np.asarray(pca.components_, dtype=float)
 
         topk = _as_positive_int(mapping_topk)
         min_abs = _as_nonnegative_float(mapping_min_abs)
@@ -434,6 +514,7 @@ def _pca_reduce(
         "n_samples": n_samples,
         "n_features": n_features,
         **x_meta,
+        **orientation_meta,
     }
     return DimRedResult(reduced=reduced, mapping=pd.DataFrame(mapping_rows), meta=meta)
 
@@ -497,6 +578,7 @@ def apply_dimred(
     spatial_bin: int = 2,
     pca_priority: str = "auto",
     pca_solver: str = "full",
+    pca_orient_sign: str = "none",
     mapping_topk: int | None = None,
     mapping_min_abs: float | None = None,
 ) -> DimRedResult:
@@ -532,6 +614,7 @@ def apply_dimred(
             solver=pca_solver,
             mapping_topk=mapping_topk,
             mapping_min_abs=mapping_min_abs,
+            orient_sign=pca_orient_sign,
         )
     if method_norm in {"pca_gram", "pca_gram_matrix"}:
         return _pca_reduce(
@@ -543,6 +626,7 @@ def apply_dimred(
             solver="gram",
             mapping_topk=mapping_topk,
             mapping_min_abs=mapping_min_abs,
+            orient_sign=pca_orient_sign,
         )
     if method_norm in {"pca_randomized", "pca_rand", "pca_random"}:
         return _pca_reduce(
@@ -554,6 +638,7 @@ def apply_dimred(
             solver="randomized",
             mapping_topk=mapping_topk,
             mapping_min_abs=mapping_min_abs,
+            orient_sign=pca_orient_sign,
         )
 
     return _variance_select(data, target_n or n_features)
