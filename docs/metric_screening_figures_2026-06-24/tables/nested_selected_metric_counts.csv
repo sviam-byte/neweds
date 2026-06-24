@@ -1,0 +1,15 @@
+﻿scope,metric,size,scope_label
+AAL3_whole_roi,dcor_partial,2,AAL3 whole ROI
+AAL3_whole_roi,granger_partial,1,AAL3 whole ROI
+AAL3_whole_roi,te_full,2,AAL3 whole ROI
+HCP360_GM_active_mean,correlation_directed,1,HCP360 GM
+HCP360_GM_active_mean,correlation_full,1,HCP360 GM
+HCP360_GM_active_mean,te_full,2,HCP360 GM
+HCP360_GM_active_mean,te_partial,1,HCP360 GM
+HCP360_whole_brain,correlation_kendall,1,HCP360 whole
+HCP360_whole_brain,correlation_spearman,1,HCP360 whole
+HCP360_whole_brain,h2_partial,1,HCP360 whole
+HCP360_whole_brain,te_partial,2,HCP360 whole
+tissue_mean_GM_WM_CSF,dcor_directed,1,Tissue GM/WM/CSF
+tissue_mean_GM_WM_CSF,granger_full,2,Tissue GM/WM/CSF
+tissue_mean_GM_WM_CSF,te_full,2,Tissue GM/WM/CSF

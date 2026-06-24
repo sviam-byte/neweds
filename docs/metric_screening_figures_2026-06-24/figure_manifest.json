@@ -1,0 +1,12 @@
+{
+  "Exploratory per-metric ranking": "figures/metrics/01_metric_overall_ranking.png",
+  "Metric by scope heatmap": "figures/metrics/02_metric_scope_heatmap.png",
+  "Nested performance vs label-shuffle null": "figures/metrics/03_nested_vs_label_shuffle_null.png",
+  "Nested train-fold metric choices": "figures/metrics/04_nested_selected_metrics.png",
+  "Best score by window and lag": "figures/metrics/05_window_lag_grid.png",
+  "Subject coverage by scope": "figures/preanalysis/01_subject_coverage.png",
+  "Input dimensions by scope": "figures/preanalysis/02_input_dimensions.png",
+  "QC global distributions": "figures/preanalysis/03_qc_global_std_ar1.png",
+  "Valid nodes by scope": "figures/preanalysis/04_valid_nodes.png",
+  "Compute time by metric": "figures/preanalysis/05_metric_compute_time.png"
+}

@@ -1,0 +1,5 @@
+﻿scope,n_subjects,n_nodes,n_timepoints,scope_label
+AAL3_whole_roi,39,167.0,600.0,AAL3 whole ROI
+HCP360_GM_active_mean,38,360.0,600.0,HCP360 GM
+HCP360_whole_brain,38,360.0,600.0,HCP360 whole
+tissue_mean_GM_WM_CSF,39,3.0,600.0,Tissue GM/WM/CSF

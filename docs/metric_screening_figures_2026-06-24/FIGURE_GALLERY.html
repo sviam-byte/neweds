@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wide HC/SZ Metric Screening Figures</title>
+  <style>
+    body { margin: 0; font-family: Segoe UI, Arial, sans-serif; background: #f5f7fb; color: #15202b; }
+    main { max-width: 1180px; margin: 0 auto; padding: 28px; }
+    h1 { margin: 0 0 8px; }
+    .muted { color: #5b6878; }
+    .card { background: white; border: 1px solid #d9e0ea; border-radius: 8px; padding: 18px; margin: 18px 0; }
+    .card h2 { margin: 0 0 14px; font-size: 20px; }
+    img { max-width: 100%; height: auto; display: block; border: 1px solid #e5eaf1; }
+    code { background: #eef2f7; padding: 2px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wide HC/SZ Metric Screening Figures</h1>
+  <p class="muted">Source: <code>outputs\run_paths\new_results\2026-06-24_metric-classifier-wide-no-leak-screening</code>. Real HC/SZ figures use 600 time points; 1000-point HDF5 voxel files are not included in this result.</p>
+  <section class="card"><h2>Exploratory per-metric ranking</h2><a href="figures/metrics/01_metric_overall_ranking.png"><img src="figures/metrics/01_metric_overall_ranking.png" alt="Exploratory per-metric ranking"></a></section>
+<section class="card"><h2>Metric by scope heatmap</h2><a href="figures/metrics/02_metric_scope_heatmap.png"><img src="figures/metrics/02_metric_scope_heatmap.png" alt="Metric by scope heatmap"></a></section>
+<section class="card"><h2>Nested performance vs label-shuffle null</h2><a href="figures/metrics/03_nested_vs_label_shuffle_null.png"><img src="figures/metrics/03_nested_vs_label_shuffle_null.png" alt="Nested performance vs label-shuffle null"></a></section>
+<section class="card"><h2>Nested train-fold metric choices</h2><a href="figures/metrics/04_nested_selected_metrics.png"><img src="figures/metrics/04_nested_selected_metrics.png" alt="Nested train-fold metric choices"></a></section>
+<section class="card"><h2>Best score by window and lag</h2><a href="figures/metrics/05_window_lag_grid.png"><img src="figures/metrics/05_window_lag_grid.png" alt="Best score by window and lag"></a></section>
+<section class="card"><h2>Subject coverage by scope</h2><a href="figures/preanalysis/01_subject_coverage.png"><img src="figures/preanalysis/01_subject_coverage.png" alt="Subject coverage by scope"></a></section>
+<section class="card"><h2>Input dimensions by scope</h2><a href="figures/preanalysis/02_input_dimensions.png"><img src="figures/preanalysis/02_input_dimensions.png" alt="Input dimensions by scope"></a></section>
+<section class="card"><h2>QC global distributions</h2><a href="figures/preanalysis/03_qc_global_std_ar1.png"><img src="figures/preanalysis/03_qc_global_std_ar1.png" alt="QC global distributions"></a></section>
+<section class="card"><h2>Valid nodes by scope</h2><a href="figures/preanalysis/04_valid_nodes.png"><img src="figures/preanalysis/04_valid_nodes.png" alt="Valid nodes by scope"></a></section>
+<section class="card"><h2>Compute time by metric</h2><a href="figures/preanalysis/05_metric_compute_time.png"><img src="figures/preanalysis/05_metric_compute_time.png" alt="Compute time by metric"></a></section>
+</main>
+</body>
+</html>

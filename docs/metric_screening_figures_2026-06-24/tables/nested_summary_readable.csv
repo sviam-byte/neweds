@@ -1,0 +1,9 @@
+﻿Метрика / модель,Результат,По каким данным,Параметры
+all 26 combined,"BA 0.796, AUC 0.869",AAL3 whole ROI; 39 subj: HC=15/SZ=24; 167 ROI; 600 точек,nested outer=5/inner=4; all 156 tasks
+nested-selected single metric,"BA 0.725, AUC 0.697",AAL3 whole ROI; 39 subj: HC=15/SZ=24; 167 ROI; 600 точек,train-only выбор одной task
+all 26 combined,"BA 0.804, AUC 0.860",HCP360 GM active-mean; 38 subj: HC=14/SZ=24; 360 ROI; 600 точек,nested outer=5/inner=4; all 156 tasks
+nested-selected single metric,"BA 0.747, AUC 0.759",HCP360 GM active-mean; 38 subj: HC=14/SZ=24; 360 ROI; 600 точек,train-only выбор одной task
+all 26 combined,"BA 0.762, AUC 0.798",HCP360 whole-brain; 38 subj: HC=14/SZ=24; 360 ROI; 600 точек,nested outer=5/inner=4; all 156 tasks
+nested-selected single metric,"BA 0.696, AUC 0.726",HCP360 whole-brain; 38 subj: HC=14/SZ=24; 360 ROI; 600 точек,train-only выбор одной task
+all 26 combined,"BA 0.754, AUC 0.722",tissue mean GM/WM/CSF; 39 subj: HC=15/SZ=24; 3 tissue rows; 600 точек,nested outer=5/inner=4; all 156 tasks
+nested-selected single metric,"BA 0.667, AUC 0.686",tissue mean GM/WM/CSF; 39 subj: HC=15/SZ=24; 3 tissue rows; 600 точек,train-only выбор одной task
