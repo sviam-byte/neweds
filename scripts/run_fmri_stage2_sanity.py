@@ -19,6 +19,7 @@ PRIMARY_BRANCHES = ("baseline", "detrended", "AR1_residualized", "AR1_plus_detre
 SANITY_METRICS = (
     "correlation_full",
     "correlation_partial",
+    "wavelet_full",
     "correlation_directed",
     "granger_full",
 )

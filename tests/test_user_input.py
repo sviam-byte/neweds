@@ -61,3 +61,12 @@ def test_expand_variants_all_matches_registry() -> None:
     assert "h2_directed" in variants
     assert "granger_partial" in variants
     assert "te_directed" not in variants
+
+
+def test_expand_variants_spectral_includes_wavelet_family() -> None:
+    variants, explain = expand_variants(["spectral"])
+
+    assert "preset 'spectral'" in explain
+    assert "coherence_full" in variants
+    assert "wavelet_full" in variants
+    assert "wavelet_partial" in variants

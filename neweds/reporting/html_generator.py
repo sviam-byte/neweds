@@ -525,6 +525,16 @@ class HTMLReportGenerator:
         harmonic_top_k = int(kwargs.get("harmonic_top_k", 5))
         graph_threshold = kwargs.get("graph_threshold", 0.2)
         p_alpha = kwargs.get("p_alpha", 0.05)
+        cfg = getattr(self.tool, "config", None)
+        large_matrix_html_limit = int(
+            max(
+                1,
+                kwargs.get(
+                    "large_matrix_html_limit",
+                    getattr(cfg, "large_matrix_html_limit", 250),
+                ),
+            )
+        )
 
         df, report_layer, report_candidates = self._resolve_report_dataframe()
         if df is None:
@@ -996,6 +1006,24 @@ class HTMLReportGenerator:
             except Exception:
                 pair_table_html = ""
 
+            arr = np.asarray(mat)
+            matrix_n = int(arr.shape[0]) if arr.ndim == 2 else len(cols)
+            is_large_matrix = matrix_n > large_matrix_html_limit
+            plot_mat = mat
+            plot_cols = cols
+            large_matrix_note = ""
+            if is_large_matrix and arr.ndim == 2:
+                preview_n = min(large_matrix_html_limit, matrix_n, arr.shape[1])
+                plot_mat = arr[:preview_n, :preview_n]
+                plot_cols = cols[:preview_n]
+                large_matrix_note = (
+                    "<div class='meta'><b>Large matrix preview:</b> "
+                    f"showing first {preview_n} of {matrix_n} nodes. "
+                    "Full matrix is available through connectivity exports.</div>"
+                )
+                mat = plot_mat
+                cols = plot_cols
+
             legend = f"Lag={chosen_lag}"
             buf_heat = plots.plot_heatmap(
                 mat, f"{variant} Теплокарта", labels=cols, legend_text=legend
@@ -1020,7 +1048,7 @@ class HTMLReportGenerator:
             ]
 
             table_html = ""
-            if include_matrix_tables:
+            if include_matrix_tables and not is_large_matrix:
                 table_html = f"<h4>Матрица значений (Lag={chosen_lag})</h4>" + self._matrix_table(
                     mat, cols
                 )
@@ -1060,13 +1088,14 @@ class HTMLReportGenerator:
                 f"<section class='card' id='{anchor}'>"
                 f"<h2>{html.escape(info['title'])}</h2>"
                 f"<div class='muted'>{html.escape(info.get('meaning', ''))}</div>"
-                f"{meta_html}{cube_html}{pair_table_html}"
+                f"{meta_html}{large_matrix_note}{cube_html}{pair_table_html}"
                 f"{self._carousel(car_items, f'c_{k}')}"
                 f"{win_curve_html}"
                 f"{scans_html}"
                 f"{table_html}"
                 f"</section>"
             )
+            cols = list(df.columns)
 
         scan_js = """<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <script>

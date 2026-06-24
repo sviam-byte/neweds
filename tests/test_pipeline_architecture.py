@@ -90,3 +90,33 @@ def test_html_writer_accepts_analysis_result(tmp_path) -> None:
 
     assert out.endswith("report.html")
     assert (tmp_path / "reports" / "report.html").exists()
+    assert "class='matrix'" in (tmp_path / "reports" / "report.html").read_text(encoding="utf-8")
+
+
+def test_html_writer_uses_preview_for_large_matrices(tmp_path) -> None:
+    input_path = tmp_path / "series.csv"
+    pd.DataFrame(
+        {
+            "a": [1, 2, 3, 4, 5, 6],
+            "b": [1, 2, 3, 4, 5, 6],
+            "c": [6, 5, 4, 3, 2, 1],
+            "d": [2, 3, 5, 7, 11, 13],
+        }
+    ).to_csv(input_path, index=False)
+
+    result = run_analysis(
+        str(input_path),
+        AnalysisConfig(
+            max_lag=1,
+            lag_selection="fixed",
+            variants=["correlation_full"],
+            large_matrix_html_limit=2,
+        ),
+    )
+
+    out = write_html_report(result, str(tmp_path / "large_reports"))
+    html = (tmp_path / "large_reports" / "report.html").read_text(encoding="utf-8")
+
+    assert out.endswith("report.html")
+    assert "Large matrix preview" in html
+    assert "class='matrix'" not in html

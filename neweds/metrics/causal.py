@@ -16,6 +16,7 @@ import pandas as pd
 
 from ..defaults import DEFAULT_BINS, DEFAULT_MAX_LAG, PYINFORM_AVAILABLE
 from ._shared import (
+    _enforce_pairwise_guardrail,
     _get_effective_pairs,
     _init_matrix,
     _iter_pairs,
@@ -32,11 +33,19 @@ def granger_matrix(
     lag: int = DEFAULT_MAX_LAG,
     control: list[str] | None = None,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     from statsmodels.tsa.stattools import grangercausalitytests
 
     n_cols = int(df.shape[1])
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="granger_full",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     out = _init_matrix(n_cols, np.nan, diag=0.0)
     columns = df.columns.tolist()
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
@@ -86,10 +95,18 @@ def granger_matrix_partial(
     if control_matrix is not None:
         sub = df.copy()
         sub, _ = _residualize_df(sub, control=control, control_matrix=control_matrix)
-        return granger_matrix(sub, lag=lag, control=None, pairs=pairs)
+        return granger_matrix(sub, lag=lag, control=None, pairs=pairs, **extra)
     columns = list(df.columns)
     n_cols = len(columns)
     out = _init_matrix(n_cols, np.nan, diag=0.0)
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="granger_partial",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     if len(df) <= n_cols + 2:
         logging.warning(
             "Слишком мало данных для Granger partial: строк %s <= колонок %s. Возвращаю NaN.",
@@ -188,6 +205,42 @@ def _transfer_entropy_discrete(source_d: np.ndarray, target_d: np.ndarray, k: in
     return float(te)
 
 
+def _zscore_1d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if x.size == 0:
+        return x
+    mean = np.nanmean(x)
+    std = np.nanstd(x)
+    return x - mean if (not np.isfinite(std) or std <= 0) else (x - mean) / std
+
+
+def _add_tiny_jitter(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    if x.size <= 3:
+        return x
+    uniq = np.unique(x[np.isfinite(x)])
+    if uniq.size < max(3, int(0.2 * x.size)):
+        rng = np.random.default_rng(get_module_seed())
+        scale = (np.nanstd(x) if np.nanstd(x) > 0 else 1.0) * 1e-10
+        x = x + rng.normal(0.0, scale, size=x.shape)
+    return x
+
+
+def _discretize_quantile_te(series: np.ndarray, num_bins: int) -> np.ndarray:
+    s_full = _add_tiny_jitter(_zscore_1d(np.asarray(series, dtype=np.float64).ravel()))
+    s = s_full[np.isfinite(s_full)]
+    if s.size == 0:
+        return np.array([], dtype=int)
+    if float(np.nanmin(s)) == float(np.nanmax(s)):
+        return np.zeros(s_full.size, dtype=int)
+    edges = np.unique(np.quantile(s, np.linspace(0.0, 1.0, int(num_bins) + 1)))
+    if edges.size <= 2:
+        return np.zeros(s_full.size, dtype=int)
+    edges[-1] = np.nextafter(edges[-1], edges[-1] + 1.0)
+    disc = np.digitize(s_full, bins=edges[1:-1], right=False)
+    return np.clip(disc, 0, int(num_bins) - 1).astype(int)
+
+
 def compute_te_jitter(
     source: np.ndarray, target: np.ndarray, lag: int = 1, bins: int = DEFAULT_BINS
 ) -> float:
@@ -245,13 +298,24 @@ def transfer_entropy_matrix(
     control: list[str] | None = None,
     bins: int = DEFAULT_BINS,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     n_cols = int(df.shape[1])
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="te_full",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     out = _init_matrix(n_cols, 0.0, diag=0.0)
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     X = _prepare_numpy(df)
     col_finite = np.isfinite(X)
+    discrete_cols = [_discretize_quantile_te(X[:, i], bins) for i in range(n_cols)]
+    pyinform = _load_pyinform()
+    k = int(max(1, lag))
 
     def _compute_te_pair(pair: tuple[int, int]) -> tuple[int, int, float]:
         src, tgt = pair
@@ -259,7 +323,16 @@ def transfer_entropy_matrix(
         n_valid = int(mask.sum())
         if n_valid <= lag:
             return src, tgt, 0.0
-        v = compute_te_jitter(X[mask, src], X[mask, tgt], lag=lag, bins=bins)
+        try:
+            source_discrete = discrete_cols[src][mask]
+            target_discrete = discrete_cols[tgt][mask]
+            if pyinform is not None:
+                v = float(pyinform.transfer_entropy(source_discrete, target_discrete, k=k))
+            else:
+                v = _transfer_entropy_discrete(source_discrete, target_discrete, k=k)
+        except Exception as exc:
+            logging.error("[TE] Ошибка вычисления: %s", exc)
+            v = float("nan")
         return src, tgt, float(v) if np.isfinite(v) else 0.0
 
     for src, tgt, value in _try_parallel(_compute_te_pair, effective, heavy=True):
@@ -280,6 +353,14 @@ def transfer_entropy_matrix_partial(
     out = _init_matrix(n_cols, 0.0, diag=0.0)
     X = _prepare_numpy(df)
     control_matrix = extra.get("control_matrix")
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="te_partial",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
 
     def residualize(y, x_ctrl):
         if x_ctrl is None or x_ctrl.size == 0:

@@ -18,6 +18,7 @@ _PARALLEL_PAIR_THRESHOLD_DEFAULT = 200
 _PARALLEL_PAIR_THRESHOLD_HEAVY = 30
 # Верхняя граница автоматически сэмплируемых пар для очень больших матриц.
 _MAX_AUTO_RANDOM_PAIRS = 500_000
+_DEFAULT_MAX_PAIRWISE_PAIRS = 500_000
 
 # Глобальный seed для всех стохастических операций.
 # Устанавливается из AnalysisConfig.master_seed через set_module_seed().
@@ -107,6 +108,43 @@ def _get_effective_pairs(
         if len(result) >= max_pairs:
             break
     return list(result)
+
+
+def _count_all_pairs(n: int, *, directed: bool) -> int:
+    n = int(max(0, n))
+    return n * (n - 1) if directed else n * (n - 1) // 2
+
+
+def _enforce_pairwise_guardrail(
+    n: int,
+    pairs: list[tuple[int, int]] | None,
+    *,
+    directed: bool,
+    metric_name: str,
+    max_pairwise_pairs: int | None = None,
+    performance_guardrails: bool = True,
+) -> None:
+    """Fail before heavy pairwise metrics materialize or compute too many pairs."""
+    if not bool(performance_guardrails):
+        return
+    limit = (
+        _DEFAULT_MAX_PAIRWISE_PAIRS
+        if max_pairwise_pairs is None
+        else int(max(1, max_pairwise_pairs))
+    )
+    pair_count = (
+        _count_all_pairs(n, directed=directed)
+        if pairs is None
+        else len(_iter_pairs(n, pairs, directed=directed))
+    )
+    if pair_count <= limit:
+        return
+    raise ValueError(
+        f"{metric_name} would evaluate {pair_count:,} pairs for {int(n)} channels, "
+        f"above max_pairwise_pairs={limit:,}. Pass an explicit pairs list, reduce "
+        "channels with spatial/bin aggregation, or raise AnalysisConfig.max_pairwise_pairs "
+        "after confirming the run is intentional."
+    )
 
 
 def _prepare_numpy(data: pd.DataFrame) -> np.ndarray:
@@ -284,11 +322,14 @@ __all__ = [
     "_PARALLEL_PAIR_THRESHOLD_DEFAULT",
     "_PARALLEL_PAIR_THRESHOLD_HEAVY",
     "_MAX_AUTO_RANDOM_PAIRS",
+    "_DEFAULT_MAX_PAIRWISE_PAIRS",
     "set_module_seed",
     "get_module_seed",
     "_init_matrix",
     "_iter_pairs",
     "_get_effective_pairs",
+    "_count_all_pairs",
+    "_enforce_pairwise_guardrail",
     "_prepare_numpy",
     "_safe_parallel_backend",
     "_try_parallel",

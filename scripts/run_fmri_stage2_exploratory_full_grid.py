@@ -33,7 +33,13 @@ from scripts.run_fmri_stage2_sanity import (
     _write_csv,
 )
 
-DEFAULT_METRICS = ("correlation_full", "correlation_partial", "correlation_directed", "granger_full")
+DEFAULT_METRICS = (
+    "correlation_full",
+    "correlation_partial",
+    "wavelet_full",
+    "correlation_directed",
+    "granger_full",
+)
 BRANCH_LABELS = {
     "baseline": "survives_baseline",
     "detrended": "survives_detrended",

@@ -10,6 +10,7 @@ import pandas as pd
 
 from ..defaults import DEFAULT_EMBED_DIM, DEFAULT_EMBED_TAU, DEFAULT_K_MI
 from ._shared import (
+    _enforce_pairwise_guardrail,
     _get_effective_pairs,
     _init_matrix,
     _iter_pairs,
@@ -124,10 +125,18 @@ def mutual_info_matrix(
     control: list[str] | None = None,
     k: int = DEFAULT_K_MI,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     """Взаимная информация (KSG kNN)."""
     n_vars = int(len(data.columns))
+    _enforce_pairwise_guardrail(
+        n_vars,
+        pairs,
+        directed=False,
+        metric_name="mutinf_full",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     effective = _get_effective_pairs(n_vars, pairs, directed=False)
     mi_matrix = _init_matrix(n_vars, np.nan, diag=0.0)
     X = _prepare_numpy(data)
@@ -167,10 +176,18 @@ def mutual_info_matrix_partial(
     if control_matrix is not None:
         sub = data.copy()
         sub, _desc = _residualize_df(sub, control=control, control_matrix=control_matrix)
-        return mutual_info_matrix(sub, lag=lag, control=None, k=k, pairs=pairs)
+        return mutual_info_matrix(sub, lag=lag, control=None, k=k, pairs=pairs, **extra)
     cols = list(data.columns)
     n_cols = len(cols)
     pmi = _init_matrix(n_cols, np.nan, diag=0.0)
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=False,
+        metric_name="mutinf_partial",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     it = (
         _iter_pairs(n_cols, pairs, directed=False)
         if pairs is not None
@@ -277,9 +294,17 @@ def dcor_matrix(
     lag: int = 1,
     control: list[str] | None = None,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     n_vars = int(data.shape[1])
+    _enforce_pairwise_guardrail(
+        n_vars,
+        pairs,
+        directed=False,
+        metric_name="dcor_full",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     effective = _get_effective_pairs(n_vars, pairs, directed=False)
     out = _init_matrix(n_vars, 0.0, diag=1.0)
     X = _prepare_numpy(data)
@@ -310,8 +335,16 @@ def dcor_matrix_partial(
     control_matrix = extra.get("control_matrix")
     if control_matrix is not None or (control is not None and len(control) > 0):
         sub, _desc = _residualize_df(data, control=control, control_matrix=control_matrix)
-        return dcor_matrix(sub, lag=lag, control=None, pairs=pairs)
+        return dcor_matrix(sub, lag=lag, control=None, pairs=pairs, **extra)
     n_cols = len(data.columns)
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=False,
+        metric_name="dcor_partial",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     effective = _get_effective_pairs(n_cols, pairs, directed=False)
     out = _init_matrix(n_cols, 0.0, diag=1.0)
     X = _prepare_numpy(data)
@@ -336,11 +369,19 @@ def dcor_matrix_directed(
     lag: int = 1,
     control: list[str] | None = None,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     lag = int(max(1, lag))
     n_cols = len(data.columns)
     out = _init_matrix(n_cols, 0.0, diag=0.0)
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="dcor_directed",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     X = _prepare_numpy(data)
     for i, j in effective:
@@ -429,7 +470,7 @@ def AH_matrix(
     embed_dim: int = DEFAULT_EMBED_DIM,
     tau: int = DEFAULT_EMBED_TAU,
     pairs: list[tuple[int, int]] | None = None,
-    **_: dict,
+    **extra: dict,
 ) -> np.ndarray:
     """Направленная связность через Arnhold-H ratio."""
 
@@ -439,6 +480,14 @@ def AH_matrix(
     if n_cols < 2 or df.empty:
         return out
 
+    _enforce_pairwise_guardrail(
+        n_cols,
+        pairs,
+        directed=True,
+        metric_name="ah_full",
+        max_pairwise_pairs=extra.get("max_pairwise_pairs"),
+        performance_guardrails=extra.get("performance_guardrails", True),
+    )
     effective = _get_effective_pairs(n_cols, pairs, directed=True)
     values = df.to_numpy(dtype=np.float64, copy=False)
 
@@ -473,7 +522,7 @@ def compute_partial_AH_matrix(
     control_matrix = extra.get("control_matrix")
     if control_matrix is not None or (control is not None and len(control) > 0):
         residualized, _desc = _residualize_df(df, control=control, control_matrix=control_matrix)
-        return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs)
+        return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs, **extra)
 
     try:
         from statsmodels.tsa.vector_ar.var_model import VAR
@@ -483,7 +532,7 @@ def compute_partial_AH_matrix(
     except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
         logging.warning("[AH] VAR residualization failed; returning NaN matrix: %s", exc)
         return _init_matrix(n_cols, np.nan, diag=0.0)
-    return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs)
+    return AH_matrix(residualized, embed_dim=embed_dim, tau=tau, pairs=pairs, **extra)
 
 
 def AH_matrix_directed(

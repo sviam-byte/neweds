@@ -14,6 +14,8 @@ VARIANT_ALIASES: dict[str, str] = {
     "coh_full": "coherence_full",
     "coh_partial": "coherence_partial",
     "fftcoh_full": "coherence_full",  # short alias
+    "wav_full": "wavelet_full",
+    "wav_partial": "wavelet_partial",
 }
 
 
@@ -40,6 +42,8 @@ PRESETS = {
     "spectral": [
         "coh_full",
         "coh_partial",
+        "wav_full",
+        "wav_partial",
     ],
     "entropy": [
         "mutinf_full",
@@ -80,6 +84,8 @@ PRESETS = {
             "correlation_directed",
             "coherence_full",
             "coherence_partial",
+            "wavelet_full",
+            "wavelet_partial",
             "mutinf_full",
             "mutinf_partial",
             "dcor_full",

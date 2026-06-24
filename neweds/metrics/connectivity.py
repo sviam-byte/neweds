@@ -57,6 +57,8 @@ from .ordinal import (  # noqa: F401
 from .spectral import (  # noqa: F401
     coherence_matrix,
     coherence_matrix_partial,
+    wavelet_matrix,
+    wavelet_matrix_partial,
 )
 
 __all__ = [
@@ -92,4 +94,6 @@ __all__ = [
     "spearman_matrix",
     "transfer_entropy_matrix",
     "transfer_entropy_matrix_partial",
+    "wavelet_matrix",
+    "wavelet_matrix_partial",
 ]

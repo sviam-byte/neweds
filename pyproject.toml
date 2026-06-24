@@ -51,6 +51,9 @@ io = [
 neweds = "neweds.cli:main"
 neweds-group = "neweds.cli_group:main"
 neweds-fmri-audit = "neweds.cli_fmri_audit:main"
+neweds-fmri-tissue-audit = "neweds.cli_fmri_tissue_audit:main"
+neweds-fmri-gm-signals = "neweds.cli_fmri_gm_signals:main"
+neweds-fmri-stage2-benchmark = "neweds.cli_fmri_stage2_benchmark:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

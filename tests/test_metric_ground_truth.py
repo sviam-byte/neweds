@@ -83,9 +83,34 @@ def test_ordinal_independent_is_low() -> None:
     assert matrix[0, 1] < 0.3
 
 
+def test_wavelet_registry_metric_recovers_multiscale_copy() -> None:
+    rng = _rng(7)
+    t = np.linspace(0.0, 10.0 * np.pi, 512)
+    x = np.sin(t) + 0.4 * np.sin(6.0 * t)
+    df = pd.DataFrame(
+        {
+            "x": x + 0.03 * rng.normal(size=t.size),
+            "y": x + 0.03 * rng.normal(size=t.size),
+            "noise": rng.normal(size=t.size),
+        }
+    )
+
+    matrix = compute_metric(df, "wavelet_full", lag=1)
+
+    assert matrix.shape == (3, 3)
+    assert matrix[0, 1] > 0.8
+    assert matrix[0, 1] > matrix[0, 2]
+
+
 @pytest.mark.parametrize(
     "variant",
-    ["correlation_full", "correlation_spearman", "correlation_kendall", "dcor_full"],
+    [
+        "correlation_full",
+        "correlation_spearman",
+        "correlation_kendall",
+        "dcor_full",
+        "wavelet_full",
+    ],
 )
 def test_metric_matrix_is_symmetric_for_undirected_variants(variant: str) -> None:
     matrix = compute_metric(_independent(n=300), variant, lag=1)

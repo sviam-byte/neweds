@@ -143,6 +143,12 @@ class AnalysisConfig:
     # 0 = AR-detrend выключен; >0 = удалить AR(p)-структуру до анализа.
     ar_order: int = 0
 
+    # Performance guardrails for expensive pairwise metrics and large reports.
+    max_pairwise_pairs: int = 500_000
+    heavy_window_max_windows: int = 50
+    large_matrix_html_limit: int = 250
+    performance_guardrails: bool = True
+
 
 # Реэкспорт: исторически из neweds.config импортировали и таблицы методов.
 # Делаем это лениво, чтобы ``import neweds.config`` не триггерил ensure_builtins.

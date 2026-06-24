@@ -27,6 +27,19 @@ DEFAULT_PUBLIC_VARIANTS = [
 ]
 
 _HDF5_EXTS = {".h5", ".hdf5", ".hdf"}
+_HEAVY_WINDOW_PREFIXES = (
+    "mutinf",
+    "dcor",
+    "te",
+    "granger",
+    "ah",
+    "ordinal",
+    "wavelet",
+)
+
+
+def _is_heavy_window_metric(variant: str) -> bool:
+    return str(variant).startswith(_HEAVY_WINDOW_PREFIXES)
 
 
 def _config_hash(config: AnalysisConfig) -> str:
@@ -125,6 +138,8 @@ def _compute_variant(
     lag: int,
     controls: list[str],
     control_matrix: np.ndarray | None,
+    max_pairwise_pairs: int | None = None,
+    performance_guardrails: bool = True,
 ) -> np.ndarray:
     metric = get_metric(variant)
     params: dict[str, Any] = {}
@@ -132,6 +147,8 @@ def _compute_variant(
     if controls and metric.supports_control:
         params["control_matrix"] = control_matrix
         control_arg = controls
+    params["max_pairwise_pairs"] = max_pairwise_pairs
+    params["performance_guardrails"] = performance_guardrails
     return np.asarray(compute_metric(signal_data, variant, lag=lag, control=control_arg, **params))
 
 
@@ -142,6 +159,8 @@ def _select_lag(
     max_lag: int,
     controls: list[str],
     control_matrix: np.ndarray | None,
+    max_pairwise_pairs: int | None = None,
+    performance_guardrails: bool = True,
 ) -> tuple[np.ndarray, int]:
     metric = get_metric(variant)
     best_matrix: np.ndarray | None = None
@@ -154,6 +173,8 @@ def _select_lag(
             lag=lag,
             controls=controls,
             control_matrix=control_matrix,
+            max_pairwise_pairs=max_pairwise_pairs,
+            performance_guardrails=performance_guardrails,
         )
         score = _matrix_strength(matrix, pvalue_based=metric.pvalue_based)
         if score > best_score:
@@ -218,9 +239,16 @@ def _run_windows(
                 lag=lag,
                 controls=controls,
                 control_matrix=cm,
+                max_pairwise_pairs=int(config.max_pairwise_pairs),
+                performance_guardrails=bool(config.performance_guardrails),
             )
 
         for window_size in config.window_sizes:
+            max_windows = (
+                int(config.heavy_window_max_windows)
+                if _is_heavy_window_metric(variant)
+                else 400
+            )
             per_size[int(window_size)] = analyze_sliding_windows(
                 signal_data,
                 variant,
@@ -229,6 +257,7 @@ def _run_windows(
                 compute_variant_func=_compute,
                 is_pvalue=metric.pvalue_based,
                 lag=int(max(1, config.max_lag)),
+                max_windows=max_windows,
                 return_matrices=False,
             )
         windows[variant] = {
@@ -280,6 +309,8 @@ def run_analysis(
                 max_lag=max_lag,
                 controls=control_columns,
                 control_matrix=control_matrix,
+                max_pairwise_pairs=int(config.max_pairwise_pairs),
+                performance_guardrails=bool(config.performance_guardrails),
             )
         else:
             matrix_np = _compute_variant(
@@ -288,6 +319,8 @@ def run_analysis(
                 lag=max_lag,
                 controls=control_columns,
                 control_matrix=control_matrix,
+                max_pairwise_pairs=int(config.max_pairwise_pairs),
+                performance_guardrails=bool(config.performance_guardrails),
             )
             used_lag = max_lag
 

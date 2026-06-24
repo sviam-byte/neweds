@@ -13,6 +13,7 @@ The project treats brain regions not as automatically valid units, but as object
 - загрузка табличных временных рядов из CSV и Excel;
 - preprocessing: пропуски, нормализация, выбросы, AR/STL-опции;
 - connectivity-метрики через единый registry;
+- многомасштабная Haar-wavelet связность (`wavelet_full`, экспериментально);
 - CLI `neweds` и Python API для одного файла;
 - batch-запуск для набора табличных файлов;
 - HTML/Excel-отчеты и экспорт connectivity-матриц;
@@ -86,6 +87,7 @@ signal_a, signal_b_lagged, noise_control, seasonal_component
 
 - signal QC before connectivity: ROI/bin homogeneity checks, regional-signal construction choices, and PCA sign-orientation metadata;
 - `neweds-fmri-audit` для первичного аудита уже извлечённых ROI time series HC/SZ: inventory, ROI QC, temporal QC, baseline Pearson FC и FDR;
+- `neweds-fmri-tissue-audit` для отдельного потокового аудита GM/WM/CSF HDF5 без смешивания с ROI/whole-brain результатами;
 - node-definition QC for experimental voxel/bin workflows: mask coverage, volume-space adjacency constrained by mask, and explicit warnings that XYZ adjacency is not cortical-surface adjacency;
 - `neweds-group` для case/control-сравнения;
 - HDF5/fMRI-like эксперименты;
@@ -100,6 +102,8 @@ signal_a, signal_b_lagged, noise_control, seasonal_component
 - [Метрики](docs/metrics.md)
 - [Group pipeline](docs/group_pipeline.md)
 - [fMRI ROI audit MVP](docs/fmri_roi_audit.md)
+- [Independent GM/WM/CSF tissue audit](docs/fmri_tissue_audit.md)
+- [fMRI audit separation contract](docs/fmri_audit_separation_contract.md)
 - [fMRI-like signal QC protocol](docs/fmri_signal_qc_protocol.md)
 - [Ограничения](docs/limitations.md)
 - [Refactoring story](docs/refactoring_story.md)

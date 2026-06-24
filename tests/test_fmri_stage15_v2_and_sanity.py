@@ -207,9 +207,12 @@ def test_stage2_sanity_smoke_continues_with_granger_failures(tmp_path: Path) -> 
 
     summary = pd.read_csv(out / "stage2_sanity_summary.csv")
     failures = pd.read_csv(out / "summaries" / "stage2_sanity_failures.csv")
-    assert {"correlation_full", "correlation_partial", "correlation_directed"}.issubset(
-        set(summary["metric"])
-    )
+    assert {
+        "correlation_full",
+        "correlation_partial",
+        "wavelet_full",
+        "correlation_directed",
+    }.issubset(set(summary["metric"]))
     assert (out / "summaries" / "stage2_sanity_stability.csv").exists()
     assert (out / "reports" / "stage2_sanity_stability_report.md").exists()
     assert "granger_full" in set(summary["metric"]) or "granger_full" in set(failures["metric"])

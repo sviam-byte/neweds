@@ -174,3 +174,40 @@ def test_pvalue_correction_and_windows_are_exposed(monkeypatch) -> None:
     assert np.isclose(matrix[0, 1], 0.06)
     assert np.isclose(matrix[1, 0], 0.08)
     assert "granger_full" in result.windows
+
+
+def test_guardrail_config_is_forwarded_and_heavy_windows_are_limited(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    def _fake_loader(*args, **kwargs):
+        df = pd.DataFrame(
+            {
+                "x": np.arange(80, dtype=float),
+                "y": np.arange(80, dtype=float) + 1.0,
+            }
+        )
+        return df, type("Report", (), {"steps_global": []})()
+
+    def _fake_compute(data, variant, *, lag=1, control=None, **params):
+        captured.append(dict(params))
+        return np.array([[0.0, 0.03], [0.04, 0.0]], dtype=float)
+
+    monkeypatch.setattr(public_pipeline, "load_or_generate", _fake_loader)
+    monkeypatch.setattr(public_pipeline, "compute_metric", _fake_compute)
+
+    result = run_analysis(
+        "input.csv",
+        AnalysisConfig(
+            variants=["granger_full"],
+            max_pairwise_pairs=7,
+            heavy_window_max_windows=5,
+            window_sizes=[10],
+            window_stride=1,
+        ),
+    )
+
+    assert captured
+    assert captured[0]["max_pairwise_pairs"] == 7
+    assert captured[0]["performance_guardrails"] is True
+    ticks = result.windows["granger_full"]["sizes"][10]["ticks"]
+    assert len(ticks) == 5
